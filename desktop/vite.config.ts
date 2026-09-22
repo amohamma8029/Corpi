@@ -7,6 +7,11 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    watch: {
+      // Tauri watches the Rust sources; Vite watching the build output crashes
+      // with EBUSY on Windows while cargo links (recommended by Tauri).
+      ignored: ["**/src-tauri/**"],
+    },
   },
   build: {
     target: "es2022",
