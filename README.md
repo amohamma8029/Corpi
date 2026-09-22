@@ -12,11 +12,22 @@ Notebooks and saved research stay on the user's device. Answer generation uses t
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/) (winget: `astral-sh.uv`)
-- Node.js + pnpm, Rust toolchain (stable) with the MSVC toolchain on Windows
-- WebView2 runtime (Windows ships it with Edge)
-- [just](https://github.com/casey/just) (winget: `Casey.Just`)
-- For end-to-end tests only: [tauri-driver](https://tauri.app/develop/tests/webdriver/) (`cargo install tauri-driver`) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`)
+- [mise](https://mise.jdx.dev/installing-mise.html) — `mise.toml` pins the project tools (just, Node.js LTS, pnpm, uv, Rust) and `mise install` installs them
+- Windows builds additionally need:
+  - MSVC build tools (Visual Studio Build Tools with the "Desktop development with C++" workload)
+  - WebView2 runtime (Windows ships it with Edge)
+- End-to-end tests only: [tauri-driver](https://tauri.app/develop/tests/webdriver/) (`cargo install tauri-driver`) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`)
+
+Python is managed by uv through `core/.python-version`; uv downloads its own Python 3.13.
+
+## Setup
+
+```powershell
+mise install
+uv sync --directory core
+pnpm --dir desktop install
+just dev
+```
 
 ## Commands
 
