@@ -23,11 +23,15 @@ Python is managed by uv through `core/.python-version`; uv downloads its own Pyt
 ## Setup
 
 ```powershell
-mise install
+mise trust          # trust this project's mise.toml (once per clone)
+mise install        # installs just, Node.js, pnpm, uv, and Rust at the pinned versions
+mise activate pwsh | Out-String | Invoke-Expression   # add to your $PROFILE to make it permanent
 uv sync --directory core
 pnpm --dir desktop install
 just dev
 ```
+
+With mise activated, `node`, `pnpm`, `just`, `uv`, and `cargo` resolve to the pinned versions inside this repository; outside it, your global mise tools are untouched.
 
 ## Commands
 
