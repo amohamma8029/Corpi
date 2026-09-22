@@ -1,0 +1,18 @@
+[package]
+name = "corpi-desktop"
+version = "0.1.0"
+description = "Corpi desktop shell: launches and monitors the local core."
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+lto = true

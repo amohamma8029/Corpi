@@ -1,0 +1,12 @@
+# Node / pnpm
+node_modules/
+dist/
+
+# Rust
+target/
+
+# uv
+.venv/
+
+# Tauri generated files
+desktop/src-tauri/gen/

@@ -1,0 +1,48 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Corpi Core",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Health Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/demo/stream": {
+      "get": {
+        "summary": "Demo Stream",
+        "description": "Transport proof for authenticated streaming: SSE-formatted chunks over plain HTTP.\n\nRead with fetch + Authorization header, never browser EventSource (which cannot\nsend the per-launch token). Later import-progress and answer-token streams reuse\nthis shape.",
+        "operationId": "demo_stream_demo_stream_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
