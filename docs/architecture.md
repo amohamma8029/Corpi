@@ -688,6 +688,7 @@ Deferred items also state whether they await the artifact milestone or fall outs
 | Evidence | Keep citation passages immutable and retrieval chunks replaceable. Check references with app rules and claim support with a separate model call. |
 | Models | Use the user's configured external provider and BYOK credentials for generation. Corpi manages local embeddings by default. |
 | History | Make ready versions available all at once. Preserve source/output versions and template/rendering versions. Regenerate only on request. Use 30-day local trash. |
+| Desktop shell and local core | Tauri 2 + React/TypeScript shell; Python 3.13 core managed with uv; FastAPI over loopback HTTP with a per-launch bearer token, `Origin`/`Host` validation, and authenticated streaming read with `fetch` (or a WebSocket authenticated on connect). Monorepo with `core/`, `desktop/`, and a root justfile. Electron is the documented fallback if Tauri sidecar packaging proves too painful. |
 
 ### Open implementation choices
 
@@ -695,7 +696,6 @@ Choose and record each open implementation detail before building the component 
 
 | Area | Status | What remains open |
 | --- | --- | --- |
-| Desktop UI/application shell and local core | **Needs Decision** | Desktop UI/shell framework, core runtime/language, and how they communicate. |
 | Local database/state store | **Needs Decision** | Database technology and how it implements indexes and valid record links. |
 | Local keyword/FTS and vector search | **Needs Decision** | Both search implementations. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
 | Local embeddings | **Needs Decision** | Supported model and runtime; benchmark them before selection. Local-by-default processing is decided. |

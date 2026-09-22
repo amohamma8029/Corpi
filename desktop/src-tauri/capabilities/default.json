@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Main window defaults: navigation and event APIs only; no filesystem, shell, or network plugins.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
