@@ -9,6 +9,7 @@ import uvicorn
 from core.api.app import create_app
 
 READY_MARKER = "CORPI_CORE_READY"
+WATCH_STDIN_ENV = "CORPI_CORE_WATCH_STDIN"
 
 
 def pick_free_port() -> int:
@@ -20,6 +21,22 @@ def pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def exit_when_stdin_closes(server: "uvicorn.Server") -> None:
+    """Graceful shutdown when the core's stdin reaches EOF.
+
+    The shell holds the write end of the stdin pipe for as long as the app
+    runs; app exit, crash, or an explicit stop closes it. That signal reaches
+    this process directly even when process-group kills miss it (uv may regroup
+    its children), making shutdown portable rather than Unix-kill-dependent.
+    Opt-in via CORPI_CORE_WATCH_STDIN so terminal and test runs are unaffected.
+    """
+    try:
+        sys.stdin.buffer.read()
+    except (OSError, ValueError):
+        pass
+    server.should_exit = True
 
 
 def print_ready_when_listening(server: "uvicorn.Server", port: int) -> None:
@@ -57,6 +74,8 @@ def main() -> None:
     server = uvicorn.Server(config)
 
     threading.Thread(target=print_ready_when_listening, args=(server, port), daemon=True).start()
+    if os.environ.get(WATCH_STDIN_ENV) == "1":
+        threading.Thread(target=exit_when_stdin_closes, args=(server,), daemon=True).start()
     server.run()
 
 
