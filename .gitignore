@@ -10,3 +10,18 @@ target/
 
 # Tauri generated files
 desktop/src-tauri/gen/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
