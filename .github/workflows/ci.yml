@@ -56,5 +56,8 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo build
 
-      - name: Launcher smoke test
-        run: uv run --directory core python scripts/ci_launcher_smoke.py
+      - name: Launcher tests (real shell spawn-and-stop code)
+        working-directory: desktop/src-tauri
+        env:
+          CORPI_CORE_DIR: ${{ github.workspace }}/core
+        run: cargo test --test launcher -- --test-threads=1
