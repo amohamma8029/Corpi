@@ -20,6 +20,14 @@ def test_allowed_origin_is_accepted(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def test_macos_and_linux_tauri_origin_is_accepted(client: TestClient) -> None:
+    response = client.get(
+        "/health",
+        headers={"Authorization": f"Bearer {TOKEN}", "Origin": "tauri://localhost"},
+    )
+    assert response.status_code == 200
+
+
 def test_non_local_host_is_forbidden(client: TestClient) -> None:
     response = client.get(
         "http://metadata.evil.internal/health",

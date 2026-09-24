@@ -7,6 +7,8 @@ from core.api.identity import APP_VERSION
 from core.api.routes import router
 
 DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = (
+    # macOS and Linux webviews use the tauri scheme; Windows uses http(s).
+    "tauri://localhost",
     "http://tauri.localhost",
     "https://tauri.localhost",
     "http://localhost:1420",
