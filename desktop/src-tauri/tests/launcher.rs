@@ -52,18 +52,36 @@ fn http_status(port: u16, token: Option<&str>) -> Option<u16> {
     response.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Shutdown can be immediate (SIGKILL on the group) or graceful (the server
+/// notices stdin EOF and exits); allow a bounded drain either way.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn assert_port_dead(port: u16) {
-    if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-        panic!("port {port} still accepts connections after stop");
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).is_err() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("port {port} still accepts connections after stop");
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
 #[cfg(unix)]
 fn assert_group_dead(pgid: u32) {
-    unsafe {
-        if libc::kill(-(pgid as i32), 0) == 0 {
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    loop {
+        // 0 means "does this group have any live members"; ESRCH means none.
+        let alive = unsafe { libc::kill(-(pgid as i32), 0) == 0 };
+        if !alive {
+            return;
+        }
+        if Instant::now() >= deadline {
             panic!("process group {pgid} still has live members after stop");
         }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

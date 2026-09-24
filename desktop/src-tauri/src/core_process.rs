@@ -159,9 +159,15 @@ impl CoreState {
             }
         }
         if let Some(ref mut child) = *guard {
+            // Close the stdin write end first: the server watches it and shuts
+            // down on EOF, which reaches it even when the interpreter was
+            // regrouped away from the direct child (uv manages its own child
+            // process group on Unix).
+            drop(child.stdin.take());
             #[cfg(unix)]
             unsafe {
-                // Kill the whole process group (uv + interpreter), then reap uv.
+                // Best effort: kill the whole process group (uv + interpreter)
+                // when the interpreter still shares it.
                 libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
             let _ = child.kill();
@@ -253,6 +259,9 @@ fn spawn_core() -> Result<(Child, String), String> {
         .args(["run", "python", "-m", "core.api.server"])
         .current_dir(&core_dir)
         .env("CORPI_CORE_TOKEN", &token)
+        // The shell holds the stdin pipe; the server exits on EOF, which
+        // reaches it even when process-group kills miss the interpreter.
+        .env("CORPI_CORE_WATCH_STDIN", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

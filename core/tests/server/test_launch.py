@@ -82,6 +82,58 @@ def test_ready_line_means_immediately_listening(core_server: int) -> None:
     assert response.status_code == 200
 
 
+def test_stdin_close_shuts_down_when_watching() -> None:
+    """With the shell's opt-in watcher enabled, closing the core's stdin must
+    stop the server (the portable shutdown signal)."""
+    env = os.environ.copy()
+    env["CORPI_CORE_TOKEN"] = TOKEN
+    env["CORPI_CORE_WATCH_STDIN"] = "1"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "core.api.server"],
+        cwd=CORE_ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        ready_line = ""
+        for _ in range(200):
+            line = process.stdout.readline()
+            if line.startswith("CORPI_CORE_READY"):
+                ready_line = line.strip()
+                break
+            if line == "":
+                raise AssertionError("core server exited before reporting ready")
+        if not ready_line:
+            raise AssertionError("core server did not report ready")
+        fields = dict(part.split("=", 1) for part in ready_line.split()[1:])
+        port = int(fields["port"])
+
+        assert process.stdin is not None
+        process.stdin.close()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("core did not exit after its stdin closed") from None
+
+        # The server exited: the port must no longer answer. Any transport
+        # failure counts (Windows may time out rather than refuse on a
+        # just-closed loopback port).
+        with pytest.raises(httpx.TransportError):
+            httpx.get(
+                f"http://127.0.0.1:{port}/health",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                timeout=2,
+            )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_stream_delivers_chunks_over_live_socket(core_server: int) -> None:
     events: list[dict] = []
     with httpx.stream(
