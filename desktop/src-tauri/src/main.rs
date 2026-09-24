@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{Manager, RunEvent, State};
+use win32job::{ExtendedLimitInfo, Job};
 
 const READY_MARKER: &str = "CORPI_CORE_READY";
 // Cold starts (fresh binary, Defender first-scan, uv resolving the venv) can be
@@ -28,6 +30,38 @@ struct CoreState {
     connection: Mutex<Option<CoreConnection>>,
     failure: Mutex<Option<String>>,
     child: Mutex<Option<Child>>,
+    /// Job object with kill-on-job-close holding the core's process tree. The
+    /// kernel terminates every process in the tree (uv, the venv trampoline,
+    /// and the Python server) when this handle is closed — on explicit stop,
+    /// on app exit, and even if the app crashes.
+    job: Mutex<Option<Job>>,
+}
+
+/// Puts the spawned core into a job object that kills its whole process tree
+/// when the job handle closes. `uv` spawns a venv trampoline plus the real
+/// interpreter, so killing the direct child alone leaves the server running.
+fn attach_core_job(child: &Child) -> Result<Job, String> {
+    let mut info = ExtendedLimitInfo::new();
+    info.limit_kill_on_job_close();
+    let job = Job::create_with_limit_info(&info)
+        .map_err(|error| format!("core job creation failed: {error}"))?;
+    job.assign_process(child.as_raw_handle() as isize)
+        .map_err(|error| format!("core job assignment failed: {error}"))?;
+    Ok(job)
+}
+
+/// Stops the core tree deterministically: close the job handle (terminates the
+/// tree), then reap the direct child.
+fn stop_core(state: &State<'_, CoreState>) {
+    if let Some(job) = state.job.lock().unwrap().take() {
+        drop(job);
+    }
+    let mut guard = state.child.lock().unwrap();
+    if let Some(ref mut child) = *guard {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *guard = None;
 }
 
 fn log_spawn_event(message: &str) {
@@ -155,6 +189,7 @@ fn main() {
         connection: Mutex::new(None),
         failure: Mutex::new(None),
         child: Mutex::new(None),
+        job: Mutex::new(None),
     };
 
     tauri::Builder::default()
@@ -177,6 +212,17 @@ fn main() {
 
                 // Register the child BEFORE the handshake so that app exit,
                 // handshake timeout, or an early core exit can all stop it.
+                match attach_core_job(&child) {
+                    Ok(job) => {
+                        *state.job.lock().unwrap() = Some(job);
+                    }
+                    Err(error) => {
+                        // Without the job the plain child kill still runs; the
+                        // tree-kill guarantee is weakened only in this
+                        // unlikely Windows-API failure case.
+                        log_spawn_event(&format!("{error} (falling back to child kill)"));
+                    }
+                }
                 let mut guard = state.child.lock().unwrap();
                 *guard = Some(child);
                 let ready = wait_for_core_ready(guard.as_mut().unwrap());
@@ -188,13 +234,8 @@ fn main() {
                         });
                     }
                     Err(error) => {
-                        {
-                            let child = guard.as_mut().unwrap();
-                            let _ = child.kill();
-                            let _ = child.wait();
-                        }
-                        *guard = None;
                         drop(guard);
+                        stop_core(&state);
                         log_spawn_event(&format!("core startup failed: {error}"));
                         *state.failure.lock().unwrap() = Some(error);
                     }
@@ -208,12 +249,7 @@ fn main() {
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 let state: State<CoreState> = app.state();
-                let mut guard = state.child.lock().unwrap();
-                if let Some(ref mut child) = *guard {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                *guard = None;
+                stop_core(&state);
             }
         });
 }
