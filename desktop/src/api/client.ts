@@ -47,6 +47,25 @@ export function coreHealth(connection: CoreConnection): Promise<CoreHealth> {
   return coreRequest<CoreHealth>(connection, "/health");
 }
 
+export async function coreHealthWithRetry(
+  connection: CoreConnection,
+  attempts = 5,
+  delayMs = 500,
+): Promise<CoreHealth> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await coreHealth(connection);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+  throw lastError;
+}
+
 export async function demoStream(
   connection: CoreConnection,
   onEvent: (event: StreamEvent) => void,

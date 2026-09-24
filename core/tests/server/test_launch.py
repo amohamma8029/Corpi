@@ -72,6 +72,16 @@ def test_non_local_host_is_rejected(core_server: int) -> None:
     assert response.status_code == 403
 
 
+def test_ready_line_means_immediately_listening(core_server: int) -> None:
+    """The first request right after READY must succeed — the marker may only
+    print once the socket is accepting connections (no retry allowed here)."""
+    response = httpx.get(
+        f"http://127.0.0.1:{core_server}/health",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert response.status_code == 200
+
+
 def test_stream_delivers_chunks_over_live_socket(core_server: int) -> None:
     events: list[dict] = []
     with httpx.stream(

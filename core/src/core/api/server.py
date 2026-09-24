@@ -1,6 +1,8 @@
 import os
 import socket
 import sys
+import threading
+import time
 
 import uvicorn
 
@@ -18,6 +20,19 @@ def pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def print_ready_when_listening(server: "uvicorn.Server", port: int) -> None:
+    """Print READY only once the socket is accepting connections.
+
+    uvicorn sets ``Server.started`` after binding and running the app's startup
+    hooks, so the marker reaching stdout guarantees an immediate health check can
+    succeed. Startup failure exits the process; this daemon thread dies with it
+    and the shell's timeout handling takes over.
+    """
+    while not server.started:
+        time.sleep(0.02)
+    print(f"{READY_MARKER} port={port} pid={os.getpid()}", flush=True)
 
 
 def main() -> None:
@@ -41,7 +56,7 @@ def main() -> None:
     )
     server = uvicorn.Server(config)
 
-    print(f"{READY_MARKER} port={port} pid={os.getpid()}", flush=True)
+    threading.Thread(target=print_ready_when_listening, args=(server, port), daemon=True).start()
     server.run()
 
 
