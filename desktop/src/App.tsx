@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-import { CoreConnection, CoreHealth, coreHealth, demoStream, StreamEvent } from "./api/client";
+import { CoreConnection, CoreHealth, coreHealthWithRetry, demoStream, StreamEvent } from "./api/client";
 
 type CoreStatus = "connecting" | "ok" | "error";
 
@@ -25,7 +25,9 @@ export function App() {
       try {
         const conn = await invoke<CoreConnection>("core_connection");
         if (cancelled) return;
-        const health: CoreHealth = await coreHealth(conn);
+        // Retry instead of a single check: a slow server start surfaces as
+        // "Connecting…" until the deadline, then a clear error.
+        const health: CoreHealth = await coreHealthWithRetry(conn);
         if (cancelled) return;
         setConnection(conn);
         setVersion(health.version);

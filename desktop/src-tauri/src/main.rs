@@ -1,17 +1,19 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{Manager, RunEvent, State};
 
 const READY_MARKER: &str = "CORPI_CORE_READY";
 // Cold starts (fresh binary, Defender first-scan, uv resolving the venv) can be
-// slow; the UI stays on "Connecting…" until the handshake lands.
-const READY_TIMEOUT_POLLS: u32 = 300;
-const READY_POLL_MILLIS: u64 = 100;
+// slow; the UI stays on "Connecting…" until the handshake lands. On timeout,
+// early exit, or any other failure the child is stopped by the spawn thread.
+const READY_TIMEOUT_MILLIS: u64 = 30_000;
+const READ_POLL_MILLIS: u64 = 250;
 
 /// Connection handed to the webview. The token is a per-launch credential:
 /// whoever holds it can spend the user's model-API budget under BYOK, so it is
@@ -42,7 +44,7 @@ fn log_spawn_event(message: &str) {
     }
 }
 
-fn spawn_core() -> Result<(Child, CoreConnection), String> {
+fn spawn_core() -> Result<(Child, String), String> {
     let core_dir = match std::env::var("CORPI_CORE_DIR") {
         Ok(dir) => dir,
         Err(_) => {
@@ -54,7 +56,7 @@ fn spawn_core() -> Result<(Child, CoreConnection), String> {
     };
     let token = uuid::Uuid::new_v4().simple().to_string();
 
-    let mut child = match Command::new("uv")
+    let child = match Command::new("uv")
         .args(["run", "python", "-m", "core.api.server"])
         .current_dir(&core_dir)
         .env("CORPI_CORE_TOKEN", &token)
@@ -70,62 +72,82 @@ fn spawn_core() -> Result<(Child, CoreConnection), String> {
             return Err(message);
         }
     };
+    Ok((child, token))
+}
 
+/// Waits until the core reports READY (which, since the server prints it only
+/// after binding its socket, means it accepts connections). Detects early
+/// exits and enforces the timeout; the CALLER owns the child and must stop it
+/// when this returns Err.
+fn wait_for_core_ready(child: &mut Child) -> Result<u32, String> {
     let stdout = child.stdout.take().ok_or_else(|| {
         let message = "core stdout unavailable".to_string();
         log_spawn_event(&message);
         message
     })?;
-    let reader = BufReader::new(stdout);
-    let mut port: Option<u32> = None;
-    for line in reader.lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                let message = format!("core stdout read failed: {error}");
-                log_spawn_event(&message);
-                return Err(message);
-            }
-        };
-        if let Some(rest) = line.strip_prefix(READY_MARKER) {
-            port = rest
-                .split_whitespace()
-                .find_map(|part| part.strip_prefix("port="))
-                .and_then(|value| value.parse().ok());
-            break;
-        }
-    }
 
-    let port = match port {
-        Some(port) => port,
-        None => {
-            let message = "core did not report a port before its stdout closed".to_string();
+    let (sender, receiver) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let started = Instant::now();
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            let message = format!("core exited before reporting ready: {status}");
             log_spawn_event(&message);
             return Err(message);
         }
-    };
-    let connection = CoreConnection {
-        base_url: format!("http://127.0.0.1:{port}"),
-        token,
-    };
-    log_spawn_event(&format!("core ready: {port}"));
-    Ok((child, connection))
+        if started.elapsed() > Duration::from_millis(READY_TIMEOUT_MILLIS) {
+            let message = format!("core did not become ready within {READY_TIMEOUT_MILLIS} ms");
+            log_spawn_event(&message);
+            return Err(message);
+        }
+        match receiver.recv_timeout(Duration::from_millis(READ_POLL_MILLIS)) {
+            Ok(line) => {
+                if let Some(rest) = line.strip_prefix(READY_MARKER) {
+                    if let Some(port) = rest
+                        .split_whitespace()
+                        .find_map(|part| part.strip_prefix("port="))
+                        .and_then(|value| value.parse().ok())
+                    {
+                        return Ok(port);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let message = "core stdout closed before reporting ready".to_string();
+                log_spawn_event(&message);
+                return Err(message);
+            }
+        }
+    }
 }
 
 /// Waits (bounded) until the background spawn finishes, so the first UI render
 /// already knows whether the core is available.
 #[tauri::command]
 fn core_connection(state: State<'_, CoreState>) -> Result<CoreConnection, String> {
-    for _ in 0..READY_TIMEOUT_POLLS {
+    let deadline = Instant::now() + Duration::from_millis(READY_TIMEOUT_MILLIS);
+    loop {
         if let Some(connection) = state.connection.lock().unwrap().clone() {
             return Ok(connection);
         }
         if let Some(failure) = state.failure.lock().unwrap().clone() {
             return Err(failure);
         }
-        thread::sleep(Duration::from_millis(READY_POLL_MILLIS));
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "core did not become ready within {READY_TIMEOUT_MILLIS} ms"
+            ));
+        }
+        thread::sleep(Duration::from_millis(READ_POLL_MILLIS));
     }
-    Err("core did not become ready within 10 seconds".to_string())
 }
 
 fn main() {
@@ -139,18 +161,43 @@ fn main() {
         .manage(state)
         .setup(|app| {
             let handle = app.handle().clone();
-            // Spawning on a thread keeps the blocking READY-line read off the
-            // window setup path; core_connection() gates the UI.
-            thread::spawn(move || match spawn_core() {
-                Ok((child, connection)) => {
-                    let state: State<CoreState> = handle.state();
-                    *state.connection.lock().unwrap() = Some(connection);
-                    *state.child.lock().unwrap() = Some(child);
-                }
-                Err(error) => {
-                    eprintln!("failed to start core: {error}");
-                    let state: State<CoreState> = handle.state();
-                    *state.failure.lock().unwrap() = Some(error);
+            // Spawning on a thread keeps the blocking handshake off the window
+            // setup path; core_connection() gates the UI.
+            thread::spawn(move || {
+                let state: State<CoreState> = handle.state();
+                let spawn_result = spawn_core();
+                let (child, token) = match spawn_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        log_spawn_event(&format!("failed to start core: {error}"));
+                        *state.failure.lock().unwrap() = Some(error);
+                        return;
+                    }
+                };
+
+                // Register the child BEFORE the handshake so that app exit,
+                // handshake timeout, or an early core exit can all stop it.
+                let mut guard = state.child.lock().unwrap();
+                *guard = Some(child);
+                let ready = wait_for_core_ready(guard.as_mut().unwrap());
+                match ready {
+                    Ok(port) => {
+                        *state.connection.lock().unwrap() = Some(CoreConnection {
+                            base_url: format!("http://127.0.0.1:{port}"),
+                            token,
+                        });
+                    }
+                    Err(error) => {
+                        {
+                            let child = guard.as_mut().unwrap();
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        *guard = None;
+                        drop(guard);
+                        log_spawn_event(&format!("core startup failed: {error}"));
+                        *state.failure.lock().unwrap() = Some(error);
+                    }
                 }
             });
             Ok(())
