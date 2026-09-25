@@ -297,6 +297,20 @@ mod tests {
         assert!(parse_core_error(&format!("{ERROR_MARKER} code=unknown")).is_none());
         assert!(parse_core_error("CORPI_CORE_READY port=1234").is_none());
     }
+
+    #[test]
+    fn startup_error_does_not_forward_extra_source_content() {
+        let message = parse_core_error(
+            "CORPI_CORE_ERROR code=migration_failed context=sensitive-source-marker",
+        )
+        .expect("recognized error code");
+
+        assert_eq!(
+            message,
+            "core persistence startup failed: the local database could not be upgraded"
+        );
+        assert!(!message.contains("sensitive-source-marker"));
+    }
 }
 
 fn spawn_core(data_dir: &Path) -> Result<(Child, String), String> {

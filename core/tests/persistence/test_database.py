@@ -215,6 +215,20 @@ def test_schema_indexes_dependent_record_lookups(database: Database) -> None:
     } <= indexes
 
 
+def test_initial_schema_has_no_provider_credential_fields(database: Database) -> None:
+    with database.connect() as connection:
+        declarations = "\n".join(
+            row[0].lower()
+            for row in connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE type='table' AND sql IS NOT NULL"
+            )
+        )
+
+    assert "provider_key" not in declarations
+    assert "api_key" not in declarations
+    assert "access_token" not in declarations
+
+
 def test_competing_writer_succeeds_when_the_lock_is_released(database: Database) -> None:
     attempting = threading.Event()
     outcome: list[str] = []
@@ -237,6 +251,27 @@ def test_competing_writer_succeeds_when_the_lock_is_released(database: Database)
 
     assert not thread.is_alive()
     assert outcome == ["acquired"]
+
+
+def test_wal_reader_remains_available_while_a_writer_has_uncommitted_rows(
+    database: Database,
+) -> None:
+    with database.connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "INSERT INTO notebooks(id,title,created_at,updated_at) VALUES(?,?,?,?)",
+            (
+                "22222222-2222-4222-8222-222222222222",
+                "Pending write",
+                "2026-01-01T00:00:00.000000Z",
+                "2026-01-01T00:00:00.000000Z",
+            ),
+        )
+        with database.connect() as reader:
+            assert reader.execute("SELECT count(*) FROM notebooks").fetchone()[0] == 0
+        writer.execute("COMMIT")
+    with database.connect() as reader:
+        assert reader.execute("SELECT count(*) FROM notebooks").fetchone()[0] == 1
 
 
 def test_lock_timeout_is_a_busy_error_and_does_not_block_async_ticker(data_dir: Path) -> None:

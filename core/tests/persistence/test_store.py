@@ -1,5 +1,8 @@
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
+from secrets import token_hex
 
 import pytest
 
@@ -205,6 +208,75 @@ def test_exact_job_and_step_retry_reuses_one_committed_output(database: Database
     assert len(snapshot.job_steps) == 1
 
 
+def test_crashed_writer_rolls_back_partial_extraction_before_retry(
+    database: Database, data_dir: Path
+) -> None:
+    store = PersistenceStore(database)
+    source_id, source_version = seed_source(store)
+    extraction, passages = make_extraction(source_id, source_version)
+    job = store.create_job("extract:crash", "extract", source_id, source_version.id)
+    before = store.load_snapshot()
+
+    # Exit the writer process without COMMIT or connection cleanup after two related inserts.
+    child = '''
+import os
+import sys
+from pathlib import Path
+from core.persistence.database import Database, DatabaseConfig
+from core.persistence.models import utc_timestamp
+
+data_dir, source_id, version_id, extraction_id, passage_id = sys.argv[1:]
+database = Database(DatabaseConfig(Path(data_dir)))
+with database.connect() as connection:
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        """INSERT INTO extraction_versions
+        (id,source_id,source_version_id,parser_name,parser_version,
+         normalization_version,settings_format_version,settings_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
+        (extraction_id, source_id, version_id, "pdf", "1", "nfc", 1, "{}", utc_timestamp()),
+    )
+    connection.execute(
+        """INSERT INTO passages
+        (id,source_id,source_version_id,extraction_version_id,ordinal,text,
+         location_format_version,location_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)""",
+        (passage_id, source_id, version_id, extraction_id,
+         0, "partial evidence", 1, "{}", utc_timestamp()),
+    )
+    os._exit(71)
+'''
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child,
+            str(data_dir),
+            source_id,
+            source_version.id,
+            extraction.id,
+            passages[0].id,
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 71, result.stderr
+
+    reopened_database = Database(DatabaseConfig(data_dir))
+    reopened_database.initialize()
+    reopened = PersistenceStore(reopened_database)
+    assert reopened.load_snapshot() == before
+
+    step = reopened.commit_extraction_step(
+        job.id, "extract", extraction, passages, 1, {"done": True}
+    )
+    assert step.output_extraction_version_id == extraction.id
+    assert reopened.load_extraction(extraction.id).passages == passages
+    assert len(reopened.load_snapshot().job_steps) == 1
+
+
 def test_job_output_and_checkpoint_roll_back_together_on_target_mismatch(
     database: Database,
 ) -> None:
@@ -273,6 +345,24 @@ def test_database_trigger_rejects_passage_update(database: Database) -> None:
         with database.connect() as connection:
             connection.execute("UPDATE passages SET text='rewritten' WHERE id=?", (passages[0].id,))
 
+    assert store.load_extraction(extraction.id).passages == passages
+
+
+def test_passage_text_is_absent_from_conflict_errors_and_general_output(
+    database: Database, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = PersistenceStore(database)
+    source_id, source_version = seed_source(store)
+    extraction, passages = make_extraction(source_id, source_version)
+    store.save_extraction(extraction, passages)
+    sensitive_text = token_hex(24)
+
+    with pytest.raises(ConflictingWriteError) as raised:
+        store.save_extraction(extraction, (replace(passages[0], text=sensitive_text), passages[1]))
+
+    output = capsys.readouterr()
+    assert sensitive_text not in str(raised.value)
+    assert sensitive_text not in output.out + output.err
     assert store.load_extraction(extraction.id).passages == passages
 
 
@@ -347,6 +437,60 @@ def test_reindex_and_reextract_keep_old_generations_unchanged(database: Database
         item.extraction_version_id == extraction_two.id
         for item in store.load_index(index_three.id).chunks
     )
+
+
+def test_embedding_revision_creates_another_index_without_changing_saved_evidence(
+    database: Database, data_dir: Path
+) -> None:
+    store = PersistenceStore(database)
+    source_id, source_version = seed_source(store)
+    extraction, passages = make_extraction(source_id, source_version)
+    store.save_extraction(extraction, passages)
+
+    first, first_chunks, first_mappings = make_index(extraction, passages)
+    first = replace(
+        first, index_kind="semantic", embedding_model="local-model", embedding_revision="rev-1"
+    )
+    first_graph = store.save_index(first, first_chunks, first_mappings)
+    second, second_chunks, second_mappings = make_index(extraction, passages)
+    second = replace(
+        second, index_kind="semantic", embedding_model="local-model", embedding_revision="rev-2"
+    )
+    second_graph = store.save_index(second, second_chunks, second_mappings)
+
+    reopened_database = Database(DatabaseConfig(data_dir))
+    reopened_database.initialize()
+    reopened = PersistenceStore(reopened_database)
+    assert first.id != second.id
+    assert reopened.load_index(first.id) == first_graph
+    assert reopened.load_index(second.id) == second_graph
+    assert reopened.load_extraction(extraction.id).passages == passages
+    with pytest.raises(ConflictingWriteError):
+        reopened.save_index(
+            replace(first, embedding_revision="rev-2"), first_chunks, first_mappings
+        )
+    assert reopened.load_index(first.id) == first_graph
+
+
+def test_missing_parent_and_duplicate_identity_fail_without_corrupting_saved_rows(
+    database: Database,
+) -> None:
+    store = PersistenceStore(database)
+    notebook = store.create_notebook(new_id(), "Original")
+
+    with pytest.raises(IntegrityViolationError):
+        store.create_source(new_id(), new_id(), "Orphan source")
+    with pytest.raises(ConflictingWriteError):
+        store.create_notebook(notebook.id, "Different content")
+    with pytest.raises(IntegrityViolationError):
+        with database.connect() as connection:
+            connection.execute(
+                "INSERT INTO notebooks(id,title,created_at,updated_at) VALUES(?,?,?,?)",
+                (notebook.id, "Duplicate", notebook.created_at, notebook.updated_at),
+            )
+
+    assert store.load_notebook(notebook.id) == notebook
+    assert store.load_snapshot().sources == ()
 
 
 def test_index_mapping_rejects_offsets_beyond_saved_passage(database: Database) -> None:
