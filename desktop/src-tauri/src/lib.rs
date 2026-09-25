@@ -33,6 +33,18 @@ pub fn run() {
     tauri::Builder::default()
         .manage(CoreState::new())
         .setup(|app| {
+            let state: State<CoreState> = app.state();
+            let data_dir = match app.path().app_data_dir() {
+                Ok(path) => path,
+                Err(_) => {
+                    let message = "core user app-data directory is unavailable".to_string();
+                    log_spawn_event(&message);
+                    state.set_failure(message);
+                    return Ok(());
+                }
+            };
+            state.set_data_dir(data_dir);
+
             let handle = app.handle().clone();
             // Spawning on a thread keeps the blocking handshake off the window
             // setup path; core_connection() gates the UI.
