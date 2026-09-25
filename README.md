@@ -16,9 +16,10 @@ Notebooks and saved research stay on the user's device. Answer generation uses t
 - Windows builds additionally need:
   - MSVC build tools (Visual Studio Build Tools with the "Desktop development with C++" workload)
   - WebView2 runtime (Windows ships it with Edge)
+- macOS builds additionally need Homebrew Python 3.13 with SQLite 3.51.3 or newer; see the macOS setup below. `uv` still manages the core's packages.
 - End-to-end tests only: [tauri-driver](https://tauri.app/develop/tests/webdriver/) (`cargo install tauri-driver`) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`)
 
-Python is managed by uv through `core/.python-version`; uv downloads its own Python 3.13.
+`uv` manages the core's Python environment and packages. It downloads Python 3.13 by default; on macOS, select the Homebrew interpreter below so Python loads a supported SQLite version.
 
 ## Setup
 
@@ -32,6 +33,25 @@ just dev
 ```
 
 With mise activated, `node`, `pnpm`, `just`, `uv`, and `cargo` resolve to the pinned versions inside this repository; outside it, your global mise tools are untouched.
+
+### macOS Python and SQLite
+
+The uv-selected Python on macOS CI loaded SQLite 3.50.4, below the version Corpi requires for safe WAL use. Set up the project tools and use Homebrew's Python 3.13 as the interpreter for the `uv` environment. From the repository root in zsh:
+
+```sh
+mise trust
+mise install
+eval "$(mise activate zsh)"
+brew install python@3.13
+export UV_PYTHON="$(brew --prefix python@3.13)/bin/python3.13"
+uv sync --directory core
+pnpm --dir desktop install
+uv run --directory core python -c 'import sqlite3; print(sqlite3.sqlite_version)'
+export CORPI_CORE_DIR="$(pwd)/core"
+pnpm --dir desktop tauri dev
+```
+
+Confirm that the printed SQLite version is at least 3.51.3. Keep `UV_PYTHON` set when launching the desktop app so its child core uses the same interpreter. The root `just` recipes currently require `pwsh`; the direct macOS launch command above does not. This setup does not change the Python-core packaging decision.
 
 ## Commands
 
@@ -47,7 +67,7 @@ Run from the repository root:
 | `just schema-export` | Re-export `core/openapi.json` after changing core routes. |
 | `just schema-check` | Verify the committed OpenAPI schema still matches the live core routes. |
 
-Core setup is `uv sync` inside `core/` (uv installs Python 3.13 itself); desktop setup is `pnpm install` inside `desktop/`.
+Core setup is `uv sync` inside `core/`; desktop setup is `pnpm install` inside `desktop/`. On macOS, set `UV_PYTHON` as shown above before syncing or launching the core.
 
 ## API contract
 
