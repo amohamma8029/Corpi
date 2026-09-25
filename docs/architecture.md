@@ -485,7 +485,7 @@ and links to the work that produced or used it.
 
 | Storage responsibility | What it keeps |
 | --- | --- |
-| Local app records | Notebooks; source details and versions; immutable citation passages and their retrieval-chunk links; search metadata; conversations, answers, notes, artifacts, and citations; citation-check failures; settings and job/task state. |
+| Local app records | One SQLite database under the user's Corpi app-data directory: notebooks; source details and versions; immutable citation passages and their retrieval-chunk links; search metadata; conversations, answers, notes, artifacts, and citations; citation-check failures; settings and job/task state. |
 | Corpi-managed files | Uploaded originals, saved web pages/PDFs, previews, generated documents/exports, and other large app-managed files. Export behavior is still open. |
 | Search indexes | Local keyword and semantic/vector indexes. Record each index version, the source versions it covers, and the embedding model and version used for semantic search. |
 | Secure credential storage | External generation credentials, kept outside ordinary app/database fields. The storage/decryption technology and authorized component remain open. |
@@ -502,8 +502,22 @@ by `chunk_id` in [citation references](#citation-passages-and-retrieval-chunks).
 
 Index the combined identity and the referencing citation records so Corpi can efficiently locate
 both a passage and every citation that depends on it. Use composite indexes and indexed foreign
-keys, or the selected local store's equivalent capabilities, to preserve these lookup and valid-link
-guarantees. The exact database implementation remains open.
+keys to preserve these lookup and valid-link guarantees. Initial v1 uses one SQLite application
+database through Python's standard-library `sqlite3`, with composite constraints and indexed links.
+
+#### Local database and migrations
+
+Store structured records for all notebooks in one SQLite database beneath Tauri's per-user app-data
+directory. Keep large originals outside the database and reference them through managed-file records;
+their directory layout and copy behavior remain part of the file-management milestone. Enable WAL
+and `synchronous=FULL`, with a configurable 5,000 ms starting lock wait on each connection. Require
+SQLite 3.51.3 or newer for the WAL-reset fix, and record the library actually loaded by Python.
+
+Use ordered, checked-in SQL migrations with revision history and source/schema checksums. Acquire
+SQLite's `BEGIN IMMEDIATE` writer lock before trusting migration history so simultaneous core starts
+cannot apply the same revision. Complete runtime checks and migrations before the core reports READY.
+Reject an unsupported or tampered database without repairing or replacing it. When a risky migration
+needs recovery, create a bounded snapshot with SQLite's backup API.
 
 #### Preserve sources and saved results
 
@@ -668,10 +682,12 @@ prompts in retrieved documents, the desktop UI, and the fetch sandbox cannot dir
 read stored credentials. Use an appropriate secure local credential mechanism, not ordinary
 app/database fields.
 
-Local data stays under the user's OS account and app-data boundary. Database/file encryption
-remains **Needs Decision**. Single-user v1 needs no hosted account/session or workspace authorization
-service. The app controls how responses are displayed, and fixed citation passages keep their
-evidence stable.
+The database and Corpi-managed research files stay under the user's OS-account and app-data
+boundary. Initial v1 does not add Corpi-managed encryption; copied database or file data is not
+promised to remain confidential. Provider credentials remain separate and must use secure local
+credential storage outside ordinary database fields. Single-user v1 needs no hosted account/session
+or workspace authorization service. The app controls how responses are displayed, and fixed citation
+passages keep their evidence stable.
 
 ## Decision register
 
@@ -688,6 +704,7 @@ Deferred items also state whether they await the artifact milestone or fall outs
 | Evidence | Keep citation passages immutable and retrieval chunks replaceable. Check references with app rules and claim support with a separate model call. |
 | Models | Use the user's configured external provider and BYOK credentials for generation. Corpi manages local embeddings by default. |
 | History | Make ready versions available all at once. Preserve source/output versions and template/rendering versions. Regenerate only on request. Use 30-day local trash. |
+| Local database and research-data protection | Use one standard-library SQLite database under the per-user app-data directory, relational versioned records, immutable citation passages, ordered SQL migrations, and the OS-account/app-data protection boundary without additional Corpi-managed research-data encryption in initial v1. Keep provider credentials in separate secure storage. |
 | Desktop shell and local core | Tauri 2 + React/TypeScript shell; Python 3.13 core managed with uv; FastAPI over loopback HTTP with a per-launch bearer token, `Origin`/`Host` validation, and authenticated streaming read with `fetch` (or a WebSocket authenticated on connect). Monorepo with `core/`, `desktop/`, and a root justfile. Electron is the documented fallback if Tauri sidecar packaging proves too painful. |
 
 ### Open implementation choices
@@ -696,12 +713,11 @@ Choose and record each open implementation detail before building the component 
 
 | Area | Status | What remains open |
 | --- | --- | --- |
-| Local database/state store | **Needs Decision** | Database technology and how it implements indexes and valid record links. |
 | Local keyword/FTS and vector search | **Needs Decision** | Both search implementations. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
 | Local embeddings | **Needs Decision** | Supported model and runtime; benchmark them before selection. Local-by-default processing is decided. |
 | Background work | **Needs Decision** | Task/process/runtime mechanism. |
 | Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
-| Local files and data protection | **Needs Decision** | Source/app file layout and database/file encryption. |
+| Local file layout | **Needs Decision** | Source/app file layout, safe copy behavior, and retention implementation. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
 | Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
 | Fetch/browser | **Needs Decision** | Sandboxing and browser tools. |
 | Format tools | **Needs Decision** | Native PDF extraction library, separate OCR engine, DOCX parser, HTML/boilerplate extractor, and YouTube transcript method/library. |

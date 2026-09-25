@@ -1,0 +1,1097 @@
+"""Typed, transactional save/load operations for local Corpi records."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from pathlib import PurePosixPath, PureWindowsPath
+
+from core.persistence.database import Database
+from core.persistence.errors import (
+    ConflictingWriteError,
+    PersistenceError,
+    translate_sqlite_error,
+)
+from core.persistence.models import (
+    ChunkPassage,
+    ExtractionGraph,
+    ExtractionVersion,
+    IndexGraph,
+    IndexVersion,
+    Job,
+    JobStep,
+    JSONValue,
+    ManagedFile,
+    Notebook,
+    Passage,
+    PersistenceSnapshot,
+    RetrievalChunk,
+    Source,
+    SourceVersion,
+    decode_json,
+    encode_json,
+    new_id,
+    utc_timestamp,
+    validate_id,
+    validate_sha256,
+    validate_utc_timestamp,
+)
+
+
+class PersistenceStore:
+    """Application-owned store; callers cannot access a long-lived connection."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def create_notebook(self, notebook_id: str, title: str) -> Notebook:
+        validate_id(notebook_id)
+        title = _required_text(title, "notebook title")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _fetchone(connection, "SELECT * FROM notebooks WHERE id=?", (notebook_id,))
+            if row is None:
+                connection.execute(
+                    "INSERT INTO notebooks(id,title,created_at,updated_at) VALUES(?,?,?,?)",
+                    (notebook_id, title, timestamp, timestamp),
+                )
+                row = _fetchone(connection, "SELECT * FROM notebooks WHERE id=?", (notebook_id,))
+            elif row["title"] != title:
+                raise ConflictingWriteError("notebook identity already has different content")
+            return _notebook(_require_row(row))
+
+    def rename_notebook(self, notebook_id: str, title: str) -> Notebook:
+        validate_id(notebook_id)
+        title = _required_text(title, "notebook title")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE notebooks SET title=?, updated_at=? WHERE id=?",
+                (title, utc_timestamp(), notebook_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("notebook does not exist")
+            row = _fetchone(connection, "SELECT * FROM notebooks WHERE id=?", (notebook_id,))
+            return _notebook(_require_row(row))
+
+    def create_source(self, source_id: str, notebook_id: str, display_name: str) -> Source:
+        validate_id(source_id)
+        validate_id(notebook_id)
+        display_name = _required_text(display_name, "source display name")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _fetchone(connection, "SELECT * FROM sources WHERE id=?", (source_id,))
+            if row is None:
+                connection.execute(
+                    """INSERT INTO sources(id,notebook_id,display_name,created_at,updated_at)
+                       VALUES(?,?,?,?,?)""",
+                    (source_id, notebook_id, display_name, timestamp, timestamp),
+                )
+                row = _fetchone(connection, "SELECT * FROM sources WHERE id=?", (source_id,))
+            elif row["notebook_id"] != notebook_id or row["display_name"] != display_name:
+                raise ConflictingWriteError("source identity already has different content")
+            return _source(_require_row(row))
+
+    def rename_source(self, source_id: str, display_name: str) -> Source:
+        validate_id(source_id)
+        display_name = _required_text(display_name, "source display name")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE sources SET display_name=?, updated_at=? WHERE id=?",
+                (display_name, utc_timestamp(), source_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("source does not exist")
+            row = _fetchone(connection, "SELECT * FROM sources WHERE id=?", (source_id,))
+            return _source(_require_row(row))
+
+    def save_managed_file(self, managed_file: ManagedFile) -> ManagedFile:
+        _validate_managed_file(managed_file)
+        with self._transaction() as connection:
+            _save_managed_file(connection, managed_file)
+            return _managed_file(
+                _require_row(
+                    _fetchone(
+                        connection,
+                        "SELECT * FROM managed_files WHERE id=?",
+                        (managed_file.id,),
+                    )
+                )
+            )
+
+    def create_source_version(
+        self,
+        source_id: str,
+        content_sha256: str,
+        managed_file_id: str | None = None,
+        version_id: str | None = None,
+    ) -> SourceVersion:
+        source_version = SourceVersion(
+            id=version_id or new_id(),
+            source_id=source_id,
+            managed_file_id=managed_file_id,
+            content_sha256=content_sha256,
+            created_at=utc_timestamp(),
+        )
+        _validate_source_version(source_version)
+        with self._transaction() as connection:
+            _save_source_version(connection, source_version)
+            return _source_version(
+                _require_row(
+                    _fetchone(
+                        connection,
+                        "SELECT * FROM source_versions WHERE id=?",
+                        (source_version.id,),
+                    )
+                )
+            )
+
+    def save_extraction(
+        self,
+        extraction: ExtractionVersion,
+        passages: Sequence[Passage],
+    ) -> ExtractionGraph:
+        with self._transaction() as connection:
+            _save_extraction(connection, extraction, passages)
+            return _load_extraction(connection, extraction.id)
+
+    def save_index(
+        self,
+        index: IndexVersion,
+        chunks: Sequence[RetrievalChunk],
+        mappings: Sequence[ChunkPassage],
+    ) -> IndexGraph:
+        with self._transaction() as connection:
+            _save_index(connection, index, chunks, mappings)
+            return _load_index(connection, index.id)
+
+    def create_job(
+        self,
+        logical_work_key: str,
+        kind: str,
+        source_id: str,
+        source_version_id: str | None = None,
+        extraction_version_id: str | None = None,
+        index_version_id: str | None = None,
+    ) -> Job:
+        logical_work_key = _required_text(logical_work_key, "logical work key")
+        kind = _required_text(kind, "job kind")
+        _validate_job_targets(source_id, source_version_id, extraction_version_id, index_version_id)
+        timestamp = utc_timestamp()
+        proposed_id = new_id()
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO jobs(
+                       id,logical_work_key,kind,source_id,source_version_id,
+                       extraction_version_id,index_version_id,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(logical_work_key) DO NOTHING""",
+                (
+                    proposed_id,
+                    logical_work_key,
+                    kind,
+                    source_id,
+                    source_version_id,
+                    extraction_version_id,
+                    index_version_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = _fetchone(
+                connection,
+                "SELECT * FROM jobs WHERE logical_work_key=?",
+                (logical_work_key,),
+            )
+            if row is None:
+                raise PersistenceError("job could not be saved")
+            expected = (kind, source_id, source_version_id, extraction_version_id, index_version_id)
+            actual = tuple(
+                row[field]
+                for field in (
+                    "kind",
+                    "source_id",
+                    "source_version_id",
+                    "extraction_version_id",
+                    "index_version_id",
+                )
+            )
+            if actual != expected:
+                raise ConflictingWriteError("logical work key already identifies different work")
+            return _job(row)
+
+    def commit_source_version_step(
+        self,
+        job_id: str,
+        step_key: str,
+        source_version: SourceVersion,
+        checkpoint_format_version: int,
+        checkpoint: JSONValue,
+        managed_file: ManagedFile | None = None,
+    ) -> JobStep:
+        _validate_source_version(source_version)
+        if managed_file is not None:
+            _validate_managed_file(managed_file)
+            if source_version.managed_file_id != managed_file.id:
+                raise ValueError("source version and managed-file identities do not match")
+        with self._transaction() as connection:
+            if managed_file is not None:
+                _save_managed_file(connection, managed_file)
+            _save_source_version(connection, source_version)
+            _save_job_step(
+                connection,
+                job_id,
+                step_key,
+                checkpoint_format_version,
+                checkpoint,
+                output_source_version_id=source_version.id,
+            )
+            return _load_job_step(connection, job_id, step_key)
+
+    def commit_extraction_step(
+        self,
+        job_id: str,
+        step_key: str,
+        extraction: ExtractionVersion,
+        passages: Sequence[Passage],
+        checkpoint_format_version: int,
+        checkpoint: JSONValue,
+    ) -> JobStep:
+        with self._transaction() as connection:
+            _save_extraction(connection, extraction, passages)
+            _save_job_step(
+                connection,
+                job_id,
+                step_key,
+                checkpoint_format_version,
+                checkpoint,
+                output_extraction_version_id=extraction.id,
+            )
+            return _load_job_step(connection, job_id, step_key)
+
+    def commit_index_step(
+        self,
+        job_id: str,
+        step_key: str,
+        index: IndexVersion,
+        chunks: Sequence[RetrievalChunk],
+        mappings: Sequence[ChunkPassage],
+        checkpoint_format_version: int,
+        checkpoint: JSONValue,
+    ) -> JobStep:
+        with self._transaction() as connection:
+            _save_index(connection, index, chunks, mappings)
+            _save_job_step(
+                connection,
+                job_id,
+                step_key,
+                checkpoint_format_version,
+                checkpoint,
+                output_index_version_id=index.id,
+            )
+            return _load_job_step(connection, job_id, step_key)
+
+    def load_notebook(self, notebook_id: str) -> Notebook:
+        validate_id(notebook_id)
+        with self.database.connect() as connection:
+            row = _fetchone(connection, "SELECT * FROM notebooks WHERE id=?", (notebook_id,))
+            if row is None:
+                raise PersistenceError("notebook does not exist")
+            return _notebook(_require_row(row))
+
+    def load_source(self, source_id: str) -> Source:
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            row = _fetchone(connection, "SELECT * FROM sources WHERE id=?", (source_id,))
+            if row is None:
+                raise PersistenceError("source does not exist")
+            return _source(_require_row(row))
+
+    def load_extraction(self, extraction_version_id: str) -> ExtractionGraph:
+        validate_id(extraction_version_id)
+        with self.database.connect() as connection:
+            return _load_extraction(connection, extraction_version_id)
+
+    def load_index(self, index_version_id: str) -> IndexGraph:
+        validate_id(index_version_id)
+        with self.database.connect() as connection:
+            return _load_index(connection, index_version_id)
+
+    def load_job(self, logical_work_key: str) -> Job:
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM jobs WHERE logical_work_key=?",
+                (logical_work_key,),
+            )
+            if row is None:
+                raise PersistenceError("job does not exist")
+            return _job(row)
+
+    def load_job_step(self, job_id: str, step_key: str) -> JobStep:
+        validate_id(job_id)
+        with self.database.connect() as connection:
+            return _load_job_step(connection, job_id, step_key)
+
+    def load_snapshot(self) -> PersistenceSnapshot:
+        """Load every 1.2 record through one read transaction for restart evidence."""
+        with self._transaction(write=False) as connection:
+            notebooks = tuple(
+                _notebook(row) for row in connection.execute("SELECT * FROM notebooks ORDER BY id")
+            )
+            sources = tuple(
+                _source(row) for row in connection.execute("SELECT * FROM sources ORDER BY id")
+            )
+            managed_files = tuple(
+                _managed_file(row)
+                for row in connection.execute("SELECT * FROM managed_files ORDER BY id")
+            )
+            source_versions = tuple(
+                _source_version(row)
+                for row in connection.execute("SELECT * FROM source_versions ORDER BY id")
+            )
+            extractions = tuple(
+                _load_extraction(connection, row["id"])
+                for row in connection.execute("SELECT id FROM extraction_versions ORDER BY id")
+            )
+            indexes = tuple(
+                _load_index(connection, row["id"])
+                for row in connection.execute("SELECT id FROM index_versions ORDER BY id")
+            )
+            jobs = tuple(_job(row) for row in connection.execute("SELECT * FROM jobs ORDER BY id"))
+            job_steps = tuple(
+                _job_step(row)
+                for row in connection.execute("SELECT * FROM job_steps ORDER BY job_id,step_key")
+            )
+            return PersistenceSnapshot(
+                notebooks,
+                sources,
+                managed_files,
+                source_versions,
+                extractions,
+                indexes,
+                jobs,
+                job_steps,
+            )
+
+    @contextmanager
+    def _transaction(self, write: bool = True) -> Iterator[sqlite3.Connection]:
+        try:
+            with self.database.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                try:
+                    yield connection
+                    connection.execute("COMMIT")
+                except Exception:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.Error as error:
+            translated = translate_sqlite_error(error)
+            raise translated from error
+
+
+def _fetchone(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: tuple[object, ...] = (),
+) -> sqlite3.Row | None:
+    return connection.execute(query, parameters).fetchone()
+
+
+def _require_row(row: sqlite3.Row | None) -> sqlite3.Row:
+    if row is None:
+        raise PersistenceError("expected database record was not found")
+    return row
+
+
+def _required_text(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must not be empty")
+    return value
+
+
+def _integer(value: int, label: str, minimum: int = 0) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(f"{label} must be an integer greater than or equal to {minimum}")
+
+
+def _validate_managed_file(managed_file: ManagedFile) -> None:
+    validate_id(managed_file.id)
+    validate_sha256(managed_file.sha256)
+    path = managed_file.relative_path
+    pure_path = PurePosixPath(path)
+    windows_path = PureWindowsPath(path)
+    if (
+        not path
+        or "\\" in path
+        or pure_path.is_absolute()
+        or windows_path.drive
+        or ".." in pure_path.parts
+        or not pure_path.parts
+        or pure_path.as_posix() != path
+    ):
+        raise ValueError("managed-file reference must be a normalized app-data-relative path")
+    _integer(managed_file.size_bytes, "managed-file size")
+    validate_utc_timestamp(managed_file.created_at)
+
+
+def _validate_source_version(source_version: SourceVersion) -> None:
+    validate_id(source_version.id)
+    validate_id(source_version.source_id)
+    if source_version.managed_file_id is not None:
+        validate_id(source_version.managed_file_id)
+    validate_sha256(source_version.content_sha256)
+    validate_utc_timestamp(source_version.created_at)
+
+
+def _validate_extraction(extraction: ExtractionVersion, passages: Sequence[Passage]) -> None:
+    validate_id(extraction.id)
+    validate_id(extraction.source_id)
+    validate_id(extraction.source_version_id)
+    _required_text(extraction.parser_name, "parser name")
+    _required_text(extraction.parser_version, "parser version")
+    _required_text(extraction.normalization_version, "normalization version")
+    _integer(extraction.settings_format_version, "settings format version", minimum=1)
+    encode_json(extraction.settings)
+    validate_utc_timestamp(extraction.created_at)
+    if len({passage.id for passage in passages}) != len(passages):
+        raise ValueError("passage identities must be unique within an extraction")
+    if len({passage.ordinal for passage in passages}) != len(passages):
+        raise ValueError("passage positions must be unique within an extraction")
+    for passage in passages:
+        validate_id(passage.id)
+        if (
+            passage.source_id != extraction.source_id
+            or passage.source_version_id != extraction.source_version_id
+            or passage.extraction_version_id != extraction.id
+        ):
+            raise ValueError("passage ownership does not match its extraction")
+        _integer(passage.ordinal, "passage position")
+        _integer(passage.location_format_version, "passage location format version", minimum=1)
+        if not passage.text:
+            raise ValueError("passage position and text must be valid")
+        encode_json(passage.location)
+        validate_utc_timestamp(passage.created_at)
+
+
+def _validate_index(
+    index: IndexVersion,
+    chunks: Sequence[RetrievalChunk],
+    mappings: Sequence[ChunkPassage],
+    connection: sqlite3.Connection,
+) -> None:
+    for identifier in (
+        index.id,
+        index.source_id,
+        index.source_version_id,
+        index.extraction_version_id,
+    ):
+        validate_id(identifier)
+    _required_text(index.index_kind, "index kind")
+    _required_text(index.chunker_version, "chunker version")
+    _integer(index.settings_format_version, "settings format version", minimum=1)
+    if (index.embedding_model is None) != (index.embedding_revision is None):
+        raise ValueError("embedding model and revision must be supplied together")
+    encode_json(index.settings)
+    validate_utc_timestamp(index.created_at)
+    if len({chunk.id for chunk in chunks}) != len(chunks):
+        raise ValueError("retrieval chunk identities must be unique within an index")
+    if len({chunk.ordinal for chunk in chunks}) != len(chunks):
+        raise ValueError("retrieval chunk positions must be unique within an index")
+    chunk_ids = {chunk.id for chunk in chunks}
+    passage_text: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT id,text FROM passages WHERE extraction_version_id=?",
+        (index.extraction_version_id,),
+    ):
+        passage_text[row["id"]] = row["text"]
+    for chunk in chunks:
+        validate_id(chunk.id)
+        if (
+            chunk.index_version_id != index.id
+            or chunk.source_id != index.source_id
+            or chunk.source_version_id != index.source_version_id
+            or chunk.extraction_version_id != index.extraction_version_id
+        ):
+            raise ValueError("retrieval chunk ownership does not match its index")
+        _integer(chunk.ordinal, "retrieval chunk position")
+        if not chunk.text:
+            raise ValueError("retrieval chunk position and text must be valid")
+    seen_positions: set[tuple[str, int]] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    for mapping in mappings:
+        validate_id(mapping.retrieval_chunk_id)
+        validate_id(mapping.passage_id)
+        if (
+            mapping.index_version_id != index.id
+            or mapping.source_id != index.source_id
+            or mapping.source_version_id != index.source_version_id
+            or mapping.extraction_version_id != index.extraction_version_id
+        ):
+            raise ValueError("chunk mapping ownership does not match its index")
+        if mapping.retrieval_chunk_id not in chunk_ids:
+            raise ValueError("chunk mapping references a chunk outside this index")
+        if mapping.passage_id not in passage_text:
+            raise ValueError("chunk mapping references a passage outside this extraction")
+        _integer(mapping.ordinal, "chunk mapping position")
+        pair = (mapping.retrieval_chunk_id, mapping.passage_id)
+        position = (mapping.retrieval_chunk_id, mapping.ordinal)
+        if pair in seen_pairs or position in seen_positions:
+            raise ValueError("chunk mappings must have unique passage and order per chunk")
+        seen_pairs.add(pair)
+        seen_positions.add(position)
+        if (mapping.start_offset is None) != (mapping.end_offset is None):
+            raise ValueError("partial passage offsets must be supplied as a pair")
+        if mapping.start_offset is not None:
+            _integer(mapping.start_offset, "partial passage start offset")
+            if mapping.end_offset is None:
+                raise ValueError("partial passage offsets must be supplied as a pair")
+            _integer(mapping.end_offset, "partial passage end offset")
+            if mapping.end_offset < mapping.start_offset:
+                raise ValueError("partial passage offsets are invalid")
+            if mapping.end_offset > len(passage_text[mapping.passage_id]):
+                raise ValueError("partial passage offsets exceed the saved passage text")
+
+
+def _validate_job_targets(
+    source_id: str,
+    source_version_id: str | None,
+    extraction_version_id: str | None,
+    index_version_id: str | None,
+) -> None:
+    validate_id(source_id)
+    for identifier in (source_version_id, extraction_version_id, index_version_id):
+        if identifier is not None:
+            validate_id(identifier)
+    if source_version_id is None and extraction_version_id is not None:
+        raise ValueError("an extraction job target requires a source-version target")
+    if extraction_version_id is None and index_version_id is not None:
+        raise ValueError("an index job target requires an extraction-version target")
+
+
+def _save_managed_file(connection: sqlite3.Connection, item: ManagedFile) -> None:
+    values = {
+        "id": item.id,
+        "relative_path": item.relative_path,
+        "size_bytes": item.size_bytes,
+        "sha256": item.sha256,
+        "created_at": item.created_at,
+    }
+    existing = _fetchone(connection, "SELECT * FROM managed_files WHERE id=?", (item.id,))
+    if existing is not None:
+        if any(existing[name] != value for name, value in values.items() if name != "created_at"):
+            raise ConflictingWriteError("managed-file identity already has different content")
+        return
+    try:
+        connection.execute(
+            """INSERT INTO managed_files(id,relative_path,size_bytes,sha256,created_at)
+               VALUES(:id,:relative_path,:size_bytes,:sha256,:created_at)""",
+            values,
+        )
+    except sqlite3.IntegrityError as error:
+        raise ConflictingWriteError("managed-file reference is already assigned") from error
+
+
+def _save_source_version(connection: sqlite3.Connection, item: SourceVersion) -> None:
+    values = {
+        "source_id": item.source_id,
+        "managed_file_id": item.managed_file_id,
+        "content_sha256": item.content_sha256,
+    }
+    existing = _fetchone(connection, "SELECT * FROM source_versions WHERE id=?", (item.id,))
+    if existing is not None:
+        if any(existing[name] != value for name, value in values.items()):
+            raise ConflictingWriteError("source-version identity already has different content")
+        return
+    connection.execute(
+        """INSERT INTO source_versions(id,source_id,managed_file_id,content_sha256,created_at)
+           VALUES(?,?,?,?,?)""",
+        (item.id, item.source_id, item.managed_file_id, item.content_sha256, item.created_at),
+    )
+
+
+def _save_extraction(
+    connection: sqlite3.Connection,
+    extraction: ExtractionVersion,
+    passages: Sequence[Passage],
+) -> None:
+    _validate_extraction(extraction, passages)
+    settings_json = encode_json(extraction.settings)
+    values = {
+        "source_id": extraction.source_id,
+        "source_version_id": extraction.source_version_id,
+        "parser_name": extraction.parser_name,
+        "parser_version": extraction.parser_version,
+        "normalization_version": extraction.normalization_version,
+        "settings_format_version": extraction.settings_format_version,
+        "settings_json": settings_json,
+    }
+    existing = connection.execute(
+        "SELECT * FROM extraction_versions WHERE id=?", (extraction.id,)
+    ).fetchone()
+    if existing is not None:
+        if any(existing[name] != value for name, value in values.items()):
+            raise ConflictingWriteError("extraction identity already has different content")
+        existing_ids = {
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM passages WHERE extraction_version_id=?", (extraction.id,)
+            )
+        }
+        if existing_ids != {passage.id for passage in passages}:
+            raise ConflictingWriteError("extraction retry contains a different passage set")
+    else:
+        connection.execute(
+            """INSERT INTO extraction_versions(
+                   id,source_id,source_version_id,parser_name,parser_version,
+                   normalization_version,settings_format_version,settings_json,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                extraction.id,
+                extraction.source_id,
+                extraction.source_version_id,
+                extraction.parser_name,
+                extraction.parser_version,
+                extraction.normalization_version,
+                extraction.settings_format_version,
+                settings_json,
+                extraction.created_at,
+            ),
+        )
+    for passage in passages:
+        _save_passage(connection, passage)
+
+
+def _save_passage(connection: sqlite3.Connection, item: Passage) -> None:
+    values: dict[str, object] = {
+        "source_id": item.source_id,
+        "source_version_id": item.source_version_id,
+        "extraction_version_id": item.extraction_version_id,
+        "ordinal": item.ordinal,
+        "text": item.text,
+        "location_format_version": item.location_format_version,
+        "location_json": encode_json(item.location),
+    }
+    existing = _fetchone(connection, "SELECT * FROM passages WHERE id=?", (item.id,))
+    if existing is not None:
+        if any(existing[name] != value for name, value in values.items()):
+            raise ConflictingWriteError("passage identity already has different evidence")
+        return
+    connection.execute(
+        """INSERT INTO passages(
+               id,source_id,source_version_id,extraction_version_id,ordinal,text,
+               location_format_version,location_json,created_at
+           ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            item.id,
+            item.source_id,
+            item.source_version_id,
+            item.extraction_version_id,
+            item.ordinal,
+            item.text,
+            item.location_format_version,
+            values["location_json"],
+            item.created_at,
+        ),
+    )
+
+
+def _save_index(
+    connection: sqlite3.Connection,
+    index: IndexVersion,
+    chunks: Sequence[RetrievalChunk],
+    mappings: Sequence[ChunkPassage],
+) -> None:
+    _validate_index(index, chunks, mappings, connection)
+    values: dict[str, object] = {
+        "source_id": index.source_id,
+        "source_version_id": index.source_version_id,
+        "extraction_version_id": index.extraction_version_id,
+        "index_kind": index.index_kind,
+        "chunker_version": index.chunker_version,
+        "settings_format_version": index.settings_format_version,
+        "settings_json": encode_json(index.settings),
+        "embedding_model": index.embedding_model,
+        "embedding_revision": index.embedding_revision,
+    }
+    existing = _fetchone(connection, "SELECT * FROM index_versions WHERE id=?", (index.id,))
+    if existing is not None:
+        if any(existing[name] != value for name, value in values.items()):
+            raise ConflictingWriteError("index identity already has different content")
+        existing_chunks = {
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM retrieval_chunks WHERE index_version_id=?", (index.id,)
+            )
+        }
+        if existing_chunks != {chunk.id for chunk in chunks}:
+            raise ConflictingWriteError("index retry contains a different chunk set")
+        existing_mappings = {
+            tuple(row)
+            for row in connection.execute(
+                """SELECT retrieval_chunk_id,passage_id,ordinal,start_offset,end_offset
+                   FROM chunk_passages WHERE index_version_id=?""",
+                (index.id,),
+            )
+        }
+        expected_mappings = {
+            (
+                item.retrieval_chunk_id,
+                item.passage_id,
+                item.ordinal,
+                item.start_offset,
+                item.end_offset,
+            )
+            for item in mappings
+        }
+        if existing_mappings != expected_mappings:
+            raise ConflictingWriteError("index retry contains different passage mappings")
+    else:
+        connection.execute(
+            """INSERT INTO index_versions(
+                   id,source_id,source_version_id,extraction_version_id,index_kind,
+                   chunker_version,settings_format_version,settings_json,embedding_model,
+                   embedding_revision,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                index.id,
+                index.source_id,
+                index.source_version_id,
+                index.extraction_version_id,
+                index.index_kind,
+                index.chunker_version,
+                index.settings_format_version,
+                values["settings_json"],
+                index.embedding_model,
+                index.embedding_revision,
+                index.created_at,
+            ),
+        )
+    for chunk in chunks:
+        _save_chunk(connection, chunk)
+    for mapping in mappings:
+        _save_mapping(connection, mapping)
+
+
+def _save_chunk(connection: sqlite3.Connection, item: RetrievalChunk) -> None:
+    values = (
+        item.index_version_id,
+        item.source_id,
+        item.source_version_id,
+        item.extraction_version_id,
+        item.ordinal,
+        item.text,
+    )
+    existing = _fetchone(connection, "SELECT * FROM retrieval_chunks WHERE id=?", (item.id,))
+    if existing is not None:
+        actual = tuple(
+            existing[field]
+            for field in (
+                "index_version_id",
+                "source_id",
+                "source_version_id",
+                "extraction_version_id",
+                "ordinal",
+                "text",
+            )
+        )
+        if actual != values:
+            raise ConflictingWriteError("retrieval-chunk identity already has different content")
+        return
+    connection.execute(
+        """INSERT INTO retrieval_chunks(
+               id,index_version_id,source_id,source_version_id,extraction_version_id,ordinal,text
+           ) VALUES(?,?,?,?,?,?,?)""",
+        (item.id, *values),
+    )
+
+
+def _save_mapping(connection: sqlite3.Connection, item: ChunkPassage) -> None:
+    values = (
+        item.index_version_id,
+        item.source_id,
+        item.source_version_id,
+        item.extraction_version_id,
+        item.ordinal,
+        item.start_offset,
+        item.end_offset,
+    )
+    existing = connection.execute(
+        "SELECT * FROM chunk_passages WHERE retrieval_chunk_id=? AND passage_id=?",
+        (item.retrieval_chunk_id, item.passage_id),
+    ).fetchone()
+    if existing is not None:
+        actual = tuple(
+            existing[field]
+            for field in (
+                "index_version_id",
+                "source_id",
+                "source_version_id",
+                "extraction_version_id",
+                "ordinal",
+                "start_offset",
+                "end_offset",
+            )
+        )
+        if actual != values:
+            raise ConflictingWriteError("chunk-to-passage mapping already has different content")
+        return
+    connection.execute(
+        """INSERT INTO chunk_passages(
+               retrieval_chunk_id,passage_id,index_version_id,source_id,source_version_id,
+               extraction_version_id,ordinal,start_offset,end_offset
+           ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (
+            item.retrieval_chunk_id,
+            item.passage_id,
+            item.index_version_id,
+            item.source_id,
+            item.source_version_id,
+            item.extraction_version_id,
+            item.ordinal,
+            item.start_offset,
+            item.end_offset,
+        ),
+    )
+
+
+def _save_job_step(
+    connection: sqlite3.Connection,
+    job_id: str,
+    step_key: str,
+    checkpoint_format_version: int,
+    checkpoint: JSONValue,
+    output_source_version_id: str | None = None,
+    output_extraction_version_id: str | None = None,
+    output_index_version_id: str | None = None,
+) -> None:
+    validate_id(job_id)
+    step_key = _required_text(step_key, "job step key")
+    _integer(checkpoint_format_version, "checkpoint format version", minimum=1)
+    checkpoint_json = encode_json(checkpoint)
+    existing = connection.execute(
+        "SELECT * FROM job_steps WHERE job_id=? AND step_key=?", (job_id, step_key)
+    ).fetchone()
+    output_values = (
+        output_source_version_id,
+        output_extraction_version_id,
+        output_index_version_id,
+    )
+    if existing is not None:
+        actual = (
+            existing["checkpoint_format_version"],
+            existing["checkpoint_json"],
+            existing["output_source_version_id"],
+            existing["output_extraction_version_id"],
+            existing["output_index_version_id"],
+        )
+        expected = (checkpoint_format_version, checkpoint_json, *output_values)
+        if actual != expected:
+            raise ConflictingWriteError("job step already has a different committed checkpoint")
+        return
+    connection.execute(
+        """INSERT INTO job_steps(
+               job_id,step_key,checkpoint_format_version,checkpoint_json,
+               output_source_version_id,output_extraction_version_id,output_index_version_id,committed_at
+           ) VALUES(?,?,?,?,?,?,?,?)""",
+        (
+            job_id,
+            step_key,
+            checkpoint_format_version,
+            checkpoint_json,
+            *output_values,
+            utc_timestamp(),
+        ),
+    )
+
+
+def _load_extraction(
+    connection: sqlite3.Connection,
+    extraction_id: str,
+) -> ExtractionGraph:
+    row = _fetchone(
+        connection,
+        "SELECT * FROM extraction_versions WHERE id=?",
+        (extraction_id,),
+    )
+    if row is None:
+        raise PersistenceError("extraction version does not exist")
+    extraction = _extraction(row)
+    passages = tuple(
+        _passage(item)
+        for item in connection.execute(
+            """SELECT * FROM passages
+               WHERE extraction_version_id=? ORDER BY ordinal,id""",
+            (extraction_id,),
+        )
+    )
+    return ExtractionGraph(extraction, passages)
+
+
+def _load_index(connection: sqlite3.Connection, index_id: str) -> IndexGraph:
+    row = connection.execute("SELECT * FROM index_versions WHERE id=?", (index_id,)).fetchone()
+    if row is None:
+        raise PersistenceError("index version does not exist")
+    index = _index(row)
+    chunks = tuple(
+        _chunk(item)
+        for item in connection.execute(
+            """SELECT * FROM retrieval_chunks
+               WHERE index_version_id=? ORDER BY ordinal,id""",
+            (index_id,),
+        )
+    )
+    mappings = tuple(
+        _mapping(item)
+        for item in connection.execute(
+            """SELECT * FROM chunk_passages WHERE index_version_id=?
+               ORDER BY retrieval_chunk_id,ordinal,passage_id""",
+            (index_id,),
+        )
+    )
+    return IndexGraph(index, chunks, mappings)
+
+
+def _load_job_step(connection: sqlite3.Connection, job_id: str, step_key: str) -> JobStep:
+    row = connection.execute(
+        "SELECT * FROM job_steps WHERE job_id=? AND step_key=?", (job_id, step_key)
+    ).fetchone()
+    if row is None:
+        raise PersistenceError("job step does not exist")
+    return _job_step(row)
+
+
+def _notebook(row: sqlite3.Row) -> Notebook:
+    return Notebook(
+        row["id"],
+        row["title"],
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _source(row: sqlite3.Row) -> Source:
+    return Source(
+        row["id"],
+        row["notebook_id"],
+        row["display_name"],
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _managed_file(row: sqlite3.Row) -> ManagedFile:
+    return ManagedFile(
+        row["id"],
+        row["relative_path"],
+        row["size_bytes"],
+        row["sha256"],
+        row["created_at"],
+    )
+
+
+def _source_version(row: sqlite3.Row) -> SourceVersion:
+    return SourceVersion(
+        row["id"],
+        row["source_id"],
+        row["managed_file_id"],
+        row["content_sha256"],
+        row["created_at"],
+    )
+
+
+def _extraction(row: sqlite3.Row) -> ExtractionVersion:
+    return ExtractionVersion(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["parser_name"],
+        row["parser_version"],
+        row["normalization_version"],
+        row["settings_format_version"],
+        decode_json(row["settings_json"]),
+        row["created_at"],
+    )
+
+
+def _passage(row: sqlite3.Row) -> Passage:
+    return Passage(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["ordinal"],
+        row["text"],
+        row["location_format_version"],
+        decode_json(row["location_json"]),
+        row["created_at"],
+    )
+
+
+def _index(row: sqlite3.Row) -> IndexVersion:
+    return IndexVersion(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["index_kind"],
+        row["chunker_version"],
+        row["settings_format_version"],
+        decode_json(row["settings_json"]),
+        row["embedding_model"],
+        row["embedding_revision"],
+        row["created_at"],
+    )
+
+
+def _chunk(row: sqlite3.Row) -> RetrievalChunk:
+    return RetrievalChunk(
+        row["id"],
+        row["index_version_id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["ordinal"],
+        row["text"],
+    )
+
+
+def _mapping(row: sqlite3.Row) -> ChunkPassage:
+    return ChunkPassage(
+        row["retrieval_chunk_id"],
+        row["passage_id"],
+        row["index_version_id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["ordinal"],
+        row["start_offset"],
+        row["end_offset"],
+    )
+
+
+def _job(row: sqlite3.Row) -> Job:
+    return Job(
+        row["id"],
+        row["logical_work_key"],
+        row["kind"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["index_version_id"],
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _job_step(row: sqlite3.Row) -> JobStep:
+    return JobStep(
+        row["job_id"],
+        row["step_key"],
+        row["checkpoint_format_version"],
+        decode_json(row["checkpoint_json"]),
+        row["output_source_version_id"],
+        row["output_extraction_version_id"],
+        row["output_index_version_id"],
+        row["committed_at"],
+    )

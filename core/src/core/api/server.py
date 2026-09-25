@@ -7,8 +7,11 @@ import time
 import uvicorn
 
 from core.api.app import create_app
+from core.persistence.database import Database, DatabaseConfig
+from core.persistence.errors import PersistenceError
 
 READY_MARKER = "CORPI_CORE_READY"
+PERSISTENCE_ERROR_MARKER = "CORPI_CORE_ERROR"
 WATCH_STDIN_ENV = "CORPI_CORE_WATCH_STDIN"
 
 
@@ -57,6 +60,12 @@ def main() -> None:
     if not token:
         print("CORPI_CORE_ERROR missing CORPI_CORE_TOKEN", file=sys.stderr, flush=True)
         raise SystemExit(2)
+
+    try:
+        Database(DatabaseConfig.from_environment()).initialize()
+    except PersistenceError as error:
+        print(f"{PERSISTENCE_ERROR_MARKER} code={error.code}", flush=True)
+        raise SystemExit(2) from None
 
     allowed = os.environ.get("CORPI_CORE_ALLOWED_ORIGINS")
     origins = allowed.split(",") if allowed else None

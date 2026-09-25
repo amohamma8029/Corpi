@@ -13,10 +13,11 @@ TOKEN = "launch-contract-token"
 
 
 @pytest.fixture()
-def core_server() -> Iterator[int]:
+def core_server(tmp_path: Path) -> Iterator[int]:
     """Launch the real server entry point and yield its OS-assigned port."""
     env = os.environ.copy()
     env["CORPI_CORE_TOKEN"] = TOKEN
+    env["CORPI_DATA_DIR"] = str(tmp_path / "corpi-data")
     process = subprocess.Popen(
         [sys.executable, "-m", "core.api.server"],
         cwd=CORE_ROOT,
@@ -82,12 +83,13 @@ def test_ready_line_means_immediately_listening(core_server: int) -> None:
     assert response.status_code == 200
 
 
-def test_stdin_close_shuts_down_when_watching() -> None:
+def test_stdin_close_shuts_down_when_watching(tmp_path: Path) -> None:
     """With the shell's opt-in watcher enabled, closing the core's stdin must
     stop the server (the portable shutdown signal)."""
     env = os.environ.copy()
     env["CORPI_CORE_TOKEN"] = TOKEN
     env["CORPI_CORE_WATCH_STDIN"] = "1"
+    env["CORPI_DATA_DIR"] = str(tmp_path / "stdin-launch-data")
     process = subprocess.Popen(
         [sys.executable, "-m", "core.api.server"],
         cwd=CORE_ROOT,
@@ -132,6 +134,50 @@ def test_stdin_close_shuts_down_when_watching() -> None:
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_invalid_existing_database_fails_before_ready(tmp_path: Path) -> None:
+    data_dir = tmp_path / "corpi-data"
+    data_dir.mkdir()
+    database_path = data_dir / "corpi.sqlite3"
+    database_path.write_bytes(b"not a Corpi database")
+    original = database_path.read_bytes()
+    env = os.environ.copy()
+    env["CORPI_CORE_TOKEN"] = TOKEN
+    env["CORPI_DATA_DIR"] = str(data_dir)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "core.api.server"],
+        cwd=CORE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "CORPI_CORE_ERROR code=unsupported_schema"
+    assert "CORPI_CORE_READY" not in result.stdout
+    assert database_path.read_bytes() == original
+
+
+def test_missing_data_directory_setting_fails_before_ready() -> None:
+    env = os.environ.copy()
+    env["CORPI_CORE_TOKEN"] = TOKEN
+    env.pop("CORPI_DATA_DIR", None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "core.api.server"],
+        cwd=CORE_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == "CORPI_CORE_ERROR code=invalid_data_dir"
+    assert "CORPI_CORE_READY" not in result.stdout
 
 
 def test_stream_delivers_chunks_over_live_socket(core_server: int) -> None:
