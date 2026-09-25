@@ -9,9 +9,10 @@
 //! process-group probe is Unix-specific; Windows shutdown is additionally
 //! covered by `just e2e`.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,62 @@ fn ensure_core_dir() {
             .join("..")
             .join("core");
         std::env::set_var("CORPI_CORE_DIR", core_dir);
+    }
+}
+
+struct TestDataDir(PathBuf);
+
+impl TestDataDir {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("corpi-launcher-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&path).expect("create isolated launcher data directory");
+        Self(path)
+    }
+}
+
+impl Drop for TestDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn isolated_core_state() -> (CoreState, TestDataDir) {
+    let data_dir = TestDataDir::new();
+    let state = CoreState::new();
+    state.set_data_dir(data_dir.0.clone());
+    (state, data_dir)
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct EnvVarRestore {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
     }
 }
 
@@ -88,7 +145,7 @@ fn assert_group_dead(pgid: u32) {
 #[test]
 fn stops_after_the_core_is_ready() {
     ensure_core_dir();
-    let state = CoreState::new();
+    let (state, _data_dir) = isolated_core_state();
     state.prepare_for_spawn().expect("prepare_for_spawn");
 
     let connection = state.launch_blocking().expect("core should start");
@@ -113,7 +170,7 @@ fn stops_after_the_core_is_ready() {
 #[test]
 fn stops_while_the_core_is_starting() {
     ensure_core_dir();
-    let state = CoreState::new();
+    let (state, _data_dir) = isolated_core_state();
     state.prepare_for_spawn().expect("prepare_for_spawn");
 
     thread::scope(|scope| {
@@ -159,7 +216,7 @@ fn stops_while_the_core_is_starting() {
 #[test]
 fn waits_for_an_in_flight_spawn_before_stopping() {
     ensure_core_dir();
-    let state = CoreState::new();
+    let (state, _data_dir) = isolated_core_state();
     state.prepare_for_spawn().expect("prepare_for_spawn");
 
     thread::scope(|scope| {
@@ -183,4 +240,106 @@ fn waits_for_an_in_flight_spawn_before_stopping() {
     });
 
     std::mem::forget(state); // see note in stops_after_the_core_is_ready
+}
+
+#[test]
+fn reports_invalid_data_directory_from_the_core_handshake() {
+    ensure_core_dir();
+    let data_dir = TestDataDir::new();
+    let invalid_path = data_dir.0.join("a-file-not-a-directory");
+    std::fs::write(&invalid_path, b"keep this file").expect("create invalid data path");
+    let state = CoreState::new();
+    state.set_data_dir(invalid_path);
+    state.prepare_for_spawn().expect("prepare_for_spawn");
+
+    let error = match state.launch_blocking() {
+        Err(error) => error,
+        Ok(_) => panic!("invalid path must fail startup"),
+    };
+
+    assert!(
+        error.contains("local data directory is unavailable"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(data_dir.0.join("a-file-not-a-directory")).unwrap(),
+        b"keep this file"
+    );
+    std::mem::forget(state);
+}
+
+#[test]
+fn reports_unsupported_schema_from_the_core_handshake_without_rewriting_it() {
+    ensure_core_dir();
+    let data_dir = TestDataDir::new();
+    let database_path = data_dir.0.join("corpi.sqlite3");
+    std::fs::write(&database_path, b"foreign database bytes").expect("create foreign database");
+    let state = CoreState::new();
+    state.set_data_dir(data_dir.0.clone());
+    state.prepare_for_spawn().expect("prepare_for_spawn");
+
+    let error = match state.launch_blocking() {
+        Err(error) => error,
+        Ok(_) => panic!("foreign schema must fail startup"),
+    };
+
+    assert!(error.contains("database schema is unsupported"), "{error}");
+    assert_eq!(
+        std::fs::read(&database_path).unwrap(),
+        b"foreign database bytes"
+    );
+    std::mem::forget(state);
+}
+
+#[test]
+fn reports_busy_database_from_the_core_handshake() {
+    ensure_core_dir();
+    let data_dir = TestDataDir::new();
+    let core_dir = std::env::var("CORPI_CORE_DIR").expect("test core directory");
+    let initialize = Command::new("uv")
+        .args([
+            "run",
+            "python",
+            "-c",
+            "from core.persistence.database import Database, DatabaseConfig; import os; Database(DatabaseConfig.from_environment()).initialize()",
+        ])
+        .current_dir(&core_dir)
+        .env("CORPI_DATA_DIR", &data_dir.0)
+        .status()
+        .expect("initialize test database");
+    assert!(initialize.success());
+
+    let _restore_timeout = EnvVarRestore::set("CORPI_SQLITE_BUSY_TIMEOUT_MS", "75");
+    let lock_script = "import sqlite3,sys,time; db=sqlite3.connect(sys.argv[1]); db.execute('BEGIN IMMEDIATE'); print('LOCKED',flush=True); time.sleep(10)";
+    let mut lock_holder = ChildGuard(
+        Command::new("uv")
+            .args(["run", "python", "-c", lock_script])
+            .arg(data_dir.0.join("corpi.sqlite3"))
+            .current_dir(&core_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start database lock holder"),
+    );
+    let stdout = lock_holder.0.stdout.take().expect("lock holder stdout");
+    let mut output = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut output)
+        .expect("read lock holder readiness");
+    assert_eq!(output.trim(), "LOCKED");
+
+    let state = CoreState::new();
+    state.set_data_dir(data_dir.0.clone());
+    state.prepare_for_spawn().expect("prepare_for_spawn");
+    let error = match state.launch_blocking() {
+        Err(error) => error,
+        Ok(_) => panic!("locked database must stop startup after its wait"),
+    };
+
+    assert!(
+        error.contains("database remained busy during startup"),
+        "{error}"
+    );
+    drop(lock_holder);
+    std::mem::forget(state);
 }

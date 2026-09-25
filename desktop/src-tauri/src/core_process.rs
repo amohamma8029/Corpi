@@ -13,6 +13,7 @@
 //!   and is stopped with a group kill.
 
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
@@ -25,6 +26,7 @@ use serde::Serialize;
 use win32job::{ExtendedLimitInfo, Job};
 
 pub const READY_MARKER: &str = "CORPI_CORE_READY";
+pub const ERROR_MARKER: &str = "CORPI_CORE_ERROR";
 /// Cold starts (fresh binary, Defender first-scan, uv resolving the venv) can
 /// be slow; the UI stays on "Connecting…" until the handshake lands. On
 /// timeout, early exit, or any other failure the core tree is stopped.
@@ -44,6 +46,7 @@ pub struct CoreState {
     connection: Mutex<Option<CoreConnection>>,
     failure: Mutex<Option<String>>,
     child: Mutex<Option<Child>>,
+    data_dir: Mutex<Option<PathBuf>>,
     /// Set when the app starts shutting down; a launch that has not spawned
     /// yet is cancelled instead of starting a process nobody would stop.
     stopping: Mutex<bool>,
@@ -67,6 +70,7 @@ impl CoreState {
             connection: Mutex::new(None),
             failure: Mutex::new(None),
             child: Mutex::new(None),
+            data_dir: Mutex::new(None),
             stopping: Mutex::new(false),
             #[cfg(windows)]
             job: Mutex::new(None),
@@ -83,6 +87,10 @@ impl CoreState {
 
     pub fn set_failure(&self, message: String) {
         *self.failure.lock().unwrap() = Some(message);
+    }
+
+    pub fn set_data_dir(&self, path: PathBuf) {
+        *self.data_dir.lock().unwrap() = Some(path);
     }
 
     /// The direct child (uv) pid while a core process is registered.
@@ -119,7 +127,13 @@ impl CoreState {
         if *self.stopping.lock().unwrap() {
             return Err("app is shutting down; core launch cancelled".to_string());
         }
-        let (child, token) = spawn_core()?;
+        let data_dir = self
+            .data_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "core app-data directory is unavailable".to_string())?;
+        let (child, token) = spawn_core(&data_dir)?;
         *guard = Some(child);
         drop(guard);
 
@@ -201,19 +215,6 @@ impl CoreState {
 
         let started = Instant::now();
         loop {
-            {
-                let mut guard = self.child.lock().unwrap();
-                match guard.as_mut() {
-                    Some(child) => {
-                        if let Ok(Some(status)) = child.try_wait() {
-                            let message = format!("core exited before reporting ready: {status}");
-                            log_spawn_event(&message);
-                            return Err(message);
-                        }
-                    }
-                    None => return Err("core process was stopped before it was ready".to_string()),
-                }
-            }
             if started.elapsed() > Duration::from_millis(READY_TIMEOUT_MILLIS) {
                 let message = format!("core did not become ready within {READY_TIMEOUT_MILLIS} ms");
                 log_spawn_event(&message);
@@ -221,6 +222,9 @@ impl CoreState {
             }
             match receiver.recv_timeout(Duration::from_millis(READ_TIMEOUT_POLL_MILLIS)) {
                 Ok(line) => {
+                    if let Some(message) = parse_core_error(&line) {
+                        return Err(message);
+                    }
                     if let Some(rest) = line.strip_prefix(READY_MARKER) {
                         if let Some(port) = rest
                             .split_whitespace()
@@ -231,7 +235,22 @@ impl CoreState {
                         }
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut guard = self.child.lock().unwrap();
+                    match guard.as_mut() {
+                        Some(child) => {
+                            if let Ok(Some(status)) = child.try_wait() {
+                                let message =
+                                    format!("core exited before reporting ready: {status}");
+                                log_spawn_event(&message);
+                                return Err(message);
+                            }
+                        }
+                        None => {
+                            return Err("core process was stopped before it was ready".to_string());
+                        }
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     let message = "core stdout closed before reporting ready".to_string();
                     log_spawn_event(&message);
@@ -242,7 +261,45 @@ impl CoreState {
     }
 }
 
-fn spawn_core() -> Result<(Child, String), String> {
+fn parse_core_error(line: &str) -> Option<String> {
+    let code = line
+        .strip_prefix(ERROR_MARKER)?
+        .trim()
+        .strip_prefix("code=")?
+        .split_whitespace()
+        .next()?;
+    let reason = match code {
+        "invalid_data_dir" => "the local data directory is unavailable",
+        "unsupported_sqlite" => "the SQLite runtime is unsupported",
+        "unsupported_schema" => "the local database schema is unsupported",
+        "database_busy" => "the local database remained busy during startup",
+        "migration_failed" => "the local database could not be upgraded",
+        _ => return None,
+    };
+    Some(format!("core persistence startup failed: {reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_core_error, ERROR_MARKER};
+
+    #[test]
+    fn maps_only_the_supported_core_error_codes() {
+        for code in [
+            "invalid_data_dir",
+            "unsupported_sqlite",
+            "unsupported_schema",
+            "database_busy",
+            "migration_failed",
+        ] {
+            assert!(parse_core_error(&format!("{ERROR_MARKER} code={code}")).is_some());
+        }
+        assert!(parse_core_error(&format!("{ERROR_MARKER} code=unknown")).is_none());
+        assert!(parse_core_error("CORPI_CORE_READY port=1234").is_none());
+    }
+}
+
+fn spawn_core(data_dir: &Path) -> Result<(Child, String), String> {
     let core_dir = match std::env::var("CORPI_CORE_DIR") {
         Ok(dir) => dir,
         Err(_) => {
@@ -259,6 +316,7 @@ fn spawn_core() -> Result<(Child, String), String> {
         .args(["run", "python", "-m", "core.api.server"])
         .current_dir(&core_dir)
         .env("CORPI_CORE_TOKEN", &token)
+        .env("CORPI_DATA_DIR", data_dir)
         // The shell holds the stdin pipe; the server exits on EOF, which
         // reaches it even when process-group kills miss the interpreter.
         .env("CORPI_CORE_WATCH_STDIN", "1")
