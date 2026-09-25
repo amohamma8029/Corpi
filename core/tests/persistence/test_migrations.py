@@ -82,6 +82,7 @@ def test_failed_risky_upgrade_keeps_rollback_and_recovery_snapshot(database: Dat
 
     snapshot = database.config.snapshot_dir / "snapshot-r0002.sqlite3"
     assert snapshot.is_file()
+    assert snapshot.is_relative_to(database.config.data_dir)
     assert list(database.config.snapshot_dir.glob("snapshot-r*.sqlite3")) == [snapshot]
     with sqlite3.connect(snapshot) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
