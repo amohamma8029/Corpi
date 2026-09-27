@@ -37,6 +37,19 @@ DEFAULT_LOCK_WAIT_MS = 5_000
 MAX_LOCK_WAIT_MS = 2_147_483_647
 
 
+def verify_sqlite_runtime() -> None:
+    """Fail before any filesystem effect when the loaded SQLite is too old.
+
+    The server runs this before acquiring the data-directory lock, so an
+    unsupported runtime never creates the data directory; `Database.initialize`
+    also calls it to keep standalone use safe.
+    """
+    if sqlite3.sqlite_version_info < MINIMUM_SQLITE_VERSION:
+        version = ".".join(str(part) for part in sqlite3.sqlite_version_info)
+        required = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
+        raise UnsupportedSQLiteError(f"loaded SQLite {version} is older than required {required}")
+
+
 @dataclass(frozen=True, slots=True)
 class DatabaseConfig:
     data_dir: Path
@@ -145,12 +158,7 @@ class Database:
             connection.close()
 
     def _verify_runtime(self) -> None:
-        if sqlite3.sqlite_version_info < MINIMUM_SQLITE_VERSION:
-            version = ".".join(str(part) for part in sqlite3.sqlite_version_info)
-            required = ".".join(str(part) for part in MINIMUM_SQLITE_VERSION)
-            raise UnsupportedSQLiteError(
-                f"loaded SQLite {version} is older than required {required}"
-            )
+        verify_sqlite_runtime()
 
     def _ensure_data_directory(self) -> None:
         try:

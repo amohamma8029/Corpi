@@ -274,6 +274,7 @@ fn parse_core_error(line: &str) -> Option<String> {
         "unsupported_schema" => "the local database schema is unsupported",
         "database_busy" => "the local database remained busy during startup",
         "migration_failed" => "the local database could not be upgraded",
+        "core_already_running" => "another Corpi core already holds this data directory",
         _ => return None,
     };
     Some(format!("core persistence startup failed: {reason}"))
@@ -291,6 +292,7 @@ mod tests {
             "unsupported_schema",
             "database_busy",
             "migration_failed",
+            "core_already_running",
         ] {
             assert!(parse_core_error(&format!("{ERROR_MARKER} code={code}")).is_some());
         }

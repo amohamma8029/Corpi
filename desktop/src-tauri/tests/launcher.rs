@@ -343,3 +343,31 @@ fn reports_busy_database_from_the_core_handshake() {
     drop(lock_holder);
     std::mem::forget(state);
 }
+
+#[test]
+fn reports_second_core_from_the_core_handshake() {
+    ensure_core_dir();
+    let data_dir = TestDataDir::new();
+
+    let first = CoreState::new();
+    first.set_data_dir(data_dir.0.clone());
+    first.prepare_for_spawn().expect("prepare_for_spawn");
+    first.launch_blocking().expect("first core should start");
+
+    let second = CoreState::new();
+    second.set_data_dir(data_dir.0.clone());
+    second.prepare_for_spawn().expect("prepare_for_spawn");
+    let error = match second.launch_blocking() {
+        Err(error) => error,
+        Ok(_) => panic!("second core must refuse startup while the first holds the directory"),
+    };
+    assert!(
+        error.contains("already holds this data directory"),
+        "{error}"
+    );
+
+    second.stop();
+    first.stop();
+    std::mem::forget(second);
+    std::mem::forget(first);
+}
