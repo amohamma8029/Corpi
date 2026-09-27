@@ -18,7 +18,9 @@ from core.persistence.errors import (
     UnsupportedSchemaError,
     UnsupportedSQLiteError,
 )
-from core.persistence.migrations import _HISTORY_SQL, CORPI_APPLICATION_ID
+from core.persistence.migrations import _HISTORY_SQL, CORPI_APPLICATION_ID, load_migrations
+
+HEAD_REVISION = len(load_migrations())
 
 
 def test_initialization_creates_private_wal_database(data_dir: Path) -> None:
@@ -33,7 +35,7 @@ def test_initialization_creates_private_wal_database(data_dir: Path) -> None:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5_000
         assert connection.execute("PRAGMA application_id").fetchone()[0] == CORPI_APPLICATION_ID
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION
     if os.name != "nt":
         assert data_dir.stat().st_mode & 0o777 == 0o700
         assert database.path.stat().st_mode & 0o777 == 0o600
@@ -54,7 +56,7 @@ def test_initialization_recovers_each_bootstrap_stage(data_dir: Path, bootstrap_
     Database(DatabaseConfig(data_dir)).initialize()
 
     with sqlite3.connect(path) as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION
         assert reopened.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -99,7 +101,7 @@ def test_zero_byte_database_file_is_initialized(data_dir: Path) -> None:
 
     with database.connect() as connection:
         assert connection.execute("PRAGMA application_id").fetchone()[0] == CORPI_APPLICATION_ID
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION
 
 
 @pytest.mark.parametrize("value", [None, "", "relative/path"])

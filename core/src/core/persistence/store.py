@@ -20,7 +20,9 @@ from core.persistence.models import (
     IndexGraph,
     IndexVersion,
     Job,
+    JobStatus,
     JobStep,
+    JobStepAttempt,
     JSONValue,
     ManagedFile,
     Notebook,
@@ -28,6 +30,8 @@ from core.persistence.models import (
     PersistenceSnapshot,
     RetrievalChunk,
     Source,
+    SourceReadiness,
+    SourceTrash,
     SourceVersion,
     decode_json,
     encode_json,
@@ -289,6 +293,342 @@ class PersistenceStore:
                 output_index_version_id=index.id,
             )
             return _load_job_step(connection, job_id, step_key)
+
+    # --- Runner and lifecycle records (subproblem 1.3) ---
+
+    def create_job_status(self, job_id: str) -> JobStatus:
+        validate_id(job_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO job_status(
+                       job_id,status,current_step_key,attempt_count,
+                       owner_instance_id,claimed_at,heartbeat_at,failure_reason,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO NOTHING""",
+                (job_id, "queued", None, 0, None, None, None, None, timestamp),
+            )
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return _job_status(_require_row(row))
+
+    def load_job_status(self, job_id: str) -> JobStatus | None:
+        with self.database.connect() as connection:
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return None if row is None else _job_status(row)
+
+    def claim_job(self, job_id: str, owner_instance_id: str) -> JobStatus:
+        owner_instance_id = _required_text(owner_instance_id, "owner instance id")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            current = _job_status(
+                _require_row(
+                    _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+                )
+            )
+            if current.status not in ("queued", "running"):
+                raise ConflictingWriteError("job is not claimable in its current status")
+            if current.status == "running" and current.owner_instance_id not in (
+                None,
+                owner_instance_id,
+            ):
+                raise ConflictingWriteError("job is already claimed by another owner")
+            connection.execute(
+                """UPDATE job_status
+                   SET status='running', owner_instance_id=?,
+                       claimed_at=COALESCE(claimed_at, ?), heartbeat_at=?, updated_at=?
+                   WHERE job_id=?""",
+                (owner_instance_id, timestamp, timestamp, timestamp, job_id),
+            )
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return _job_status(_require_row(row))
+
+    def heartbeat_job(self, job_id: str, owner_instance_id: str) -> None:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_status SET heartbeat_at=?, updated_at=?
+                   WHERE job_id=? AND owner_instance_id=? AND status='running'""",
+                (timestamp, timestamp, job_id, owner_instance_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictingWriteError("job heartbeat rejected: ownership or status mismatch")
+
+    def update_job_progress(self, job_id: str, current_step_key: str) -> JobStatus:
+        current_step_key = _required_text(current_step_key, "current step key")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE job_status SET current_step_key=?, updated_at=? WHERE job_id=?",
+                (current_step_key, timestamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("job status record does not exist")
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return _job_status(_require_row(row))
+
+    def finish_job(
+        self,
+        job_id: str,
+        status: str,
+        failure_reason: str | None = None,
+    ) -> JobStatus:
+        if status not in ("completed", "failed", "cancelled"):
+            raise ValueError("job can only finish as completed, failed, or cancelled")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_status SET status=?, failure_reason=?, updated_at=?
+                   WHERE job_id=?""",
+                (status, failure_reason, timestamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("job status record does not exist")
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return _job_status(_require_row(row))
+
+    def start_step_attempt(self, job_id: str, step_key: str) -> JobStepAttempt:
+        step_key = _required_text(step_key, "step key")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            next_number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(attempt_number), 0) + 1
+                       FROM job_step_attempts WHERE job_id=? AND step_key=?""",
+                    (job_id, step_key),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """INSERT INTO job_step_attempts(
+                       job_id,step_key,attempt_number,started_at,finished_at,failure_reason
+                   ) VALUES(?,?,?,?,?,?)""",
+                (job_id, step_key, next_number, timestamp, None, None),
+            )
+            cursor = connection.execute(
+                """UPDATE job_status
+                   SET current_step_key=?, attempt_count=attempt_count+1, updated_at=?
+                   WHERE job_id=?""",
+                (step_key, timestamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("job status record does not exist")
+            row = _fetchone(
+                connection,
+                "SELECT * FROM job_step_attempts"
+                " WHERE job_id=? AND step_key=? AND attempt_number=?",
+                (job_id, step_key, next_number),
+            )
+            return _job_step_attempt(_require_row(row))
+
+    def finish_step_attempt(
+        self,
+        job_id: str,
+        step_key: str,
+        attempt_number: int,
+        failure_reason: str | None = None,
+    ) -> JobStepAttempt:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_step_attempts SET finished_at=?, failure_reason=?
+                   WHERE job_id=? AND step_key=? AND attempt_number=? AND finished_at IS NULL""",
+                (timestamp, failure_reason, job_id, step_key, attempt_number),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictingWriteError("step attempt is unknown or already finished")
+            row = _fetchone(
+                connection,
+                "SELECT * FROM job_step_attempts"
+                " WHERE job_id=? AND step_key=? AND attempt_number=?",
+                (job_id, step_key, attempt_number),
+            )
+            return _job_step_attempt(_require_row(row))
+
+    def load_step_attempts(self, job_id: str, step_key: str) -> tuple[JobStepAttempt, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM job_step_attempts
+                   WHERE job_id=? AND step_key=? ORDER BY attempt_number""",
+                (job_id, step_key),
+            ).fetchall()
+            return tuple(_job_step_attempt(row) for row in rows)
+
+    def publish_readiness(
+        self,
+        source_id: str,
+        source_version_id: str,
+        index_version_ids: Sequence[str],
+    ) -> SourceReadiness:
+        validate_id(source_id)
+        validate_id(source_version_id)
+        cleaned_indexes = tuple(dict.fromkeys(validate_id(item) for item in index_version_ids))
+        if not cleaned_indexes:
+            raise ValueError("readiness requires at least one finished index")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO source_readiness(source_id,source_version_id,published_at,updated_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(source_id) DO UPDATE SET
+                       source_version_id=excluded.source_version_id,
+                       published_at=excluded.published_at,
+                       updated_at=excluded.updated_at""",
+                (source_id, source_version_id, timestamp, timestamp),
+            )
+            connection.execute(
+                "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
+            )
+            for index_version_id in cleaned_indexes:
+                connection.execute(
+                    "INSERT INTO source_readiness_indexes(source_id,index_version_id) VALUES(?,?)",
+                    (source_id, index_version_id),
+                )
+            return _load_readiness(connection, source_id)
+
+    def load_readiness(self, source_id: str) -> SourceReadiness | None:
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection, "SELECT 1 FROM source_readiness WHERE source_id=?", (source_id,)
+            )
+            return None if row is None else _load_readiness(connection, source_id)
+
+    def remove_readiness(self, source_id: str) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
+            )
+            connection.execute("DELETE FROM source_readiness WHERE source_id=?", (source_id,))
+
+    def trash_source(self, source_id: str, purge_deadline_at: str) -> SourceTrash:
+        """One transaction: hide readiness, cancel active jobs, record the trash deadline."""
+        validate_id(source_id)
+        validate_utc_timestamp(purge_deadline_at)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
+            )
+            connection.execute("DELETE FROM source_readiness WHERE source_id=?", (source_id,))
+            connection.execute(
+                """UPDATE job_status SET status='cancelled', failure_reason='source deleted',
+                       updated_at=?
+                   WHERE status IN ('queued','running')
+                     AND job_id IN (SELECT id FROM jobs WHERE source_id=?)""",
+                (timestamp, source_id),
+            )
+            connection.execute(
+                """INSERT INTO source_trash(
+                       source_id,trashed_at,purge_deadline_at,files_removed_at,
+                       snapshots_removed_at,updated_at
+                   ) VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(source_id) DO UPDATE SET
+                       purge_deadline_at=excluded.purge_deadline_at,
+                       updated_at=excluded.updated_at""",
+                (source_id, timestamp, purge_deadline_at, None, None, timestamp),
+            )
+            row = _fetchone(
+                connection, "SELECT * FROM source_trash WHERE source_id=?", (source_id,)
+            )
+            return _source_trash(_require_row(row))
+
+    def load_trash(self, source_id: str) -> SourceTrash | None:
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection, "SELECT * FROM source_trash WHERE source_id=?", (source_id,)
+            )
+            return None if row is None else _source_trash(row)
+
+    def list_expired_trash(self, now: str) -> tuple[SourceTrash, ...]:
+        validate_utc_timestamp(now)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM source_trash
+                   WHERE purge_deadline_at <= ? ORDER BY purge_deadline_at""",
+                (now,),
+            ).fetchall()
+            return tuple(_source_trash(row) for row in rows)
+
+    def mark_trash_files_removed(self, source_id: str) -> SourceTrash:
+        return self._mark_trash_phase(source_id, "files_removed_at")
+
+    def mark_trash_snapshots_removed(self, source_id: str) -> SourceTrash:
+        return self._mark_trash_phase(source_id, "snapshots_removed_at")
+
+    def _mark_trash_phase(self, source_id: str, column: str) -> SourceTrash:
+        if column not in ("files_removed_at", "snapshots_removed_at"):
+            raise ValueError("unknown trash phase column")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE source_trash SET {column}=?, updated_at=? WHERE source_id=?",
+                (timestamp, timestamp, source_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("source is not in trash")
+            row = _fetchone(
+                connection, "SELECT * FROM source_trash WHERE source_id=?", (source_id,)
+            )
+            return _source_trash(_require_row(row))
+
+    def remove_trashed_records(self, source_id: str) -> None:
+        """Atomic final purge phase: records, source row, and trash tracker.
+
+        File and snapshot removal happen outside the database (tracked by
+        ``files_removed_at``/``snapshots_removed_at``); this transaction removes
+        the remaining records in foreign-key order and the tracker together with
+        the source row, so a tracker row always implies the source still exists.
+        """
+        validate_id(source_id)
+        with self._transaction() as connection:
+            tracker = _fetchone(
+                connection, "SELECT 1 FROM source_trash WHERE source_id=?", (source_id,)
+            )
+            if tracker is None:
+                raise PersistenceError("source is not in trash")
+            managed_file_ids = [
+                row[0]
+                for row in connection.execute(
+                    """SELECT DISTINCT managed_file_id FROM source_versions
+                       WHERE source_id=? AND managed_file_id IS NOT NULL""",
+                    (source_id,),
+                ).fetchall()
+            ]
+            connection.execute("DELETE FROM chunk_passages WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM retrieval_chunks WHERE source_id=?", (source_id,))
+            connection.execute(
+                "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
+            )
+            connection.execute("DELETE FROM source_readiness WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM passages WHERE source_id=?", (source_id,))
+            connection.execute(
+                """DELETE FROM job_steps
+                   WHERE job_id IN (SELECT id FROM jobs WHERE source_id=?)""",
+                (source_id,),
+            )
+            connection.execute(
+                """DELETE FROM job_step_attempts
+                   WHERE job_id IN (SELECT id FROM jobs WHERE source_id=?)""",
+                (source_id,),
+            )
+            connection.execute(
+                """DELETE FROM job_status
+                   WHERE job_id IN (SELECT id FROM jobs WHERE source_id=?)""",
+                (source_id,),
+            )
+            connection.execute("DELETE FROM jobs WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM index_versions WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM extraction_versions WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM source_versions WHERE source_id=?", (source_id,))
+            for managed_file_id in managed_file_ids:
+                connection.execute(
+                    """DELETE FROM managed_files
+                       WHERE id=?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM source_versions
+                             WHERE managed_file_id = managed_files.id
+                         )""",
+                    (managed_file_id,),
+                )
+            connection.execute("DELETE FROM source_trash WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
 
     def load_notebook(self, notebook_id: str) -> Notebook:
         validate_id(notebook_id)
@@ -1094,4 +1434,58 @@ def _job_step(row: sqlite3.Row) -> JobStep:
         row["output_extraction_version_id"],
         row["output_index_version_id"],
         row["committed_at"],
+    )
+
+
+def _job_status(row: sqlite3.Row) -> JobStatus:
+    return JobStatus(
+        row["job_id"],
+        row["status"],
+        row["current_step_key"],
+        int(row["attempt_count"]),
+        row["owner_instance_id"],
+        row["claimed_at"],
+        row["heartbeat_at"],
+        row["failure_reason"],
+        row["updated_at"],
+    )
+
+
+def _job_step_attempt(row: sqlite3.Row) -> JobStepAttempt:
+    return JobStepAttempt(
+        row["job_id"],
+        row["step_key"],
+        int(row["attempt_number"]),
+        row["started_at"],
+        row["finished_at"],
+        row["failure_reason"],
+    )
+
+
+def _load_readiness(connection: sqlite3.Connection, source_id: str) -> SourceReadiness:
+    row = _require_row(
+        _fetchone(connection, "SELECT * FROM source_readiness WHERE source_id=?", (source_id,))
+    )
+    index_rows = connection.execute(
+        """SELECT index_version_id FROM source_readiness_indexes
+           WHERE source_id=? ORDER BY index_version_id""",
+        (source_id,),
+    ).fetchall()
+    return SourceReadiness(
+        row["source_id"],
+        row["source_version_id"],
+        tuple(index_row[0] for index_row in index_rows),
+        row["published_at"],
+        row["updated_at"],
+    )
+
+
+def _source_trash(row: sqlite3.Row) -> SourceTrash:
+    return SourceTrash(
+        row["source_id"],
+        row["trashed_at"],
+        row["purge_deadline_at"],
+        row["files_removed_at"],
+        row["snapshots_removed_at"],
+        row["updated_at"],
     )
