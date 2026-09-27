@@ -296,6 +296,110 @@ class PersistenceStore:
 
     # --- Runner and lifecycle records (subproblem 1.3) ---
 
+    def commit_step(
+        self,
+        job_id: str,
+        step_key: str,
+        checkpoint_format_version: int,
+        checkpoint: JSONValue,
+    ) -> JobStep:
+        """Commit a step completion that has no database version output.
+
+        The transaction re-reads the job status first, so a cancellation or a
+        finished job rejects the commit instead of recording evidence for work
+        that must not publish.
+        """
+        step_key = _required_text(step_key, "step key")
+        if checkpoint_format_version <= 0:
+            raise ValueError("checkpoint format version must be positive")
+        with self._transaction() as connection:
+            status_row = _fetchone(
+                connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
+            )
+            if status_row is None or status_row["status"] != "running":
+                raise ConflictingWriteError("job is not running; step completion rejected")
+            _save_job_step(
+                connection,
+                job_id,
+                step_key,
+                checkpoint_format_version,
+                checkpoint,
+            )
+            return _load_job_step(connection, job_id, step_key)
+
+    def load_job_by_id(self, job_id: str) -> Job:
+        validate_id(job_id)
+        with self.database.connect() as connection:
+            row = _fetchone(connection, "SELECT * FROM jobs WHERE id=?", (job_id,))
+            if row is None:
+                raise PersistenceError("job does not exist")
+            return _job(_require_row(row))
+
+    def load_job_steps(self, job_id: str) -> tuple[JobStep, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM job_steps WHERE job_id=? ORDER BY committed_at, step_key",
+                (job_id,),
+            ).fetchall()
+            return tuple(_job_step(row) for row in rows)
+
+    def list_claimable_jobs(self) -> tuple[JobStatus, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM job_status
+                   WHERE status='queued' ORDER BY updated_at, job_id"""
+            ).fetchall()
+            return tuple(_job_status(row) for row in rows)
+
+    def cancel_job(self, job_id: str, failure_reason: str = "cancelled") -> JobStatus:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_status SET status='cancelled', failure_reason=?, updated_at=?
+                   WHERE job_id=? AND status IN ('queued','running')""",
+                (failure_reason, timestamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictingWriteError("job is not cancellable in its current status")
+            row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
+            return _job_status(_require_row(row))
+
+    def annotate_queued_job(self, job_id: str, reason: str | None) -> None:
+        """Set or clear a visible blocking reason on a still-queued job."""
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_status SET failure_reason=?, updated_at=?
+                   WHERE job_id=? AND status='queued'""",
+                (reason, timestamp, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictingWriteError("job is not queued")
+
+    def release_orphaned_jobs(self, heartbeat_before: str) -> tuple[str, ...]:
+        """Return running jobs with a stale heartbeat to queued for a restarted core.
+
+        Safe because the single-core data-directory lock guarantees no other
+        core is running: a stale heartbeat means its owner is gone.
+        """
+        validate_utc_timestamp(heartbeat_before)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            rows = connection.execute(
+                """SELECT job_id FROM job_status
+                   WHERE status='running'
+                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
+                (heartbeat_before,),
+            ).fetchall()
+            connection.execute(
+                """UPDATE job_status
+                   SET status='queued', owner_instance_id=NULL, updated_at=?
+                   WHERE status='running'
+                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
+                (timestamp, heartbeat_before),
+            )
+            return tuple(row[0] for row in rows)
+
     def create_job_status(self, job_id: str) -> JobStatus:
         validate_id(job_id)
         timestamp = utc_timestamp()
@@ -377,11 +481,11 @@ class PersistenceStore:
         with self._transaction() as connection:
             cursor = connection.execute(
                 """UPDATE job_status SET status=?, failure_reason=?, updated_at=?
-                   WHERE job_id=?""",
+                   WHERE job_id=? AND status IN ('queued','running')""",
                 (status, failure_reason, timestamp, job_id),
             )
             if cursor.rowcount != 1:
-                raise PersistenceError("job status record does not exist")
+                raise ConflictingWriteError("job is not active; finish rejected")
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
 
