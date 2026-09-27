@@ -29,8 +29,8 @@ def notebook_exists(connection: sqlite3.Connection, notebook_id: str) -> bool:
 
 def migration_two(*, requires_backup: bool = False) -> Migration:
     return Migration(
-        2,
-        "0002_add_notebook_color.sql",
+        3,
+        "0003_add_notebook_color.sql",
         "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';",
         requires_backup,
     )
@@ -41,7 +41,7 @@ def test_application_id_and_schema_fingerprint_are_stable(database: Database) ->
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x434F5250
         assert CORPI_APPLICATION_ID == 0x434F5250
         assert schema_fingerprint(connection) == (
-            "d0c5a3e0a567b8a6b14b1d6fdba7a4f7a8c8ff07f66733eff2b8f5302aff5f6b"
+            "24377a7acafbe8013ad99b1116b50f5b1dc69300b5d04caf44af9e234eb1fbfa"
         )
 
 
@@ -57,7 +57,7 @@ def test_upgrade_preserves_existing_record_identity(database: Database) -> None:
 
     assert PersistenceStore(upgraded).load_notebook(notebook.id) == notebook
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         color = connection.execute(
             "SELECT color FROM notebooks WHERE id=?",
             (notebook.id,),
@@ -74,7 +74,7 @@ def test_failed_risky_upgrade_keeps_rollback_and_recovery_snapshot(database: Dat
         "ALTER TABLE table_that_does_not_exist ADD COLUMN value TEXT;",
         requires_backup=True,
     )
-    migrations = load_migrations() + (migration_two(), migration_three)
+    migrations = load_migrations() + (migration_three,)
     target = Database(database.config, migrations=migrations)
 
     with pytest.raises(MigrationError):
@@ -139,7 +139,7 @@ from core.persistence.database import Database, DatabaseConfig
 from core.persistence.migrations import Migration, load_migrations
 root = Path(__import__('sys').argv[1])
 sql = "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';"
-migration = Migration(2, '0002_add_notebook_color.sql', sql)
+migration = Migration(3, '0003_add_notebook_color.sql', sql)
 Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).initialize()
 """
     env = os.environ.copy()
@@ -158,6 +158,6 @@ Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).init
 
     assert [process.returncode for process in processes] == [0, 0], results
     with sqlite3.connect(database.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 3
         assert notebook_exists(connection, notebook.id)

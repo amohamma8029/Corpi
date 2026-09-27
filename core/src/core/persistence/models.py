@@ -214,6 +214,48 @@ class JobStep:
 
 
 @dataclass(frozen=True, slots=True)
+class JobStatus:
+    job_id: str
+    status: str
+    current_step_key: str | None
+    attempt_count: int
+    owner_instance_id: str | None
+    claimed_at: str | None
+    heartbeat_at: str | None
+    failure_reason: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobStepAttempt:
+    job_id: str
+    step_key: str
+    attempt_number: int
+    started_at: str
+    finished_at: str | None
+    failure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceReadiness:
+    source_id: str
+    source_version_id: str
+    index_version_ids: tuple[str, ...]
+    published_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceTrash:
+    source_id: str
+    trashed_at: str
+    purge_deadline_at: str
+    files_removed_at: str | None
+    snapshots_removed_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExtractionGraph:
     extraction: ExtractionVersion
     passages: tuple[Passage, ...]
