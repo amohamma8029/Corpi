@@ -13,6 +13,10 @@ class InvalidDataDirectoryError(PersistenceError):
     code = "invalid_data_dir"
 
 
+class CoreAlreadyRunningError(PersistenceError):
+    code = "core_already_running"
+
+
 class UnsupportedSQLiteError(PersistenceError):
     code = "unsupported_sqlite"
 

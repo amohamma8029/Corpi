@@ -7,7 +7,8 @@ import time
 import uvicorn
 
 from core.api.app import create_app
-from core.persistence.database import Database, DatabaseConfig
+from core.persistence.corelock import DataDirectoryLock
+from core.persistence.database import Database, DatabaseConfig, verify_sqlite_runtime
 from core.persistence.errors import PersistenceError
 
 READY_MARKER = "CORPI_CORE_READY"
@@ -61,31 +62,47 @@ def main() -> None:
         print("CORPI_CORE_ERROR missing CORPI_CORE_TOKEN", file=sys.stderr, flush=True)
         raise SystemExit(2)
 
+    # One core per data directory, taken BEFORE database initialization so it
+    # also covers startup migrations; held until this process stops. The runtime
+    # check runs first so an unsupported SQLite never creates the directory.
     try:
-        Database(DatabaseConfig.from_environment()).initialize()
+        database_config = DatabaseConfig.from_environment()
+        verify_sqlite_runtime()
+        data_lock = DataDirectoryLock.acquire(database_config.data_dir)
     except PersistenceError as error:
         print(f"{PERSISTENCE_ERROR_MARKER} code={error.code}", flush=True)
         raise SystemExit(2) from None
 
-    allowed = os.environ.get("CORPI_CORE_ALLOWED_ORIGINS")
-    origins = allowed.split(",") if allowed else None
+    try:
+        try:
+            Database(database_config).initialize()
+        except PersistenceError as error:
+            print(f"{PERSISTENCE_ERROR_MARKER} code={error.code}", flush=True)
+            raise SystemExit(2) from None
 
-    port = pick_free_port()
-    app = create_app(token=token, allowed_origins=origins)
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=port,
-        log_level="warning",
-        access_log=False,
-        server_header=False,
-    )
-    server = uvicorn.Server(config)
+        allowed = os.environ.get("CORPI_CORE_ALLOWED_ORIGINS")
+        origins = allowed.split(",") if allowed else None
 
-    threading.Thread(target=print_ready_when_listening, args=(server, port), daemon=True).start()
-    if os.environ.get(WATCH_STDIN_ENV) == "1":
-        threading.Thread(target=exit_when_stdin_closes, args=(server,), daemon=True).start()
-    server.run()
+        port = pick_free_port()
+        app = create_app(token=token, allowed_origins=origins)
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            access_log=False,
+            server_header=False,
+        )
+        server = uvicorn.Server(config)
+
+        threading.Thread(
+            target=print_ready_when_listening, args=(server, port), daemon=True
+        ).start()
+        if os.environ.get(WATCH_STDIN_ENV) == "1":
+            threading.Thread(target=exit_when_stdin_closes, args=(server,), daemon=True).start()
+        server.run()
+    finally:
+        data_lock.release()
 
 
 if __name__ == "__main__":
