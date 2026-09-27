@@ -706,6 +706,7 @@ Deferred items also state whether they await the artifact milestone or fall outs
 | History | Make ready versions available all at once. Preserve source/output versions and template/rendering versions. Regenerate only on request. Use 30-day local trash. |
 | Local database and research-data protection | Use one standard-library SQLite database under the per-user app-data directory, relational versioned records, immutable citation passages, ordered SQL migrations, and the OS-account/app-data protection boundary without additional Corpi-managed research-data encryption in initial v1. Keep provider credentials in separate secure storage. |
 | Desktop shell and local core | Tauri 2 + React/TypeScript shell; Python 3.13 core managed with uv; FastAPI over loopback HTTP with a per-launch bearer token, `Origin`/`Host` validation, and authenticated streaming read with `fetch` (or a WebSocket authenticated on connect). Monorepo with `core/`, `desktop/`, and a root justfile. Electron is the documented fallback if Tauri sidecar packaging proves too painful. |
+| Background job runner and source lifecycle | One in-process asyncio runner per core with a bounded worker pool and durable SQLite job/step records; completion is proven by committed `job_steps` rows, never by status flags; one core per data directory via an OS advisory lock taken before database initialization; per-step-class timeout and retry starting defaults with the policy recorded on the job; cooperative cancellation with a guarded commit that rejects late results; atomic readiness publication through a readiness record with a currency recheck; 30-day trash with a resumable startup and wall-clock sweeper. |
 
 ### Open implementation choices
 
@@ -715,13 +716,12 @@ Choose and record each open implementation detail before building the component 
 | --- | --- | --- |
 | Local keyword/FTS and vector search | **Needs Decision** | Both search implementations. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
 | Local embeddings | **Needs Decision** | Supported model and runtime; benchmark them before selection. Local-by-default processing is decided. |
-| Background work | **Needs Decision** | Task/process/runtime mechanism. |
 | Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
 | Local file layout | **Needs Decision** | Source/app file layout, safe copy behavior, and retention implementation. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
 | Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
 | Fetch/browser | **Needs Decision** | Sandboxing and browser tools. |
 | Format tools | **Needs Decision** | Native PDF extraction library, separate OCR engine, DOCX parser, HTML/boilerplate extractor, and YouTube transcript method/library. |
-| Resource limits | **Needs Decision** | Non-PDF limits and general API timeout/retry/resource values. Limits, bounded retries, and PDF/OCR starting defaults are already required. |
+| Resource limits | **Needs Decision** | Non-PDF limits and remaining API timeout/retry/resource values. Limits, bounded retries, and PDF/OCR starting defaults are already required; step-class timeout/retry starting defaults were set with the background job runner (see the decided choices). |
 | Desktop delivery | **Needs Decision** | Packaging, distribution, and updates. |
 | Local backup/export/restore | **Needs Decision** | Backup/export/restore behavior and implementation. |
 | Overall artifact requirements | **Partially Decided** | Template and saved-output rules in [notes and artifacts](#notes-and-artifacts) are settled; the remaining details are listed below. |

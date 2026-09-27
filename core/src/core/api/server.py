@@ -7,9 +7,13 @@ import time
 import uvicorn
 
 from core.api.app import create_app
+from core.jobs.runner import JobRunner
+from core.jobs.steps import STEP_SETS
+from core.jobs.sweeper import TrashSweeper
 from core.persistence.corelock import DataDirectoryLock
 from core.persistence.database import Database, DatabaseConfig, verify_sqlite_runtime
 from core.persistence.errors import PersistenceError
+from core.persistence.store import PersistenceStore
 
 READY_MARKER = "CORPI_CORE_READY"
 PERSISTENCE_ERROR_MARKER = "CORPI_CORE_ERROR"
@@ -74,8 +78,9 @@ def main() -> None:
         raise SystemExit(2) from None
 
     try:
+        database = Database(database_config)
         try:
-            Database(database_config).initialize()
+            database.initialize()
         except PersistenceError as error:
             print(f"{PERSISTENCE_ERROR_MARKER} code={error.code}", flush=True)
             raise SystemExit(2) from None
@@ -83,8 +88,18 @@ def main() -> None:
         allowed = os.environ.get("CORPI_CORE_ALLOWED_ORIGINS")
         origins = allowed.split(",") if allowed else None
 
+        store = PersistenceStore(database)
+        runner = JobRunner(store, STEP_SETS)
+        sweeper = TrashSweeper(store)
+
         port = pick_free_port()
-        app = create_app(token=token, allowed_origins=origins)
+        app = create_app(
+            token=token,
+            allowed_origins=origins,
+            store=store,
+            runner=runner,
+            sweeper=sweeper,
+        )
         config = uvicorn.Config(
             app,
             host="127.0.0.1",
