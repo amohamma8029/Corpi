@@ -255,6 +255,56 @@ def test_readiness_rejects_an_index_from_another_source(store: PersistenceStore)
         store.publish_readiness(source_a, version_a.id, [index_b.id])
 
 
+def test_publication_recheck_blocks_cancelled_jobs_and_trashed_sources(
+    store: PersistenceStore,
+) -> None:
+    # Cancel-before-publish: the recheck refuses; no readiness is recorded.
+    source_a, version_a, index_a, job_a = seed_graph(store, "publication-a.pdf")
+    store.claim_job(job_a, "core-a")
+    store.cancel_job(job_a, "cancelled before publication")
+    with pytest.raises(ConflictingWriteError):
+        store.publish_readiness(source_a, version_a.id, [index_a.id], job_id=job_a)
+    assert store.load_readiness(source_a) is None
+
+    # Publish-before-cancel: readiness commits, then deletion hides it.
+    source_b, version_b, index_b, job_b = seed_graph(store, "publication-b.pdf")
+    store.claim_job(job_b, "core-a")
+    published = store.publish_readiness(source_b, version_b.id, [index_b.id], job_id=job_b)
+    assert published.source_version_id == version_b.id
+    store.trash_source(source_b, DEADLINE)
+    assert store.load_readiness(source_b) is None
+
+    # Trash-before-publish: no publication path accepts a deleted source.
+    source_c, version_c, index_c, job_c = seed_graph(store, "publication-c.pdf")
+    store.claim_job(job_c, "core-a")
+    store.trash_source(source_c, DEADLINE)
+    with pytest.raises(ConflictingWriteError):
+        store.publish_readiness(source_c, version_c.id, [index_c.id], job_id=job_c)
+    assert store.load_readiness(source_c) is None
+
+
+def test_duplicate_completion_with_different_content_is_rejected(
+    store: PersistenceStore,
+) -> None:
+    source_id, source_version = seed_source(store)
+    job = store.create_job(
+        "completion:conflict", "extract", source_id, source_version_id=source_version.id
+    )
+    store.create_job_status(job.id)
+    store.claim_job(job.id, "core-a")
+
+    first = store.commit_step(job.id, "one", 1, {"value": 1})
+    assert first.checkpoint == {"value": 1}
+
+    # The same key cannot store a different result.
+    with pytest.raises(ConflictingWriteError):
+        store.commit_step(job.id, "one", 1, {"value": 2})
+    assert store.load_job_steps(job.id)[0].checkpoint == {"value": 1}
+
+    # An identical commit is idempotent rather than an error.
+    store.commit_step(job.id, "one", 1, {"value": 1})
+
+
 def test_trash_hides_readiness_cancels_jobs_and_lists_expiry(store: PersistenceStore) -> None:
     source_id, source_version, index, job_id = seed_graph(store)
     store.publish_readiness(source_id, source_version.id, [index.id])

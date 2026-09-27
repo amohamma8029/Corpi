@@ -351,6 +351,37 @@ class PersistenceStore:
             ).fetchall()
             return tuple(_job_status(row) for row in rows)
 
+    def list_job_overviews(self) -> tuple[tuple[JobStatus, str], ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT status.*, job.kind AS job_kind
+                   FROM job_status AS status
+                   JOIN jobs AS job ON job.id = status.job_id
+                   ORDER BY status.updated_at DESC, status.job_id"""
+            ).fetchall()
+            return tuple((_job_status(row), row["job_kind"]) for row in rows)
+
+    def load_job_attempts(self, job_id: str) -> tuple[JobStepAttempt, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM job_step_attempts
+                   WHERE job_id=? ORDER BY step_key, attempt_number""",
+                (job_id,),
+            ).fetchall()
+            return tuple(_job_step_attempt(row) for row in rows)
+
+    def list_source_managed_files(self, source_id: str) -> tuple[ManagedFile, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT file.*
+                   FROM managed_files AS file
+                   JOIN source_versions AS version ON version.managed_file_id = file.id
+                   WHERE version.source_id=?
+                   ORDER BY file.created_at, file.id""",
+                (source_id,),
+            ).fetchall()
+            return tuple(_managed_file(row) for row in rows)
+
     def cancel_job(self, job_id: str, failure_reason: str = "cancelled") -> JobStatus:
         timestamp = utc_timestamp()
         with self._transaction() as connection:
@@ -560,7 +591,17 @@ class PersistenceStore:
         source_id: str,
         source_version_id: str,
         index_version_ids: Sequence[str],
+        *,
+        job_id: str | None = None,
     ) -> SourceReadiness:
+        """Record readiness in one transaction after the currency recheck.
+
+        The recheck lives in the same transaction as the write: when `job_id`
+        is given the job must still be running, and a trashed source can never
+        publish — so a cancellation or deletion that committed first blocks
+        publication, and one that commits later removes the readiness record
+        (see `trash_source`).
+        """
         validate_id(source_id)
         validate_id(source_version_id)
         cleaned_indexes = tuple(dict.fromkeys(validate_id(item) for item in index_version_ids))
@@ -568,6 +609,17 @@ class PersistenceStore:
             raise ValueError("readiness requires at least one finished index")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
+            if job_id is not None:
+                status_row = _fetchone(
+                    connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
+                )
+                if status_row is None or status_row["status"] != "running":
+                    raise ConflictingWriteError("job is not running; publication rejected")
+            trash_row = _fetchone(
+                connection, "SELECT 1 FROM source_trash WHERE source_id=?", (source_id,)
+            )
+            if trash_row is not None:
+                raise ConflictingWriteError("source is deleted; publication rejected")
             connection.execute(
                 """INSERT INTO source_readiness(source_id,source_version_id,published_at,updated_at)
                    VALUES(?,?,?,?)
