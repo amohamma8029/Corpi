@@ -496,6 +496,108 @@ def test_resumed_unfinished_paid_attempt_is_not_repeated(store: PersistenceStore
     assert attempts[0].failure_reason == "unresolved; paid-call outcome unknown"
 
 
+def test_resumed_finished_unknown_paid_attempt_is_not_repeated(
+    store: PersistenceStore,
+) -> None:
+    """The review boundary: a crash after the attempt records the unknown
+    outcome but before the job write leaves a finished attempt — recovery must
+    still refuse to replay the call."""
+    records: dict[str, list[int]] = {}
+
+    def paid_run(context: StepContext) -> StepOutcome:
+        records.setdefault("paid", []).append(context.attempt_number)
+        return StepOutcome(1, {"paid": True})
+
+    job_id, _ = enqueue(store, "demo", "demo:paid-crash", "paid-crash.pdf")
+    store.create_job_status(job_id)
+    store.claim_job(job_id, "core-old")
+    attempt = store.start_step_attempt(job_id, "paid")
+    store.finish_step_attempt(
+        job_id,
+        "paid",
+        attempt.attempt_number,
+        "timed out; paid-call outcome unknown",
+        outcome="unknown",
+    )
+
+    runner = RunnerHarness(
+        store,
+        {"demo": [StepDefinition("paid", paid_run, paid=True)]},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    runner.start()
+    try:
+        runner.runner.notify()
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        runner.stop()
+
+    assert records == {}, "the finished unknown attempt must never be replayed"
+    attempts = store.load_step_attempts(job_id, "paid")
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "unknown"
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "recorded unknown paid-call outcome" in (status.failure_reason or "")
+
+
+def test_failure_recording_is_retried_until_truthful(store: PersistenceStore, monkeypatch) -> None:
+    """A database error in the operation AND in the failure handler must not
+    abandon the job: the outcome stays pending and is retried."""
+    records: dict[str, list[int]] = {}
+    affected_job, _ = enqueue(store, "demo", "demo:record-failure", "record-failure.pdf")
+    later_job, _ = enqueue(store, "demo", "demo:after-record-failure", "after.pdf")
+    broken = {"on": True}
+    original_start = store.start_step_attempt
+    original_finish = store.finish_job
+
+    def flaky_start(job_id: str, step_key: str):
+        if job_id == affected_job:
+            raise PersistenceError("injected operation error")
+        return original_start(job_id, step_key)
+
+    def flaky_finish(job_id: str, status: str, failure_reason: str | None = None):
+        if job_id == affected_job and broken["on"]:
+            raise PersistenceError("injected failure-recording error")
+        return original_finish(job_id, status, failure_reason)
+
+    monkeypatch.setattr(store, "start_step_attempt", flaky_start)
+    monkeypatch.setattr(store, "finish_job", flaky_finish)
+
+    runner = RunnerHarness(
+        store,
+        {"demo": [step_recording("one", records, lambda context: StepOutcome(1, {}))]},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, affected_job)
+        runner.enqueue_and_notify(store, later_job)
+        assert wait_until(lambda: affected_job in runner.runner.snapshot().pending_failure_jobs), (
+            "the failed outcome must stay visibly pending"
+        )
+        assert wait_until(
+            lambda: store.load_job_status(later_job).status == "completed"  # type: ignore[union-attr]
+        ), store.load_job_status(later_job)
+
+        # The database recovers: the pending outcome is recorded truthfully.
+        broken["on"] = False
+        assert wait_until(
+            lambda: store.load_job_status(affected_job).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(affected_job)
+    finally:
+        runner.stop()
+
+    status = store.load_job_status(affected_job)
+    assert status is not None
+    assert "runner error" in (status.failure_reason or "")
+    assert runner.runner.snapshot().pending_failure_jobs == ()
+
+
 def test_release_running_jobs_recovers_every_running_job(store: PersistenceStore) -> None:
     """An immediate restart recovers fresh-heartbeat jobs too: the exclusive
     data-directory lock, not a heartbeat age, proves the previous core is gone."""

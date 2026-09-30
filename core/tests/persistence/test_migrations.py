@@ -29,8 +29,8 @@ def notebook_exists(connection: sqlite3.Connection, notebook_id: str) -> bool:
 
 def migration_two(*, requires_backup: bool = False) -> Migration:
     return Migration(
-        4,
-        "0004_add_notebook_color.sql",
+        5,
+        "0005_add_notebook_color.sql",
         "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';",
         requires_backup,
     )
@@ -41,7 +41,7 @@ def test_application_id_and_schema_fingerprint_are_stable(database: Database) ->
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x434F5250
         assert CORPI_APPLICATION_ID == 0x434F5250
         assert schema_fingerprint(connection) == (
-            "2ccf445bd6849c818874f3b8d3c101bd8a000f19e47f6db1a79bc1ba067c0474"
+            "029fdabd87f7192d0aad9bfc620f229e2d08b915c3f6760915ad9baa4d305555"
         )
 
 
@@ -57,7 +57,7 @@ def test_upgrade_preserves_existing_record_identity(database: Database) -> None:
 
     assert PersistenceStore(upgraded).load_notebook(notebook.id) == notebook
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         color = connection.execute(
             "SELECT color FROM notebooks WHERE id=?",
             (notebook.id,),
@@ -68,30 +68,30 @@ def test_upgrade_preserves_existing_record_identity(database: Database) -> None:
 def test_failed_risky_upgrade_keeps_rollback_and_recovery_snapshot(database: Database) -> None:
     store = PersistenceStore(database)
     notebook = store.create_notebook(new_id(), "Snapshot identity")
-    migration_four = Migration(
-        4,
-        "0004_fail_for_test.sql",
+    migration_five = Migration(
+        5,
+        "0005_fail_for_test.sql",
         "ALTER TABLE table_that_does_not_exist ADD COLUMN value TEXT;",
         requires_backup=True,
     )
-    migrations = load_migrations() + (migration_four,)
+    migrations = load_migrations() + (migration_five,)
     target = Database(database.config, migrations=migrations)
 
     with pytest.raises(MigrationError):
         target.initialize()
 
-    snapshot = database.config.snapshot_dir / "snapshot-r0003.sqlite3"
+    snapshot = database.config.snapshot_dir / "snapshot-r0004.sqlite3"
     assert snapshot.is_file()
     assert snapshot.is_relative_to(database.config.data_dir)
     assert list(database.config.snapshot_dir.glob("snapshot-r*.sqlite3")) == [snapshot]
     with sqlite3.connect(snapshot) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert notebook_exists(connection, notebook.id)
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 4
     with sqlite3.connect(database.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert notebook_exists(connection, notebook.id)
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 4
     if os.name != "nt":
         assert snapshot.stat().st_mode & 0o777 == 0o600
         assert database.config.snapshot_dir.stat().st_mode & 0o777 == 0o700
@@ -139,7 +139,7 @@ from core.persistence.database import Database, DatabaseConfig
 from core.persistence.migrations import Migration, load_migrations
 root = Path(__import__('sys').argv[1])
 sql = "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';"
-migration = Migration(4, '0004_add_notebook_color.sql', sql)
+migration = Migration(5, '0005_add_notebook_color.sql', sql)
 Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).initialize()
 """
     env = os.environ.copy()
@@ -158,6 +158,6 @@ Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).init
 
     assert [process.returncode for process in processes] == [0, 0], results
     with sqlite3.connect(database.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 5
         assert notebook_exists(connection, notebook.id)
