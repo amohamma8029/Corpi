@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -125,3 +126,40 @@ def test_api_stays_responsive_while_a_job_runs(tmp_path: Path) -> None:
             time.sleep(0.02)
         else:
             raise AssertionError("job did not finish")
+
+
+def test_health_stays_fast_while_the_database_writer_is_locked(tmp_path: Path) -> None:
+    """The runner's database work runs on its own capacity, so a held writer
+    lock never freezes the event loop that serves API requests."""
+    store = make_store(tmp_path)
+    runner = JobRunner(
+        store, {"demo": [StepDefinition("quick", lambda context: StepOutcome(1, {}))]}
+    )
+    app = create_app(token=TOKEN, store=store, runner=runner)
+    job_id = seed_job(store)
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        holder = sqlite3.connect(store.database.config.database_path)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            runner.notify()  # the runner's claim blocks on the writer lock
+            time.sleep(0.3)
+            started = time.monotonic()
+            health = client.get("/health", headers=AUTH)
+            elapsed = time.monotonic() - started
+            assert health.status_code == 200
+            assert elapsed < 0.25, (
+                f"/health took {elapsed:.2f}s while the database writer lock was held"
+            )
+        finally:
+            holder.rollback()
+            holder.close()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = store.load_job_status(job_id)
+            if status is not None and status.status == "completed":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("the runner did not resume after the lock was released")

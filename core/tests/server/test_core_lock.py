@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
@@ -27,15 +28,20 @@ def start_core(data_dir: Path) -> subprocess.Popen[str]:
     )
 
 
-def read_first_line(process: subprocess.Popen[str]) -> str:
-    assert process.stdout is not None
-    for _ in range(400):
-        line = process.stdout.readline()
-        if line:
-            return line.strip()
-        if process.poll() is not None:
-            break
-    return ""
+def read_first_line(process: subprocess.Popen[str], timeout: float = 30.0) -> str:
+    """Read one line with a real wall-clock bound; a silent child cannot hang us."""
+    result: dict[str, str] = {}
+
+    def read() -> None:
+        assert process.stdout is not None
+        result["line"] = process.stdout.readline()
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AssertionError("timed out waiting for the child's first output line")
+    return result.get("line", "").strip()
 
 
 def stop(process: subprocess.Popen[str]) -> None:

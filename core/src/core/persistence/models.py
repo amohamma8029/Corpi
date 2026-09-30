@@ -207,6 +207,7 @@ class JobStep:
     step_key: str
     checkpoint_format_version: int
     checkpoint: JSONValue
+    inputs_sha256: str | None
     output_source_version_id: str | None
     output_extraction_version_id: str | None
     output_index_version_id: str | None
@@ -223,6 +224,7 @@ class JobStatus:
     claimed_at: str | None
     heartbeat_at: str | None
     failure_reason: str | None
+    policy: JSONValue
     updated_at: str
 
 
@@ -237,12 +239,36 @@ class JobStepAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class AttemptGuard:
+    """Proof a commit belongs to the current attempt of the owning instance.
+
+    Every output-saving call verifies this in the same transaction as the
+    write, so a cancelled job, a superseded attempt, or another instance's
+    attempt can never record evidence.
+    """
+
+    owner_instance_id: str
+    expected_attempt_number: int
+
+
+@dataclass(frozen=True, slots=True)
 class SourceReadiness:
     source_id: str
     source_version_id: str
     index_version_ids: tuple[str, ...]
+    published_by_job_id: str | None
     published_at: str
     updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedFileRemoval:
+    managed_file_id: str
+    relative_path: str
+    requested_at: str
+    removed_at: str | None
+    attempts: int
+    last_error: str | None
 
 
 @dataclass(frozen=True, slots=True)

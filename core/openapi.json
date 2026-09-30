@@ -55,8 +55,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/JobOverview"
                   },
                   "type": "array",
                   "title": "Response List Jobs Jobs Get"
@@ -88,9 +87,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Job Detail Jobs  Job Id  Get"
+                  "$ref": "#/components/schemas/JobDetailPayload"
                 }
               }
             }
@@ -124,6 +121,166 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "JobAttemptPayload": {
+        "properties": {
+          "step_key": {
+            "type": "string",
+            "title": "Step Key"
+          },
+          "attempt_number": {
+            "type": "integer",
+            "title": "Attempt Number"
+          },
+          "started_at": {
+            "type": "string",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "step_key",
+          "attempt_number",
+          "started_at",
+          "finished_at",
+          "failure_reason"
+        ],
+        "title": "JobAttemptPayload"
+      },
+      "JobDetailPayload": {
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/JobOverview"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/JobStepPayload"
+            },
+            "type": "array",
+            "title": "Steps"
+          },
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/JobAttemptPayload"
+            },
+            "type": "array",
+            "title": "Attempts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job",
+          "steps",
+          "attempts"
+        ],
+        "title": "JobDetailPayload"
+      },
+      "JobOverview": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "current_step_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Step Key"
+          },
+          "attempt_count": {
+            "type": "integer",
+            "title": "Attempt Count"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "current_step_key",
+          "attempt_count",
+          "failure_reason",
+          "updated_at",
+          "kind"
+        ],
+        "title": "JobOverview"
+      },
+      "JobStepPayload": {
+        "properties": {
+          "step_key": {
+            "type": "string",
+            "title": "Step Key"
+          },
+          "committed_at": {
+            "type": "string",
+            "title": "Committed At"
+          },
+          "checkpoint_format_version": {
+            "type": "integer",
+            "title": "Checkpoint Format Version"
+          },
+          "checkpoint": {
+            "$ref": "#/components/schemas/JsonValue"
+          }
+        },
+        "type": "object",
+        "required": [
+          "step_key",
+          "committed_at",
+          "checkpoint_format_version",
+          "checkpoint"
+        ],
+        "title": "JobStepPayload"
+      },
+      "JsonValue": {},
       "ValidationError": {
         "properties": {
           "loc": {

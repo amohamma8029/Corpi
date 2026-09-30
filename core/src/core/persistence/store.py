@@ -14,6 +14,7 @@ from core.persistence.errors import (
     translate_sqlite_error,
 )
 from core.persistence.models import (
+    AttemptGuard,
     ChunkPassage,
     ExtractionGraph,
     ExtractionVersion,
@@ -25,6 +26,7 @@ from core.persistence.models import (
     JobStepAttempt,
     JSONValue,
     ManagedFile,
+    ManagedFileRemoval,
     Notebook,
     Passage,
     PersistenceSnapshot,
@@ -230,7 +232,10 @@ class PersistenceStore:
         source_version: SourceVersion,
         checkpoint_format_version: int,
         checkpoint: JSONValue,
+        *,
+        guard: AttemptGuard,
         managed_file: ManagedFile | None = None,
+        inputs_sha256: str | None = None,
     ) -> JobStep:
         _validate_source_version(source_version)
         if managed_file is not None:
@@ -238,6 +243,7 @@ class PersistenceStore:
             if source_version.managed_file_id != managed_file.id:
                 raise ValueError("source version and managed-file identities do not match")
         with self._transaction() as connection:
+            _verify_attempt_current(connection, job_id, step_key, guard)
             if managed_file is not None:
                 _save_managed_file(connection, managed_file)
             _save_source_version(connection, source_version)
@@ -247,6 +253,7 @@ class PersistenceStore:
                 step_key,
                 checkpoint_format_version,
                 checkpoint,
+                inputs_sha256,
                 output_source_version_id=source_version.id,
             )
             return _load_job_step(connection, job_id, step_key)
@@ -259,8 +266,12 @@ class PersistenceStore:
         passages: Sequence[Passage],
         checkpoint_format_version: int,
         checkpoint: JSONValue,
+        *,
+        guard: AttemptGuard,
+        inputs_sha256: str | None = None,
     ) -> JobStep:
         with self._transaction() as connection:
+            _verify_attempt_current(connection, job_id, step_key, guard)
             _save_extraction(connection, extraction, passages)
             _save_job_step(
                 connection,
@@ -268,6 +279,7 @@ class PersistenceStore:
                 step_key,
                 checkpoint_format_version,
                 checkpoint,
+                inputs_sha256,
                 output_extraction_version_id=extraction.id,
             )
             return _load_job_step(connection, job_id, step_key)
@@ -281,8 +293,12 @@ class PersistenceStore:
         mappings: Sequence[ChunkPassage],
         checkpoint_format_version: int,
         checkpoint: JSONValue,
+        *,
+        guard: AttemptGuard,
+        inputs_sha256: str | None = None,
     ) -> JobStep:
         with self._transaction() as connection:
+            _verify_attempt_current(connection, job_id, step_key, guard)
             _save_index(connection, index, chunks, mappings)
             _save_job_step(
                 connection,
@@ -290,6 +306,7 @@ class PersistenceStore:
                 step_key,
                 checkpoint_format_version,
                 checkpoint,
+                inputs_sha256,
                 output_index_version_id=index.id,
             )
             return _load_job_step(connection, job_id, step_key)
@@ -302,28 +319,27 @@ class PersistenceStore:
         step_key: str,
         checkpoint_format_version: int,
         checkpoint: JSONValue,
+        *,
+        guard: AttemptGuard,
+        inputs_sha256: str | None = None,
     ) -> JobStep:
         """Commit a step completion that has no database version output.
 
-        The transaction re-reads the job status first, so a cancellation or a
-        finished job rejects the commit instead of recording evidence for work
-        that must not publish.
+        The transaction verifies the attempt guard first, so a cancellation, a
+        superseded attempt, or another instance can never record evidence.
         """
         step_key = _required_text(step_key, "step key")
         if checkpoint_format_version <= 0:
             raise ValueError("checkpoint format version must be positive")
         with self._transaction() as connection:
-            status_row = _fetchone(
-                connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
-            )
-            if status_row is None or status_row["status"] != "running":
-                raise ConflictingWriteError("job is not running; step completion rejected")
+            _verify_attempt_current(connection, job_id, step_key, guard)
             _save_job_step(
                 connection,
                 job_id,
                 step_key,
                 checkpoint_format_version,
                 checkpoint,
+                inputs_sha256,
             )
             return _load_job_step(connection, job_id, step_key)
 
@@ -392,6 +408,18 @@ class PersistenceStore:
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not cancellable in its current status")
+            # Hide exactly what this job published; a newer job's readiness
+            # remains untouched.
+            connection.execute(
+                """DELETE FROM source_readiness_indexes
+                   WHERE source_id IN (
+                       SELECT source_id FROM source_readiness WHERE published_by_job_id=?
+                   )""",
+                (job_id,),
+            )
+            connection.execute(
+                "DELETE FROM source_readiness WHERE published_by_job_id=?", (job_id,)
+            )
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
 
@@ -407,27 +435,24 @@ class PersistenceStore:
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not queued")
 
-    def release_orphaned_jobs(self, heartbeat_before: str) -> tuple[str, ...]:
-        """Return running jobs with a stale heartbeat to queued for a restarted core.
+    def release_running_jobs(self) -> tuple[str, ...]:
+        """Return every running job to queued when a core starts.
 
-        Safe because the single-core data-directory lock guarantees no other
-        core is running: a stale heartbeat means its owner is gone.
+        Safe without a heartbeat-age cutoff because the exclusive
+        data-directory lock proves no other core is alive: a `running` job at
+        startup belongs to a previous instance, however recently it
+        heartbeated. An immediate restart therefore recovers promptly instead
+        of leaving the job stuck for a heartbeat window.
         """
-        validate_utc_timestamp(heartbeat_before)
         timestamp = utc_timestamp()
         with self._transaction() as connection:
             rows = connection.execute(
-                """SELECT job_id FROM job_status
-                   WHERE status='running'
-                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
-                (heartbeat_before,),
+                "SELECT job_id FROM job_status WHERE status='running'"
             ).fetchall()
             connection.execute(
-                """UPDATE job_status
-                   SET status='queued', owner_instance_id=NULL, updated_at=?
-                   WHERE status='running'
-                     AND (heartbeat_at IS NULL OR heartbeat_at < ?)""",
-                (timestamp, heartbeat_before),
+                """UPDATE job_status SET status='queued', owner_instance_id=NULL, updated_at=?
+                   WHERE status='running'""",
+                (timestamp,),
             )
             return tuple(row[0] for row in rows)
 
@@ -450,7 +475,13 @@ class PersistenceStore:
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return None if row is None else _job_status(row)
 
-    def claim_job(self, job_id: str, owner_instance_id: str) -> JobStatus:
+    def claim_job(
+        self,
+        job_id: str,
+        owner_instance_id: str,
+        *,
+        policy: JSONValue | None = None,
+    ) -> JobStatus:
         owner_instance_id = _required_text(owner_instance_id, "owner instance id")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
@@ -469,9 +500,17 @@ class PersistenceStore:
             connection.execute(
                 """UPDATE job_status
                    SET status='running', owner_instance_id=?,
-                       claimed_at=COALESCE(claimed_at, ?), heartbeat_at=?, updated_at=?
+                       claimed_at=COALESCE(claimed_at, ?), heartbeat_at=?, updated_at=?,
+                       policy_json=COALESCE(policy_json, ?)
                    WHERE job_id=?""",
-                (owner_instance_id, timestamp, timestamp, timestamp, job_id),
+                (
+                    owner_instance_id,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                    encode_json(policy) if policy is not None else None,
+                    job_id,
+                ),
             )
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
@@ -588,20 +627,19 @@ class PersistenceStore:
 
     def publish_readiness(
         self,
+        job_id: str,
         source_id: str,
         source_version_id: str,
         index_version_ids: Sequence[str],
-        *,
-        job_id: str | None = None,
     ) -> SourceReadiness:
-        """Record readiness in one transaction after the currency recheck.
+        """Publish readiness only after verifying the publishing job in-transaction.
 
-        The recheck lives in the same transaction as the write: when `job_id`
-        is given the job must still be running, and a trashed source can never
-        publish — so a cancellation or deletion that committed first blocks
-        publication, and one that commits later removes the readiness record
-        (see `trash_source`).
+        The job must still be running, belong to this source, target the
+        source's current version, and have committed every required index as
+        one of its own step outputs. A trashed source can never publish, and
+        cancelling the job later hides exactly the readiness it published.
         """
+        validate_id(job_id)
         validate_id(source_id)
         validate_id(source_version_id)
         cleaned_indexes = tuple(dict.fromkeys(validate_id(item) for item in index_version_ids))
@@ -609,25 +647,61 @@ class PersistenceStore:
             raise ValueError("readiness requires at least one finished index")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
-            if job_id is not None:
-                status_row = _fetchone(
-                    connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
+            status_row = _fetchone(
+                connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
+            )
+            if status_row is None or status_row["status"] != "running":
+                raise ConflictingWriteError("job is not running; publication rejected")
+            job_row = _fetchone(
+                connection,
+                "SELECT source_id, source_version_id FROM jobs WHERE id=?",
+                (job_id,),
+            )
+            if job_row is None or job_row["source_id"] != source_id:
+                raise ConflictingWriteError(
+                    "job does not belong to this source; publication rejected"
                 )
-                if status_row is None or status_row["status"] != "running":
-                    raise ConflictingWriteError("job is not running; publication rejected")
+            current_row = connection.execute(
+                """SELECT id FROM source_versions WHERE source_id=?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (source_id,),
+            ).fetchone()
+            if (
+                current_row is None
+                or current_row[0] != source_version_id
+                or job_row["source_version_id"] != source_version_id
+            ):
+                raise ConflictingWriteError(
+                    "job does not target the current source version; publication rejected"
+                )
             trash_row = _fetchone(
                 connection, "SELECT 1 FROM source_trash WHERE source_id=?", (source_id,)
             )
             if trash_row is not None:
                 raise ConflictingWriteError("source is deleted; publication rejected")
+            committed_outputs = {
+                row[0]
+                for row in connection.execute(
+                    """SELECT output_index_version_id FROM job_steps
+                       WHERE job_id=? AND output_index_version_id IS NOT NULL""",
+                    (job_id,),
+                ).fetchall()
+            }
+            missing = [item for item in cleaned_indexes if item not in committed_outputs]
+            if missing:
+                raise ConflictingWriteError(
+                    "published indexes were not committed by this job; publication rejected"
+                )
             connection.execute(
-                """INSERT INTO source_readiness(source_id,source_version_id,published_at,updated_at)
-                   VALUES(?,?,?,?)
+                """INSERT INTO source_readiness(
+                       source_id,source_version_id,published_by_job_id,published_at,updated_at
+                   ) VALUES(?,?,?,?,?)
                    ON CONFLICT(source_id) DO UPDATE SET
                        source_version_id=excluded.source_version_id,
+                       published_by_job_id=excluded.published_by_job_id,
                        published_at=excluded.published_at,
                        updated_at=excluded.updated_at""",
-                (source_id, source_version_id, timestamp, timestamp),
+                (source_id, source_version_id, job_id, timestamp, timestamp),
             )
             connection.execute(
                 "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
@@ -774,6 +848,20 @@ class PersistenceStore:
             connection.execute("DELETE FROM extraction_versions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM source_versions WHERE source_id=?", (source_id,))
             for managed_file_id in managed_file_ids:
+                removal = _fetchone(
+                    connection,
+                    "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                    (managed_file_id,),
+                )
+                if removal is not None and removal["removed_at"] is None:
+                    # A pending removal keeps both the marker and the row so
+                    # the next sweep retries the file and new references stay
+                    # blocked in the meantime.
+                    continue
+                connection.execute(
+                    "DELETE FROM managed_file_removals WHERE managed_file_id=?",
+                    (managed_file_id,),
+                )
                 connection.execute(
                     """DELETE FROM managed_files
                        WHERE id=?
@@ -785,6 +873,87 @@ class PersistenceStore:
                 )
             connection.execute("DELETE FROM source_trash WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
+
+    def managed_file_shared_with_other_sources(self, managed_file_id: str, source_id: str) -> bool:
+        """True when any other source's versions still reference this file."""
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM source_versions
+                   WHERE managed_file_id=? AND source_id<>? LIMIT 1""",
+                (managed_file_id, source_id),
+            ).fetchone()
+            return row is not None
+
+    def ensure_managed_file_removal(
+        self, managed_file_id: str, relative_path: str
+    ) -> ManagedFileRemoval:
+        """Create the durable removal marker that blocks new references.
+
+        Idempotent: an existing marker (including a failed earlier attempt)
+        keeps its history and state.
+        """
+        relative_path = _required_text(relative_path, "relative path")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO managed_file_removals(
+                       managed_file_id,relative_path,requested_at,removed_at,attempts,last_error
+                   ) VALUES(?,?,?,?,?,?) ON CONFLICT(managed_file_id) DO NOTHING""",
+                (managed_file_id, relative_path, timestamp, None, 0, None),
+            )
+            row = _fetchone(
+                connection,
+                "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                (managed_file_id,),
+            )
+            return _managed_file_removal(_require_row(row))
+
+    def mark_managed_file_removed(self, managed_file_id: str) -> ManagedFileRemoval:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE managed_file_removals
+                   SET removed_at=?, last_error=NULL
+                   WHERE managed_file_id=?""",
+                (timestamp, managed_file_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("managed file is not marked for removal")
+            row = _fetchone(
+                connection,
+                "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                (managed_file_id,),
+            )
+            return _managed_file_removal(_require_row(row))
+
+    def record_managed_file_removal_failure(
+        self, managed_file_id: str, error: str
+    ) -> ManagedFileRemoval:
+        error = _required_text(error, "removal error summary")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE managed_file_removals
+                   SET attempts=attempts+1, last_error=?
+                   WHERE managed_file_id=? AND removed_at IS NULL""",
+                (error, managed_file_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("managed file is not pending removal")
+            row = _fetchone(
+                connection,
+                "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                (managed_file_id,),
+            )
+            return _managed_file_removal(_require_row(row))
+
+    def load_managed_file_removal(self, managed_file_id: str) -> ManagedFileRemoval | None:
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                (managed_file_id,),
+            )
+            return None if row is None else _managed_file_removal(row)
 
     def load_notebook(self, notebook_id: str) -> Notebook:
         validate_id(notebook_id)
@@ -1357,6 +1526,7 @@ def _save_job_step(
     step_key: str,
     checkpoint_format_version: int,
     checkpoint: JSONValue,
+    inputs_sha256: str | None = None,
     output_source_version_id: str | None = None,
     output_extraction_version_id: str | None = None,
     output_index_version_id: str | None = None,
@@ -1364,6 +1534,8 @@ def _save_job_step(
     validate_id(job_id)
     step_key = _required_text(step_key, "job step key")
     _integer(checkpoint_format_version, "checkpoint format version", minimum=1)
+    if inputs_sha256 is not None:
+        validate_sha256(inputs_sha256)
     checkpoint_json = encode_json(checkpoint)
     existing = connection.execute(
         "SELECT * FROM job_steps WHERE job_id=? AND step_key=?", (job_id, step_key)
@@ -1377,28 +1549,64 @@ def _save_job_step(
         actual = (
             existing["checkpoint_format_version"],
             existing["checkpoint_json"],
+            existing["inputs_sha256"],
             existing["output_source_version_id"],
             existing["output_extraction_version_id"],
             existing["output_index_version_id"],
         )
-        expected = (checkpoint_format_version, checkpoint_json, *output_values)
+        expected = (checkpoint_format_version, checkpoint_json, inputs_sha256, *output_values)
         if actual != expected:
             raise ConflictingWriteError("job step already has a different committed checkpoint")
         return
     connection.execute(
         """INSERT INTO job_steps(
-               job_id,step_key,checkpoint_format_version,checkpoint_json,
+               job_id,step_key,checkpoint_format_version,checkpoint_json,inputs_sha256,
                output_source_version_id,output_extraction_version_id,output_index_version_id,committed_at
-           ) VALUES(?,?,?,?,?,?,?,?)""",
+           ) VALUES(?,?,?,?,?,?,?,?,?)""",
         (
             job_id,
             step_key,
             checkpoint_format_version,
             checkpoint_json,
+            inputs_sha256,
             *output_values,
             utc_timestamp(),
         ),
     )
+
+
+def _verify_attempt_current(
+    connection: sqlite3.Connection,
+    job_id: str,
+    step_key: str,
+    guard: AttemptGuard,
+) -> None:
+    """Same-transaction proof that a commit may be recorded.
+
+    The job must be running, owned by the guarding instance, and the guarded
+    attempt must be the newest unfinished attempt for that step.
+    """
+    status_row = _fetchone(
+        connection, "SELECT status, owner_instance_id FROM job_status WHERE job_id=?", (job_id,)
+    )
+    if status_row is None or status_row["status"] != "running":
+        raise ConflictingWriteError("job is not running; commit rejected")
+    if status_row["owner_instance_id"] != guard.owner_instance_id:
+        raise ConflictingWriteError("job is owned by another instance; commit rejected")
+    attempt = _fetchone(
+        connection,
+        "SELECT * FROM job_step_attempts WHERE job_id=? AND step_key=? AND attempt_number=?",
+        (job_id, step_key, guard.expected_attempt_number),
+    )
+    if attempt is None or attempt["finished_at"] is not None:
+        raise ConflictingWriteError("step attempt is not open; commit rejected")
+    latest = connection.execute(
+        "SELECT COALESCE(MAX(attempt_number), 0) FROM job_step_attempts"
+        " WHERE job_id=? AND step_key=?",
+        (job_id, step_key),
+    ).fetchone()[0]
+    if int(latest) != guard.expected_attempt_number:
+        raise ConflictingWriteError("a newer attempt supersedes this one; commit rejected")
 
 
 def _load_extraction(
@@ -1586,6 +1794,7 @@ def _job_step(row: sqlite3.Row) -> JobStep:
         row["step_key"],
         row["checkpoint_format_version"],
         decode_json(row["checkpoint_json"]),
+        row["inputs_sha256"],
         row["output_source_version_id"],
         row["output_extraction_version_id"],
         row["output_index_version_id"],
@@ -1594,6 +1803,7 @@ def _job_step(row: sqlite3.Row) -> JobStep:
 
 
 def _job_status(row: sqlite3.Row) -> JobStatus:
+    policy_json = row["policy_json"]
     return JobStatus(
         row["job_id"],
         row["status"],
@@ -1603,7 +1813,19 @@ def _job_status(row: sqlite3.Row) -> JobStatus:
         row["claimed_at"],
         row["heartbeat_at"],
         row["failure_reason"],
+        None if policy_json is None else decode_json(policy_json),
         row["updated_at"],
+    )
+
+
+def _managed_file_removal(row: sqlite3.Row) -> ManagedFileRemoval:
+    return ManagedFileRemoval(
+        row["managed_file_id"],
+        row["relative_path"],
+        row["requested_at"],
+        row["removed_at"],
+        int(row["attempts"]),
+        row["last_error"],
     )
 
 
@@ -1631,6 +1853,7 @@ def _load_readiness(connection: sqlite3.Connection, source_id: str) -> SourceRea
         row["source_id"],
         row["source_version_id"],
         tuple(index_row[0] for index_row in index_rows),
+        row["published_by_job_id"],
         row["published_at"],
         row["updated_at"],
     )

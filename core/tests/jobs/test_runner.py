@@ -6,20 +6,23 @@ import asyncio
 import threading
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from core.jobs.runner import (
     JobRunner,
     JobStepCancelled,
+    PaidCallOutcomeUnknown,
+    PermanentStepFailure,
+    StepCommitContext,
     StepContext,
     StepDefinition,
     StepOutcome,
     StepPolicy,
+    commit_checkpoint,
 )
 from core.persistence.errors import ConflictingWriteError
-from core.persistence.models import new_id, utc_timestamp
+from core.persistence.models import AttemptGuard, new_id
 from core.persistence.store import PersistenceStore
 
 FAST_POLICY = StepPolicy(timeout_seconds=5.0, attempt_cap=2, backoff_base_seconds=0.0)
@@ -214,12 +217,9 @@ def test_resume_reuses_committed_steps_and_reruns_pending(store: PersistenceStor
         first.stop()
         release.set()
 
-    released = store.release_orphaned_jobs(heartbeat_before=utc_timestamp())
-    assert job_id in released
-    status = store.load_job_status(job_id)
-    assert status is not None
-    assert status.status == "queued"
-
+    # An immediate restart recovers the previous instance's work without any
+    # manual reset: start() releases running jobs because the data-directory
+    # lock proves the old core is gone (no heartbeat-age cutoff).
     second = RunnerHarness(
         store,
         {"demo": steps()},
@@ -310,7 +310,7 @@ def test_cooperative_cancel_during_step_stops_run_and_rejects_late_commits(
     assert store.load_job_steps(job_id) == ()
     # A late completion for a cancelled job is rejected by the guarded commit.
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job_id, "late", 1, {"late": True})
+        store.commit_step(job_id, "late", 1, {"late": True}, guard=AttemptGuard("core-x", 1))
 
 
 def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
@@ -368,29 +368,231 @@ def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
         runner.stop()
 
 
-def test_release_orphaned_jobs_resets_only_stale_running(store: PersistenceStore) -> None:
-    stale_job, _ = enqueue(store, "demo", "demo:stale", "stale.pdf")
-    fresh_job, _ = enqueue(store, "demo", "demo:fresh", "fresh.pdf")
-    store.create_job_status(stale_job)
-    store.create_job_status(fresh_job)
-    store.claim_job(stale_job, "core-old")
-    store.claim_job(fresh_job, "core-old")
+def test_release_running_jobs_recovers_every_running_job(store: PersistenceStore) -> None:
+    """An immediate restart recovers fresh-heartbeat jobs too: the exclusive
+    data-directory lock, not a heartbeat age, proves the previous core is gone."""
+    first, _ = enqueue(store, "demo", "demo:fresh-restart", "fresh-restart.pdf")
+    second, _ = enqueue(store, "demo", "demo:also-fresh", "also-fresh.pdf")
+    store.create_job_status(first)
+    store.create_job_status(second)
+    store.claim_job(first, "core-old")
+    store.claim_job(second, "core-old")
 
-    with store.database.connect() as connection:
-        connection.execute(
-            "UPDATE job_status SET heartbeat_at='2020-01-01T00:00:00.000000Z' WHERE job_id=?",
-            (stale_job,),
+    released = store.release_running_jobs()
+    assert set(released) == {first, second}
+    for job_id in (first, second):
+        status = store.load_job_status(job_id)
+        assert status is not None
+        assert status.status == "queued"
+        assert status.owner_instance_id is None
+    assert store.claim_job(first, "core-new").owner_instance_id == "core-new"
+
+
+def test_attempt_cap_and_policy_survive_restart(store: PersistenceStore) -> None:
+    records: dict[str, list[int]] = {}
+    gate = threading.Event()
+
+    def second_step(context: StepContext) -> StepOutcome:
+        if context.attempt_number == 1:
+            gate.wait(10)
+        return StepOutcome(1, {"two": True})
+
+    steps = lambda: [  # noqa: E731 - two runner generations
+        step_recording("one", records, lambda context: StepOutcome(1, {"one": True})),
+        step_recording("two", records, second_step),
+    ]
+    cap_one = StepPolicy(timeout_seconds=30.0, attempt_cap=1, backoff_base_seconds=0.0)
+    first = RunnerHarness(store, {"demo": steps()}, policies={"generic": cap_one})
+    job_id, _ = enqueue(store, "demo", "demo:cap-restart", "cap-restart.pdf")
+    first.start()
+    try:
+        first.enqueue_and_notify(store, job_id)
+        assert wait_until(lambda: records.get("two", []) == [1]), records
+    finally:
+        first.stop()
+        gate.set()
+
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert isinstance(status.policy, dict)
+    recorded_generic = status.policy.get("generic")
+    assert isinstance(recorded_generic, dict)
+    assert recorded_generic.get("attempt_cap") == 1
+
+    # Restart with looser defaults: the recorded one-attempt cap still applies.
+    second = RunnerHarness(
+        store, {"demo": steps()}, policies={"generic": FAST_POLICY}, backoff_sleep=lambda d: None
+    )
+    second.start()
+    try:
+        second.runner.notify()
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        second.stop()
+
+    assert records["two"] == [1], "resumed work must not exceed the recorded cap"
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "attempt cap of 1" in (status.failure_reason or "")
+
+
+def test_permanent_failure_is_not_retried(store: PersistenceStore) -> None:
+    records: dict[str, list[int]] = {}
+
+    def permanent(context: StepContext) -> StepOutcome:
+        raise PermanentStepFailure("unsupported document")
+
+    runner = RunnerHarness(
+        store,
+        {"demo": [step_recording("forever", records, permanent)]},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    job_id, _ = enqueue(store, "demo", "demo:permanent", "permanent.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, job_id)
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        runner.stop()
+
+    assert records["forever"] == [1]
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "failed permanently" in (status.failure_reason or "")
+
+
+def test_unknown_paid_call_outcome_is_not_retried(store: PersistenceStore) -> None:
+    records: dict[str, list[int]] = {}
+
+    def unknown(context: StepContext) -> StepOutcome:
+        raise PaidCallOutcomeUnknown("provider did not acknowledge the request")
+
+    runner = RunnerHarness(
+        store,
+        {"demo": [step_recording("paid", records, unknown)]},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    job_id, _ = enqueue(store, "demo", "demo:paid-unknown", "paid-unknown.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, job_id)
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        runner.stop()
+
+    assert records["paid"] == [1], "an unknown paid-call outcome must never auto-retry"
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "review required" in (status.failure_reason or "")
+
+
+def test_changed_step_inputs_fail_with_a_clear_conflict_on_resume(
+    store: PersistenceStore,
+) -> None:
+    records: dict[str, list[int]] = {}
+    settings = {"parser": "v1"}
+    gate = threading.Event()
+
+    def third_step(context: StepContext) -> StepOutcome:
+        if context.attempt_number == 1:
+            gate.wait(10)
+        return StepOutcome(1, {"three": True})
+
+    def second_step(context: StepContext) -> StepOutcome:
+        records.setdefault("two", []).append(context.attempt_number)
+        return StepOutcome(1, {"two": True})
+
+    def make_steps() -> list[StepDefinition]:
+        return [
+            step_recording("one", records, lambda context: StepOutcome(1, {"one": True})),
+            StepDefinition(
+                "two",
+                second_step,
+                inputs=lambda context: {"parser": settings["parser"]},
+            ),
+            step_recording("three", records, third_step),
+        ]
+
+    run = RunnerHarness(
+        store, {"demo": make_steps()}, policies={"generic": StepPolicy(30.0, 2, 0.0)}
+    )
+    job_id, _ = enqueue(store, "demo", "demo:changed-inputs", "changed-inputs.pdf")
+    run.start()
+    try:
+        run.enqueue_and_notify(store, job_id)
+        assert wait_until(lambda: records.get("three", []) == [1]), records
+        assert [step.step_key for step in store.load_job_steps(job_id)] == ["one", "two"]
+    finally:
+        run.stop()
+        gate.set()
+
+    settings["parser"] = "v2"
+
+    resumed = RunnerHarness(store, {"demo": make_steps()}, policies={"generic": FAST_POLICY})
+    resumed.start()
+    try:
+        resumed.runner.notify()
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        resumed.stop()
+
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "inputs changed" in (status.failure_reason or ""), status.failure_reason
+    assert records["three"] == [1], "changed work must not silently reuse the old result"
+
+
+def test_finish_race_does_not_stop_later_jobs(store: PersistenceStore) -> None:
+    """Cancellation between the final checkpoint and completion must not kill
+    the runner or leave later jobs queued."""
+    records: dict[str, list[int]] = {}
+    cancelled_once = {"done": False}
+
+    def cancel_raced_commit(persist: PersistenceStore, commit: StepCommitContext) -> None:
+        commit_checkpoint(persist, commit)
+        if not cancelled_once["done"]:
+            cancelled_once["done"] = True
+            persist.cancel_job(commit.job_id, "cancelled at the finish line")
+
+    first_steps = [
+        StepDefinition(
+            "one",
+            lambda context: StepOutcome(1, {"one": True}),
+            commit=cancel_raced_commit,
         )
-        connection.commit()
+    ]
+    second_steps = [step_recording("quick", records, lambda context: StepOutcome(1, {}))]
 
-    cutoff = (datetime.now(UTC) - timedelta(minutes=1)).isoformat(timespec="microseconds")
-    released = store.release_orphaned_jobs(heartbeat_before=cutoff.replace("+00:00", "Z"))
-    assert released == (stale_job,)
-    stale_status = store.load_job_status(stale_job)
-    assert stale_status is not None
-    assert stale_status.status == "queued"
-    assert stale_status.owner_instance_id is None
-    fresh_status = store.load_job_status(fresh_job)
-    assert fresh_status is not None
-    assert fresh_status.status == "running"
-    assert fresh_status.owner_instance_id == "core-old"
+    runner = RunnerHarness(
+        store,
+        {"demo": first_steps, "quick": second_steps},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    first_job, _ = enqueue(store, "demo", "demo:finish-race", "finish-race.pdf")
+    second_job, _ = enqueue(store, "quick", "demo:after-race", "after-race.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, first_job)
+        assert wait_until(lambda: cancelled_once["done"]), "commit path never ran"
+        runner.enqueue_and_notify(store, second_job)
+        assert wait_until(
+            lambda: store.load_job_status(second_job).status == "completed"  # type: ignore[union-attr]
+        ), store.load_job_status(second_job)
+        assert runner.runner.snapshot().state != "stopping"
+    finally:
+        runner.stop()
+
+    first_status = store.load_job_status(first_job)
+    assert first_status is not None
+    assert first_status.status == "cancelled"

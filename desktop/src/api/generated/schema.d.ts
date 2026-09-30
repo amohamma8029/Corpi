@@ -88,6 +88,55 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** JobAttemptPayload */
+        JobAttemptPayload: {
+            /** Step Key */
+            step_key: string;
+            /** Attempt Number */
+            attempt_number: number;
+            /** Started At */
+            started_at: string;
+            /** Finished At */
+            finished_at: string | null;
+            /** Failure Reason */
+            failure_reason: string | null;
+        };
+        /** JobDetailPayload */
+        JobDetailPayload: {
+            job: components["schemas"]["JobOverview"];
+            /** Steps */
+            steps: components["schemas"]["JobStepPayload"][];
+            /** Attempts */
+            attempts: components["schemas"]["JobAttemptPayload"][];
+        };
+        /** JobOverview */
+        JobOverview: {
+            /** Job Id */
+            job_id: string;
+            /** Status */
+            status: string;
+            /** Current Step Key */
+            current_step_key: string | null;
+            /** Attempt Count */
+            attempt_count: number;
+            /** Failure Reason */
+            failure_reason: string | null;
+            /** Updated At */
+            updated_at: string;
+            /** Kind */
+            kind: string;
+        };
+        /** JobStepPayload */
+        JobStepPayload: {
+            /** Step Key */
+            step_key: string;
+            /** Committed At */
+            committed_at: string;
+            /** Checkpoint Format Version */
+            checkpoint_format_version: number;
+            checkpoint: components["schemas"]["JsonValue"];
+        };
+        JsonValue: unknown;
         /** ValidationError */
         ValidationError: {
             /** Location */
@@ -167,9 +216,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    }[];
+                    "application/json": components["schemas"]["JobOverview"][];
                 };
             };
         };
@@ -191,9 +238,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
+                    "application/json": components["schemas"]["JobDetailPayload"];
                 };
             };
             /** @description Validation Error */

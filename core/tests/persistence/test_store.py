@@ -13,6 +13,7 @@ from core.persistence.errors import (
     PersistenceError,
 )
 from core.persistence.models import (
+    AttemptGuard,
     ChunkPassage,
     ExtractionVersion,
     IndexGraph,
@@ -28,6 +29,16 @@ from core.persistence.store import PersistenceStore
 
 HASH_A = "a" * 64
 HASH_B = "b" * 64
+GUARD_OWNER = "core-tests"
+
+
+def prepare_step(store: PersistenceStore, job_id: str, step_key: str) -> AttemptGuard:
+    """Claim the job under the test owner and open an attempt for its commit guard."""
+    if store.load_job_status(job_id) is None:
+        store.create_job_status(job_id)
+    store.claim_job(job_id, GUARD_OWNER)
+    attempt = store.start_step_attempt(job_id, step_key)
+    return AttemptGuard(GUARD_OWNER, attempt.attempt_number)
 
 
 def seed_source(store: PersistenceStore, name: str = "report.pdf") -> tuple[str, SourceVersion]:
@@ -150,6 +161,7 @@ def test_restart_round_trip_preserves_the_complete_record_graph(
         passages,
         1,
         {"complete": True, "passages": len(passages)},
+        guard=prepare_step(store, extraction_job.id, "extract-passages"),
     )
     index, chunks, mappings = make_index(extraction, passages)
     index_job = store.create_job(
@@ -167,6 +179,7 @@ def test_restart_round_trip_preserves_the_complete_record_graph(
         mappings,
         1,
         {"complete": True, "chunks": len(chunks)},
+        guard=prepare_step(store, index_job.id, "build-chunks"),
     )
     before = store.load_snapshot()
 
@@ -187,7 +200,10 @@ def test_exact_job_and_step_retry_reuses_one_committed_output(database: Database
         source_id,
         source_version_id=source_version.id,
     )
-    step = store.commit_extraction_step(job.id, "extract", extraction, passages, 1, {"done": True})
+    guard = prepare_step(store, job.id, "extract")
+    step = store.commit_extraction_step(
+        job.id, "extract", extraction, passages, 1, {"done": True}, guard=guard
+    )
     retried_job = store.create_job(
         "extract:retry",
         "extract",
@@ -196,12 +212,16 @@ def test_exact_job_and_step_retry_reuses_one_committed_output(database: Database
     )
     assert retried_job == job
     assert (
-        store.commit_extraction_step(job.id, "extract", extraction, passages, 1, {"done": True})
+        store.commit_extraction_step(
+            job.id, "extract", extraction, passages, 1, {"done": True}, guard=guard
+        )
         == step
     )
 
     with pytest.raises(ConflictingWriteError):
-        store.commit_extraction_step(job.id, "extract", extraction, passages, 1, {"done": False})
+        store.commit_extraction_step(
+            job.id, "extract", extraction, passages, 1, {"done": False}, guard=guard
+        )
 
     snapshot = store.load_snapshot()
     assert len(snapshot.extractions) == 1
@@ -270,7 +290,13 @@ with database.connect() as connection:
     assert reopened.load_snapshot() == before
 
     step = reopened.commit_extraction_step(
-        job.id, "extract", extraction, passages, 1, {"done": True}
+        job.id,
+        "extract",
+        extraction,
+        passages,
+        1,
+        {"done": True},
+        guard=prepare_step(reopened, job.id, "extract"),
     )
     assert step.output_extraction_version_id == extraction.id
     assert reopened.load_extraction(extraction.id).passages == passages
@@ -292,7 +318,15 @@ def test_job_output_and_checkpoint_roll_back_together_on_target_mismatch(
     )
 
     with pytest.raises(IntegrityViolationError):
-        store.commit_extraction_step(job.id, "extract", extraction, passages, 1, {"done": True})
+        store.commit_extraction_step(
+            job.id,
+            "extract",
+            extraction,
+            passages,
+            1,
+            {"done": True},
+            guard=prepare_step(store, job.id, "extract"),
+        )
 
     with pytest.raises(PersistenceError):
         store.load_extraction(extraction.id)
@@ -306,7 +340,14 @@ def test_source_version_job_output_must_match_its_source(database: Database) -> 
     job = store.create_job("import:wrong-source", "import", source_a)
 
     with pytest.raises(IntegrityViolationError):
-        store.commit_source_version_step(job.id, "save-version", version_b, 1, {"saved": True})
+        store.commit_source_version_step(
+            job.id,
+            "save-version",
+            version_b,
+            1,
+            {"saved": True},
+            guard=prepare_step(store, job.id, "save-version"),
+        )
 
     assert store.load_snapshot().job_steps == ()
 
@@ -328,7 +369,16 @@ def test_index_job_output_must_match_its_extraction_target(database: Database) -
     )
 
     with pytest.raises(IntegrityViolationError):
-        store.commit_index_step(job.id, "build-index", index, chunks, mappings, 1, {"done": True})
+        store.commit_index_step(
+            job.id,
+            "build-index",
+            index,
+            chunks,
+            mappings,
+            1,
+            {"done": True},
+            guard=prepare_step(store, job.id, "build-index"),
+        )
 
     with pytest.raises(PersistenceError):
         store.load_index(index.id)
