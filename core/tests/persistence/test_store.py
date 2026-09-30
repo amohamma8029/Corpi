@@ -38,7 +38,7 @@ def prepare_step(store: PersistenceStore, job_id: str, step_key: str) -> Attempt
         store.create_job_status(job_id)
     store.claim_job(job_id, GUARD_OWNER)
     attempt = store.start_step_attempt(job_id, step_key)
-    return AttemptGuard(GUARD_OWNER, attempt.attempt_number)
+    return AttemptGuard(GUARD_OWNER, step_key, attempt.attempt_number)
 
 
 def seed_source(store: PersistenceStore, name: str = "report.pdf") -> tuple[str, SourceVersion]:

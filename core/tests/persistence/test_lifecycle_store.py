@@ -125,7 +125,31 @@ def make_index(
 def commit_with_guard(store: PersistenceStore, job_id: str, step_key: str) -> AttemptGuard:
     """Start a step attempt as the seed owner and return its commit guard."""
     attempt = store.start_step_attempt(job_id, step_key)
-    return AttemptGuard(SEED_OWNER, attempt.attempt_number)
+    return AttemptGuard(SEED_OWNER, step_key, attempt.attempt_number)
+
+
+def begin_publication(
+    store: PersistenceStore, job_id: str, step_key: str = "publish-source"
+) -> AttemptGuard:
+    """Open a publication attempt as the seed owner and return its guard."""
+    attempt = store.start_step_attempt(job_id, step_key)
+    return AttemptGuard(SEED_OWNER, step_key, attempt.attempt_number)
+
+
+def publish(
+    store: PersistenceStore,
+    job_id: str,
+    source_id: str,
+    source_version_id: str,
+    index_version_ids: list[str],
+):
+    return store.publish_readiness(
+        job_id,
+        source_id,
+        source_version_id,
+        index_version_ids,
+        guard=begin_publication(store, job_id),
+    )
 
 
 def seed_graph(
@@ -258,21 +282,21 @@ def test_step_attempts_number_finish_and_count(store: PersistenceStore) -> None:
 def test_readiness_publish_load_replace_and_remove(store: PersistenceStore) -> None:
     source_id, source_version, indexes, job_id = seed_graph(store, index_count=2)
 
-    readiness = store.publish_readiness(job_id, source_id, source_version.id, [indexes[0].id])
+    readiness = publish(store, job_id, source_id, source_version.id, [indexes[0].id])
     assert readiness.source_version_id == source_version.id
     assert readiness.index_version_ids == (indexes[0].id,)
     assert readiness.published_by_job_id == job_id
     assert store.load_readiness(source_id) == readiness
 
     # Republishing replaces the required-index set in one transaction.
-    replaced = store.publish_readiness(job_id, source_id, source_version.id, [indexes[1].id])
+    replaced = publish(store, job_id, source_id, source_version.id, [indexes[1].id])
     assert replaced.index_version_ids == (indexes[1].id,)
 
     store.remove_readiness(source_id)
     assert store.load_readiness(source_id) is None
 
     with pytest.raises(ValueError):
-        store.publish_readiness(job_id, source_id, source_version.id, [])
+        publish(store, job_id, source_id, source_version.id, [])
 
 
 def test_publication_verifies_the_publishing_job(store: PersistenceStore) -> None:
@@ -281,7 +305,7 @@ def test_publication_verifies_the_publishing_job(store: PersistenceStore) -> Non
 
     # An unrelated job cannot publish this source.
     with pytest.raises(ConflictingWriteError):
-        store.publish_readiness(job_b, source_a, version_a.id, [indexes_a[0].id])
+        publish(store, job_b, source_a, version_a.id, [indexes_a[0].id])
 
     # An index this job never committed cannot be published.
     other_index, _, _ = make_index(
@@ -303,13 +327,13 @@ def test_publication_verifies_the_publishing_job(store: PersistenceStore) -> Non
         ),
     )
     with pytest.raises(ConflictingWriteError):
-        store.publish_readiness(job_a, source_a, version_a.id, [other_index.id])
+        publish(store, job_a, source_a, version_a.id, [other_index.id])
 
     # A job targeting a superseded version cannot publish once a newer version
     # exists for the source.
     store.create_source_version(source_a, HASH_B, None)
     with pytest.raises(ConflictingWriteError):
-        store.publish_readiness(job_a, source_a, version_a.id, [indexes_a[0].id])
+        publish(store, job_a, source_a, version_a.id, [indexes_a[0].id])
     assert store.load_readiness(source_a) is None
     assert indexes_b  # silence unused-variable lint for the second graph
 
@@ -321,12 +345,12 @@ def test_publication_recheck_blocks_cancelled_jobs_and_trashed_sources(
     source_a, version_a, indexes_a, job_a = seed_graph(store, "publication-a.pdf")
     store.cancel_job(job_a, "cancelled before publication")
     with pytest.raises(ConflictingWriteError):
-        store.publish_readiness(job_a, source_a, version_a.id, [indexes_a[0].id])
+        publish(store, job_a, source_a, version_a.id, [indexes_a[0].id])
     assert store.load_readiness(source_a) is None
 
     # Publish-before-cancel: readiness commits, then cancellation hides it.
     source_b, version_b, indexes_b, job_b = seed_graph(store, "publication-b.pdf")
-    published = store.publish_readiness(job_b, source_b, version_b.id, [indexes_b[0].id])
+    published = publish(store, job_b, source_b, version_b.id, [indexes_b[0].id])
     assert published.source_version_id == version_b.id
     store.cancel_job(job_b, "cancelled after publication")
     assert store.load_readiness(source_b) is None
@@ -335,7 +359,7 @@ def test_publication_recheck_blocks_cancelled_jobs_and_trashed_sources(
     source_c, version_c, indexes_c, job_c = seed_graph(store, "publication-c.pdf")
     store.trash_source(source_c, DEADLINE)
     with pytest.raises(ConflictingWriteError):
-        store.publish_readiness(job_c, source_c, version_c.id, [indexes_c[0].id])
+        publish(store, job_c, source_c, version_c.id, [indexes_c[0].id])
     assert store.load_readiness(source_c) is None
 
 
@@ -343,7 +367,7 @@ def test_cancelling_an_older_job_keeps_a_newer_jobs_readiness(
     store: PersistenceStore,
 ) -> None:
     source_id, source_version, indexes, job_a = seed_graph(store, "newer.pdf")
-    store.publish_readiness(job_a, source_id, source_version.id, [indexes[0].id])
+    publish(store, job_a, source_id, source_version.id, [indexes[0].id])
 
     # A second job publishes over the first; cancelling the first must not
     # hide the newer result.
@@ -363,13 +387,99 @@ def test_cancelling_an_older_job_keeps_a_newer_jobs_readiness(
         job_b.id, "build-index-new", new_index, chunks, mappings, 1, {}, guard=guard
     )
     store.finish_step_attempt(job_b.id, "build-index-new", guard.expected_attempt_number)
-    store.publish_readiness(job_b.id, source_id, source_version.id, [new_index.id])
+    publish(store, job_b.id, source_id, source_version.id, [new_index.id])
 
     store.cancel_job(job_a, "cancelled older job")
     readiness = store.load_readiness(source_id)
     assert readiness is not None
     assert readiness.published_by_job_id == job_b.id
     assert readiness.index_version_ids == (new_index.id,)
+
+
+def test_reservation_refuses_when_another_source_references_the_file(
+    store: PersistenceStore,
+) -> None:
+    """The reference check and the removal reservation share one transaction,
+    so a reference cannot slip in between them."""
+    shared = ManagedFile(new_id(), "originals/race.pdf", 17, HASH_A, utc_timestamp())
+    store.save_managed_file(shared)
+    notebook_id = new_id()
+    store.create_notebook(notebook_id, "Race")
+    first_source = new_id()
+    second_source = new_id()
+    store.create_source(first_source, notebook_id, "first.pdf")
+    store.create_source(second_source, notebook_id, "second.pdf")
+    store.create_source_version(first_source, HASH_A, shared.id)
+    store.create_source_version(second_source, HASH_A, shared.id)
+
+    # The other source's reference is visible inside the reservation's
+    # transaction, so nothing is reserved and no marker is left behind.
+    assert store.reserve_managed_file_removal(shared.id, "originals/race.pdf", first_source) is None
+    assert store.load_managed_file_removal(shared.id) is None
+
+    # After the other reference is gone, reservation succeeds and the marker
+    # blocks anything new.
+    store.trash_source(second_source, DEADLINE)
+    store.mark_trash_files_removed(second_source)
+    store.mark_trash_snapshots_removed(second_source)
+    store.remove_trashed_records(second_source)
+    reserved = store.reserve_managed_file_removal(shared.id, "originals/race.pdf", first_source)
+    assert reserved is not None
+    assert reserved.removed_at is None
+
+
+def test_older_jobs_cannot_replace_newer_readiness(store: PersistenceStore) -> None:
+    source_id, source_version, indexes, job_a = seed_graph(store, "versions.pdf")
+    publish(store, job_a, source_id, source_version.id, [indexes[0].id])
+
+    # A job created later may replace the older result.
+    graph = store.load_extraction(indexes[0].extraction_version_id)
+    new_index, chunks, mappings = make_index(graph.extraction, graph.passages)
+    job_b = store.create_job(
+        "extract:newer-publisher",
+        "extract",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=graph.extraction.id,
+    )
+    store.create_job_status(job_b.id)
+    store.claim_job(job_b.id, SEED_OWNER)
+    guard = commit_with_guard(store, job_b.id, "build-index-new")
+    store.commit_index_step(
+        job_b.id, "build-index-new", new_index, chunks, mappings, 1, {}, guard=guard
+    )
+    store.finish_step_attempt(job_b.id, "build-index-new", guard.expected_attempt_number)
+    publish(store, job_b.id, source_id, source_version.id, [new_index.id])
+    readiness = store.load_readiness(source_id)
+    assert readiness is not None
+    assert readiness.published_by_job_id == job_b.id
+
+    # The older job cannot replace the newer result.
+    with pytest.raises(ConflictingWriteError):
+        publish(store, job_a, source_id, source_version.id, [indexes[0].id])
+    readiness = store.load_readiness(source_id)
+    assert readiness is not None
+    assert readiness.published_by_job_id == job_b.id
+    assert readiness.index_version_ids == (new_index.id,)
+
+
+def test_publication_rejects_finished_or_superseded_attempts(
+    store: PersistenceStore,
+) -> None:
+    source_id, source_version, indexes, job_id = seed_graph(store, "attempts.pdf")
+
+    first = begin_publication(store, job_id)
+    store.finish_step_attempt(job_id, first.step_key, first.expected_attempt_number, "finished")
+    with pytest.raises(ConflictingWriteError):
+        store.publish_readiness(job_id, source_id, source_version.id, [indexes[0].id], guard=first)
+
+    second = begin_publication(store, job_id)
+    with pytest.raises(ConflictingWriteError):
+        store.publish_readiness(job_id, source_id, source_version.id, [indexes[0].id], guard=first)
+    published = store.publish_readiness(
+        job_id, source_id, source_version.id, [indexes[0].id], guard=second
+    )
+    assert published.published_by_job_id == job_id
 
 
 def test_duplicate_completion_with_different_content_is_rejected(
@@ -406,31 +516,34 @@ def test_commits_require_the_current_attempt_and_owner(store: PersistenceStore) 
 
     # Another instance cannot save.
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job.id, "one", 1, {"value": 1}, guard=AttemptGuard("another-core", 1))
+        store.commit_step(
+            job.id, "one", 1, {"value": 1}, guard=AttemptGuard("another-core", "one", 1)
+        )
 
     # A superseded attempt cannot save.
     store.finish_step_attempt(job.id, "one", attempt.attempt_number)
     newer = store.start_step_attempt(job.id, "one")
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, 1))
+        store.commit_step(job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, "one", 1))
     # An expired (already finished) attempt cannot save either.
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, 1))
+        store.commit_step(job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, "one", 1))
     # The current attempt saves.
     saved = store.commit_step(
-        job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, newer.attempt_number)
+        job.id, "one", 1, {"value": 1}, guard=AttemptGuard(SEED_OWNER, "one", newer.attempt_number)
     )
     assert saved.checkpoint == {"value": 1}
 
     # Cancellation rejects a later save even for the current attempt.
+    # Cancellation rejects a later save regardless of the guard.
     store.cancel_job(job.id, "cancelled")
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job.id, "two", 1, {"value": 2}, guard=AttemptGuard(SEED_OWNER, 1))
+        store.commit_step(job.id, "two", 1, {"value": 2}, guard=AttemptGuard(SEED_OWNER, "two", 1))
 
 
 def test_trash_hides_readiness_cancels_jobs_and_lists_expiry(store: PersistenceStore) -> None:
     source_id, source_version, indexes, job_id = seed_graph(store)
-    store.publish_readiness(job_id, source_id, source_version.id, [indexes[0].id])
+    publish(store, job_id, source_id, source_version.id, [indexes[0].id])
 
     trash = store.trash_source(source_id, DEADLINE)
     assert trash.purge_deadline_at == DEADLINE
@@ -453,7 +566,8 @@ def test_managed_file_removal_marker_blocks_new_references(store: PersistenceSto
     managed_file_id = source_version.managed_file_id
     assert managed_file_id is not None
 
-    removal = store.ensure_managed_file_removal(managed_file_id, "originals/report.pdf")
+    removal = store.reserve_managed_file_removal(managed_file_id, "originals/report.pdf", source_id)
+    assert removal is not None
     assert removal.removed_at is None
     assert removal.attempts == 0
 
@@ -481,7 +595,7 @@ def test_records_purge_keeps_rows_with_pending_removal_markers(
     store.mark_trash_files_removed(source_id)
     store.mark_trash_snapshots_removed(source_id)
     # The file removal is still pending (marker without removed_at).
-    store.ensure_managed_file_removal(managed_file_id, "originals/report.pdf")
+    store.reserve_managed_file_removal(managed_file_id, "originals/report.pdf", source_id)
 
     store.remove_trashed_records(source_id)
 

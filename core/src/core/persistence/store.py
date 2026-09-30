@@ -631,13 +631,18 @@ class PersistenceStore:
         source_id: str,
         source_version_id: str,
         index_version_ids: Sequence[str],
+        *,
+        guard: AttemptGuard,
     ) -> SourceReadiness:
         """Publish readiness only after verifying the publishing job in-transaction.
 
-        The job must still be running, belong to this source, target the
-        source's current version, and have committed every required index as
-        one of its own step outputs. A trashed source can never publish, and
-        cancelling the job later hides exactly the readiness it published.
+        The publishing instance, job, and attempt are verified (the job must be
+        running, owned by the guard, and the guarded attempt current and
+        unresolved); the job must belong to this source, target the source's
+        current version, and have committed every required index as one of its
+        own step outputs. An older job cannot replace a newer job's readiness,
+        a trashed source can never publish, and cancelling the job later hides
+        exactly the readiness it published.
         """
         validate_id(job_id)
         validate_id(source_id)
@@ -647,14 +652,10 @@ class PersistenceStore:
             raise ValueError("readiness requires at least one finished index")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
-            status_row = _fetchone(
-                connection, "SELECT status FROM job_status WHERE job_id=?", (job_id,)
-            )
-            if status_row is None or status_row["status"] != "running":
-                raise ConflictingWriteError("job is not running; publication rejected")
+            _verify_attempt_current(connection, job_id, guard.step_key, guard)
             job_row = _fetchone(
                 connection,
-                "SELECT source_id, source_version_id FROM jobs WHERE id=?",
+                "SELECT source_id, source_version_id, created_at FROM jobs WHERE id=?",
                 (job_id,),
             )
             if job_row is None or job_row["source_id"] != source_id:
@@ -692,6 +693,27 @@ class PersistenceStore:
                 raise ConflictingWriteError(
                     "published indexes were not committed by this job; publication rejected"
                 )
+            current_readiness = _fetchone(
+                connection,
+                "SELECT published_by_job_id FROM source_readiness WHERE source_id=?",
+                (source_id,),
+            )
+            if current_readiness is not None and current_readiness["published_by_job_id"] not in (
+                None,
+                job_id,
+            ):
+                current_publisher = _fetchone(
+                    connection,
+                    "SELECT created_at FROM jobs WHERE id=?",
+                    (current_readiness["published_by_job_id"],),
+                )
+                if (
+                    current_publisher is not None
+                    and current_publisher["created_at"] > job_row["created_at"]
+                ):
+                    raise ConflictingWriteError(
+                        "a newer job's readiness cannot be replaced by an older job"
+                    )
             connection.execute(
                 """INSERT INTO source_readiness(
                        source_id,source_version_id,published_by_job_id,published_at,updated_at
@@ -874,27 +896,27 @@ class PersistenceStore:
             connection.execute("DELETE FROM source_trash WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM sources WHERE id=?", (source_id,))
 
-    def managed_file_shared_with_other_sources(self, managed_file_id: str, source_id: str) -> bool:
-        """True when any other source's versions still reference this file."""
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """SELECT 1 FROM source_versions
-                   WHERE managed_file_id=? AND source_id<>? LIMIT 1""",
-                (managed_file_id, source_id),
-            ).fetchone()
-            return row is not None
+    def reserve_managed_file_removal(
+        self, managed_file_id: str, relative_path: str, source_id: str
+    ) -> ManagedFileRemoval | None:
+        """Atomically check surviving references and reserve the removal.
 
-    def ensure_managed_file_removal(
-        self, managed_file_id: str, relative_path: str
-    ) -> ManagedFileRemoval:
-        """Create the durable removal marker that blocks new references.
-
-        Idempotent: an existing marker (including a failed earlier attempt)
-        keeps its history and state.
+        Returns None when another source still references the file and creates
+        nothing; otherwise the marker exists in the same transaction, so no
+        reference can be inserted between the check and the reservation (the
+        marker's trigger rejects later references). A reference committed
+        before this transaction is seen by the check.
         """
         relative_path = _required_text(relative_path, "relative path")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
+            shared = connection.execute(
+                """SELECT 1 FROM source_versions
+                   WHERE managed_file_id=? AND source_id<>? LIMIT 1""",
+                (managed_file_id, source_id),
+            ).fetchone()
+            if shared is not None:
+                return None
             connection.execute(
                 """INSERT INTO managed_file_removals(
                        managed_file_id,relative_path,requested_at,removed_at,attempts,last_error
@@ -1581,11 +1603,13 @@ def _verify_attempt_current(
     step_key: str,
     guard: AttemptGuard,
 ) -> None:
-    """Same-transaction proof that a commit may be recorded.
+    """Same-transaction proof that a commit or publication may be recorded.
 
     The job must be running, owned by the guarding instance, and the guarded
     attempt must be the newest unfinished attempt for that step.
     """
+    if guard.step_key != step_key:
+        raise ValueError("attempt guard does not match the step")
     status_row = _fetchone(
         connection, "SELECT status, owner_instance_id FROM job_status WHERE job_id=?", (job_id,)
     )
