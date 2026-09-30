@@ -21,7 +21,7 @@ from core.jobs.runner import (
     StepPolicy,
     commit_checkpoint,
 )
-from core.persistence.errors import ConflictingWriteError
+from core.persistence.errors import ConflictingWriteError, PersistenceError
 from core.persistence.models import AttemptGuard, new_id
 from core.persistence.store import PersistenceStore
 
@@ -310,7 +310,9 @@ def test_cooperative_cancel_during_step_stops_run_and_rejects_late_commits(
     assert store.load_job_steps(job_id) == ()
     # A late completion for a cancelled job is rejected by the guarded commit.
     with pytest.raises(ConflictingWriteError):
-        store.commit_step(job_id, "late", 1, {"late": True}, guard=AttemptGuard("core-x", 1))
+        store.commit_step(
+            job_id, "late", 1, {"late": True}, guard=AttemptGuard("core-x", "late", 1)
+        )
 
 
 def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
@@ -366,6 +368,132 @@ def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
     finally:
         release.set()
         runner.stop()
+
+
+def test_runner_error_leaves_a_truthful_failed_job(store: PersistenceStore) -> None:
+    """A transient database error must not abandon a job as `running`."""
+    records: dict[str, list[int]] = {}
+    failing_once = {"done": False}
+    original = store.start_step_attempt
+
+    def flaky(job_id: str, step_key: str):
+        if not failing_once["done"]:
+            failing_once["done"] = True
+            raise PersistenceError("injected transient database error")
+        return original(job_id, step_key)
+
+    runner = RunnerHarness(
+        store,
+        {"demo": [step_recording("one", records, lambda context: StepOutcome(1, {"one": True}))]},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    affected_job, _ = enqueue(store, "demo", "demo:runner-error", "runner-error.pdf")
+    later_job, _ = enqueue(store, "demo", "demo:after-error", "after-error.pdf")
+    store.start_step_attempt = flaky  # type: ignore[method-assign]
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, affected_job)
+        assert wait_until(lambda: failing_once["done"]), "injection never fired"
+        runner.enqueue_and_notify(store, later_job)
+        assert wait_until(
+            lambda: store.load_job_status(later_job).status == "completed"  # type: ignore[union-attr]
+        ), store.load_job_status(later_job)
+    finally:
+        store.start_step_attempt = original  # type: ignore[method-assign]
+        runner.stop()
+
+    affected = store.load_job_status(affected_job)
+    assert affected is not None
+    assert affected.status == "failed", "the affected job must not stay running"
+    assert "runner error" in (affected.failure_reason or "")
+
+
+def test_paid_timeout_is_unknown_and_not_retried(store: PersistenceStore) -> None:
+    records: dict[str, list[int]] = {}
+    release = threading.Event()
+
+    def slow_paid(context: StepContext) -> StepOutcome:
+        release.wait(10)
+        return StepOutcome(1, {"paid": True})
+
+    runner = RunnerHarness(
+        store,
+        {
+            "demo": [
+                StepDefinition(
+                    "paid",
+                    step_recording("paid", records, slow_paid).run,
+                    paid=True,
+                )
+            ]
+        },
+        policies={"generic": StepPolicy(0.15, 3, 0.0)},
+        backoff_sleep=lambda d: None,
+    )
+    job_id, _ = enqueue(store, "demo", "demo:paid-timeout", "paid-timeout.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, job_id)
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        release.set()
+        runner.stop()
+
+    assert records["paid"] == [1], "a timed-out paid call must not be retried"
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "review required" in (status.failure_reason or "")
+    attempts = store.load_step_attempts(job_id, "paid")
+    assert attempts[0].failure_reason == "timed out; paid-call outcome unknown"
+
+
+def test_resumed_unfinished_paid_attempt_is_not_repeated(store: PersistenceStore) -> None:
+    records: dict[str, list[int]] = {}
+    release = threading.Event()
+
+    def slow_paid(context: StepContext) -> StepOutcome:
+        release.wait(10)
+        return StepOutcome(1, {"paid": True})
+
+    steps = lambda: [  # noqa: E731 - two runner generations
+        StepDefinition("paid", step_recording("paid", records, slow_paid).run, paid=True)
+    ]
+    first = RunnerHarness(store, {"demo": steps()}, policies={"generic": StepPolicy(30.0, 3, 0.0)})
+    job_id, _ = enqueue(store, "demo", "demo:paid-restart", "paid-restart.pdf")
+    first.start()
+    try:
+        first.enqueue_and_notify(store, job_id)
+        assert wait_until(lambda: records.get("paid", []) == [1]), records
+    finally:
+        first.stop()
+        release.set()
+
+    # The restart finds an unfinished paid attempt: the outcome is unknown,
+    # so the call is never repeated automatically.
+    second = RunnerHarness(
+        store,
+        {"demo": steps()},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    second.start()
+    try:
+        second.runner.notify()
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        second.stop()
+
+    assert records["paid"] == [1], "a resumed paid call must not be repeated"
+    status = store.load_job_status(job_id)
+    assert status is not None
+    assert "unresolved paid-call attempt" in (status.failure_reason or "")
+    attempts = store.load_step_attempts(job_id, "paid")
+    assert attempts[0].failure_reason == "unresolved; paid-call outcome unknown"
 
 
 def test_release_running_jobs_recovers_every_running_job(store: PersistenceStore) -> None:

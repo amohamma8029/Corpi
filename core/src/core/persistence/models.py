@@ -240,14 +240,15 @@ class JobStepAttempt:
 
 @dataclass(frozen=True, slots=True)
 class AttemptGuard:
-    """Proof a commit belongs to the current attempt of the owning instance.
+    """Proof a commit or publication belongs to the current attempt.
 
-    Every output-saving call verifies this in the same transaction as the
-    write, so a cancelled job, a superseded attempt, or another instance's
-    attempt can never record evidence.
+    Every output-saving call and every publication verifies this in the same
+    transaction as the write, so a cancelled job, a superseded attempt, an
+    expired attempt, or another instance's attempt can never record evidence.
     """
 
     owner_instance_id: str
+    step_key: str
     expected_attempt_number: int
 
 

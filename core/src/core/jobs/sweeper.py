@@ -108,15 +108,19 @@ class TrashSweeper:
         """Unlink the source's managed files that no other source references.
 
         Returns True when the phase may be marked: every file is either still
-        referenced elsewhere, already gone, or removed now. Files that fail are
-        recorded on their removal marker and keep the phase pending.
+        referenced elsewhere, already gone, or removed now. The reference
+        check and the removal reservation happen in one transaction, so a
+        reference cannot slip in between them; files that fail are recorded on
+        their removal marker and keep the phase pending.
         """
         data_dir = self._store.database.config.data_dir.resolve()
         all_resolved = True
         for managed in self._store.list_source_managed_files(source_id):
-            if self._store.managed_file_shared_with_other_sources(managed.id, source_id):
+            removal = self._store.reserve_managed_file_removal(
+                managed.id, managed.relative_path, source_id
+            )
+            if removal is None:
                 continue  # another source still needs these bytes
-            removal = self._store.ensure_managed_file_removal(managed.id, managed.relative_path)
             if removal.removed_at is not None:
                 continue
             candidate = (data_dir / managed.relative_path).resolve()

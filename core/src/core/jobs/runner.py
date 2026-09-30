@@ -132,6 +132,7 @@ class StepDefinition:
     policy_class: str = "generic"
     commit: StepCommit = commit_checkpoint
     inputs: StepInputs | None = None
+    paid: bool = False
 
 
 @dataclass(slots=True)
@@ -389,6 +390,20 @@ class JobRunner:
                 # Cancellation or a competing transition won between the final
                 # checkpoint and completion: the job is no longer ours to finish.
                 logger.info("job %s could not be marked complete (state changed)", job_id)
+        except Exception as error:  # noqa: BLE001 - the job must reach a truthful state
+            # A runner-side failure (for example a transient database error)
+            # must not abandon the job as `running`: record a clear failed
+            # state so it is visible and never silently stuck. When the state
+            # changed underneath (already cancelled, for example) the finish
+            # attempt is refused and suppressed — that state is truthful too.
+            logger.exception("job %s failed with a runner error", job_id)
+            with contextlib.suppress(Exception):
+                await self._db(
+                    self._store.finish_job,
+                    job_id,
+                    "failed",
+                    f"runner error: {type(error).__name__}",
+                )
         finally:
             self._claimed_job_id = None
 
@@ -413,7 +428,8 @@ class JobRunner:
         policy = self._policy_for(status, step)
         fingerprint = await self._fingerprint(job, step)
         while True:
-            spent = len(await self._db(self._store.load_step_attempts, job.id, step.step_key))
+            attempts = await self._db(self._store.load_step_attempts, job.id, step.step_key)
+            spent = len(attempts)
             if spent >= policy.attempt_cap:
                 await self._db(
                     self._store.finish_job,
@@ -422,6 +438,29 @@ class JobRunner:
                     f"step {step.step_key} exhausted its attempt cap of {policy.attempt_cap}",
                 )
                 return False
+            if step.paid:
+                unresolved = [item for item in attempts if item.finished_at is None]
+                if unresolved:
+                    # A crash (or a timeout that left the call in flight) left
+                    # a paid call unresolved: its outcome is unknown, so it is
+                    # never repeated automatically — flag it for review.
+                    for item in unresolved:
+                        with contextlib.suppress(ConflictingWriteError):
+                            await self._db(
+                                self._store.finish_step_attempt,
+                                job.id,
+                                step.step_key,
+                                item.attempt_number,
+                                "unresolved; paid-call outcome unknown",
+                            )
+                    await self._db(
+                        self._store.finish_job,
+                        job.id,
+                        "failed",
+                        f"step {step.step_key} has an unresolved paid-call attempt; "
+                        "review required",
+                    )
+                    return False
             current = await self._db(self._store.load_job_status, job.id)
             if current is None or current.status != "running":
                 return False
@@ -451,6 +490,24 @@ class JobRunner:
             except TimeoutError:
                 # The worker thread keeps running; the inflight entry stays
                 # until it truly finishes, so a fully stuck pool is detected.
+                if step.paid:
+                    # The call may still complete or be charged: its outcome
+                    # is unknown, so it is never repeated automatically.
+                    await self._db(
+                        self._store.finish_step_attempt,
+                        job.id,
+                        step.step_key,
+                        attempt.attempt_number,
+                        "timed out; paid-call outcome unknown",
+                    )
+                    await self._db(
+                        self._store.finish_job,
+                        job.id,
+                        "failed",
+                        f"step {step.step_key} timed out during a paid call; "
+                        "outcome unknown, review required",
+                    )
+                    return False
                 await self._db(
                     self._store.finish_step_attempt,
                     job.id,
@@ -533,7 +590,7 @@ class JobRunner:
                     StepCommitContext(
                         job_id=job.id,
                         step_key=step.step_key,
-                        guard=AttemptGuard(self._owner, attempt.attempt_number),
+                        guard=AttemptGuard(self._owner, step.step_key, attempt.attempt_number),
                         inputs_sha256=fingerprint,
                         outcome=outcome,
                     ),
