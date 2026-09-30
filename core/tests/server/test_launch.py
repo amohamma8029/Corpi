@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -10,6 +11,32 @@ import pytest
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
 TOKEN = "launch-contract-token"
+READY_MARKER = "CORPI_CORE_READY"
+
+
+def wait_for_ready_line(process: subprocess.Popen[str], timeout: float = 30.0) -> str:
+    """Read output until READY with a real wall-clock bound.
+
+    A blocking readline in the main thread cannot be interrupted by a timeout,
+    so the read runs in a helper thread that the test can abandon safely.
+    """
+    result: dict[str, str] = {}
+
+    def read() -> None:
+        assert process.stdout is not None
+        for _ in range(400):
+            line = process.stdout.readline()
+            if line.startswith(READY_MARKER) or line == "":
+                result["line"] = line.strip()
+                return
+        result["line"] = ""
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise AssertionError("timed out waiting for the core's READY line")
+    return result.get("line", "")
 
 
 @pytest.fixture()
@@ -27,19 +54,9 @@ def core_server(tmp_path: Path) -> Iterator[int]:
         text=True,
     )
     try:
-        stream = process.stdout
-        if stream is None:
-            raise AssertionError("core server stdout unavailable")
-        ready_line = ""
-        for _ in range(200):
-            line = stream.readline()
-            if line.startswith("CORPI_CORE_READY"):
-                ready_line = line.strip()
-                break
-            if line == "":
-                raise AssertionError("core server exited before reporting ready")
-        if not ready_line:
-            raise AssertionError("core server did not report ready")
+        ready_line = wait_for_ready_line(process)
+        if not ready_line.startswith(READY_MARKER):
+            raise AssertionError(f"core server did not report ready: {ready_line!r}")
         fields = dict(part.split("=", 1) for part in ready_line.split()[1:])
         yield int(fields["port"])
     finally:
@@ -100,17 +117,9 @@ def test_stdin_close_shuts_down_when_watching(tmp_path: Path) -> None:
         text=True,
     )
     try:
-        assert process.stdout is not None
-        ready_line = ""
-        for _ in range(200):
-            line = process.stdout.readline()
-            if line.startswith("CORPI_CORE_READY"):
-                ready_line = line.strip()
-                break
-            if line == "":
-                raise AssertionError("core server exited before reporting ready")
-        if not ready_line:
-            raise AssertionError("core server did not report ready")
+        ready_line = wait_for_ready_line(process)
+        if not ready_line.startswith(READY_MARKER):
+            raise AssertionError(f"core server did not report ready: {ready_line!r}")
         fields = dict(part.split("=", 1) for part in ready_line.split()[1:])
         port = int(fields["port"])
 
