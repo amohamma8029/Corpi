@@ -598,16 +598,63 @@ class PersistenceStore:
         step_key: str,
         attempt_number: int,
         failure_reason: str | None = None,
+        outcome: str | None = None,
     ) -> JobStepAttempt:
+        if outcome is None:
+            outcome = "ok" if failure_reason is None else "failed"
+        if outcome not in ("ok", "failed", "unknown"):
+            raise ValueError("attempt outcome must be ok, failed, or unknown")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
             cursor = connection.execute(
-                """UPDATE job_step_attempts SET finished_at=?, failure_reason=?
+                """UPDATE job_step_attempts
+                   SET finished_at=?, failure_reason=?, outcome=?
                    WHERE job_id=? AND step_key=? AND attempt_number=? AND finished_at IS NULL""",
-                (timestamp, failure_reason, job_id, step_key, attempt_number),
+                (timestamp, failure_reason, outcome, job_id, step_key, attempt_number),
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("step attempt is unknown or already finished")
+            row = _fetchone(
+                connection,
+                "SELECT * FROM job_step_attempts"
+                " WHERE job_id=? AND step_key=? AND attempt_number=?",
+                (job_id, step_key, attempt_number),
+            )
+            return _job_step_attempt(_require_row(row))
+
+    def record_unknown_paid_outcome(
+        self,
+        job_id: str,
+        step_key: str,
+        attempt_number: int,
+        attempt_reason: str,
+        job_reason: str,
+    ) -> JobStepAttempt:
+        """Record an unknown paid-call outcome and fail the job in ONE transaction.
+
+        The single write closes the crash window between marking the attempt
+        and marking the job; even if a crash splits them elsewhere, the
+        attempt's `outcome` stays 'unknown' and recovery never replays it.
+        """
+        attempt_reason = _required_text(attempt_reason, "attempt reason")
+        job_reason = _required_text(job_reason, "job reason")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE job_step_attempts
+                   SET finished_at=?, failure_reason=?, outcome='unknown'
+                   WHERE job_id=? AND step_key=? AND attempt_number=? AND finished_at IS NULL""",
+                (timestamp, attempt_reason, job_id, step_key, attempt_number),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictingWriteError("step attempt is unknown or already finished")
+            job_cursor = connection.execute(
+                """UPDATE job_status SET status='failed', failure_reason=?, updated_at=?
+                   WHERE job_id=? AND status IN ('queued','running')""",
+                (job_reason, timestamp, job_id),
+            )
+            if job_cursor.rowcount != 1:
+                raise ConflictingWriteError("job is not active; unknown outcome not recorded")
             row = _fetchone(
                 connection,
                 "SELECT * FROM job_step_attempts"
@@ -653,6 +700,15 @@ class PersistenceStore:
         timestamp = utc_timestamp()
         with self._transaction() as connection:
             _verify_attempt_current(connection, job_id, guard.step_key, guard)
+            status_row = _fetchone(
+                connection,
+                "SELECT superseded_by_job_id FROM job_status WHERE job_id=?",
+                (job_id,),
+            )
+            if status_row is not None and status_row["superseded_by_job_id"] is not None:
+                raise ConflictingWriteError(
+                    "job was superseded by newer work; publication rejected"
+                )
             job_row = _fetchone(
                 connection,
                 "SELECT source_id, source_version_id, created_at FROM jobs WHERE id=?",
@@ -733,6 +789,19 @@ class PersistenceStore:
                     "INSERT INTO source_readiness_indexes(source_id,index_version_id) VALUES(?,?)",
                     (source_id, index_version_id),
                 )
+            # Mark every older or same-instant peer superseded. The mark is
+            # durable and independent of the readiness record, so cancelling
+            # this (or any newer) result never restores an older job's right
+            # to publish. Ties on created_at are resolved by first publisher.
+            connection.execute(
+                """UPDATE job_status
+                   SET superseded_by_job_id=?, updated_at=?
+                   WHERE job_id<>? AND superseded_by_job_id IS NULL
+                     AND job_id IN (
+                         SELECT id FROM jobs WHERE source_id=? AND created_at <= ?
+                     )""",
+                (job_id, timestamp, job_id, source_id, job_row["created_at"]),
+            )
             return _load_readiness(connection, source_id)
 
     def load_readiness(self, source_id: str) -> SourceReadiness | None:
@@ -1837,6 +1906,7 @@ def _job_status(row: sqlite3.Row) -> JobStatus:
         row["claimed_at"],
         row["heartbeat_at"],
         row["failure_reason"],
+        row["superseded_by_job_id"],
         None if policy_json is None else decode_json(policy_json),
         row["updated_at"],
     )
@@ -1861,6 +1931,7 @@ def _job_step_attempt(row: sqlite3.Row) -> JobStepAttempt:
         row["started_at"],
         row["finished_at"],
         row["failure_reason"],
+        row["outcome"],
     )
 
 

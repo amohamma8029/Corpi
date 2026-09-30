@@ -141,6 +141,7 @@ class RunnerSnapshot:
     blocked_reason: str | None
     claimed_job_id: str | None
     queued_job_ids: tuple[str, ...]
+    pending_failure_jobs: tuple[str, ...]
 
 
 def _default_owner_instance_id() -> str:
@@ -209,6 +210,7 @@ class JobRunner:
         self._inflight: dict[tuple[str, str, int], float] = {}
         self._inflight_lock = threading.Lock()
         self._annotated_jobs: set[str] = set()
+        self._pending_job_failures: list[tuple[str, str]] = []
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -246,6 +248,7 @@ class JobRunner:
             blocked_reason=self._blocked_reason,
             claimed_job_id=self._claimed_job_id,
             queued_job_ids=tuple(job.job_id for job in self._store.list_claimable_jobs()),
+            pending_failure_jobs=tuple(job_id for job_id, _ in self._pending_job_failures),
         )
 
     def _state_name(self) -> str:
@@ -276,6 +279,7 @@ class JobRunner:
 
     async def _loop_once(self) -> None:
         assert self._wakeup is not None
+        await self._drain_pending_failures()
         stall_reason = self._stall_reason()
         if stall_reason is not None:
             await self._db(self._enter_stall, stall_reason)
@@ -397,15 +401,38 @@ class JobRunner:
             # changed underneath (already cancelled, for example) the finish
             # attempt is refused and suppressed — that state is truthful too.
             logger.exception("job %s failed with a runner error", job_id)
-            with contextlib.suppress(Exception):
-                await self._db(
-                    self._store.finish_job,
-                    job_id,
-                    "failed",
-                    f"runner error: {type(error).__name__}",
-                )
+            await self._record_job_failure(job_id, f"runner error: {type(error).__name__}")
         finally:
             self._claimed_job_id = None
+
+    async def _record_job_failure(self, job_id: str, reason: str) -> None:
+        """Record a failed outcome, keeping it pending when the write fails.
+
+        A database error while recording the failure must not abandon the job
+        as `running`: the outcome stays pending and is retried on every loop
+        iteration until it is durable (or the job reached a truthful state
+        another way).
+        """
+        try:
+            await self._db(self._store.finish_job, job_id, "failed", reason)
+        except ConflictingWriteError:
+            pass  # the job already reached a truthful state
+        except Exception:  # noqa: BLE001 - the outcome is kept pending instead
+            logger.exception("could not record failure for job %s; keeping it pending", job_id)
+            self._pending_job_failures.append((job_id, reason))
+
+    async def _drain_pending_failures(self) -> None:
+        if not self._pending_job_failures:
+            return
+        remaining: list[tuple[str, str]] = []
+        for job_id, reason in self._pending_job_failures:
+            try:
+                await self._db(self._store.finish_job, job_id, "failed", reason)
+            except ConflictingWriteError:
+                pass  # already truthful (for example cancelled underneath)
+            except Exception:  # noqa: BLE001 - stay pending until it can be recorded
+                remaining.append((job_id, reason))
+        self._pending_job_failures = remaining
 
     async def _fingerprint(self, job: Job, step: StepDefinition) -> str:
         if step.inputs is None:
@@ -439,27 +466,36 @@ class JobRunner:
                 )
                 return False
             if step.paid:
-                unresolved = [item for item in attempts if item.finished_at is None]
-                if unresolved:
-                    # A crash (or a timeout that left the call in flight) left
-                    # a paid call unresolved: its outcome is unknown, so it is
-                    # never repeated automatically — flag it for review.
-                    for item in unresolved:
+                unfinished = [item for item in attempts if item.finished_at is None]
+                unknown_done = [
+                    item
+                    for item in attempts
+                    if item.finished_at is not None and item.outcome == "unknown"
+                ]
+                if unfinished or unknown_done:
+                    # A crash left an unresolved call, or an attempt already
+                    # recorded an unknown outcome (even with a finish
+                    # timestamp): the call's outcome is unknown, so it is never
+                    # repeated automatically — flag it for review.
+                    for item in unfinished:
                         with contextlib.suppress(ConflictingWriteError):
                             await self._db(
-                                self._store.finish_step_attempt,
-                                job.id,
-                                step.step_key,
-                                item.attempt_number,
-                                "unresolved; paid-call outcome unknown",
+                                partial(
+                                    self._store.finish_step_attempt,
+                                    job.id,
+                                    step.step_key,
+                                    item.attempt_number,
+                                    "unresolved; paid-call outcome unknown",
+                                    outcome="unknown",
+                                )
                             )
-                    await self._db(
-                        self._store.finish_job,
-                        job.id,
-                        "failed",
-                        f"step {step.step_key} has an unresolved paid-call attempt; "
-                        "review required",
+                    reason = (
+                        f"step {step.step_key} has an unresolved paid-call attempt; review required"
+                        if unfinished
+                        else f"step {step.step_key} has a recorded unknown paid-call "
+                        "outcome; review required"
                     )
+                    await self._db(self._store.finish_job, job.id, "failed", reason)
                     return False
             current = await self._db(self._store.load_job_status, job.id)
             if current is None or current.status != "running":
@@ -491,22 +527,20 @@ class JobRunner:
                 # The worker thread keeps running; the inflight entry stays
                 # until it truly finishes, so a fully stuck pool is detected.
                 if step.paid:
-                    # The call may still complete or be charged: its outcome
-                    # is unknown, so it is never repeated automatically.
-                    await self._db(
-                        self._store.finish_step_attempt,
-                        job.id,
-                        step.step_key,
-                        attempt.attempt_number,
-                        "timed out; paid-call outcome unknown",
-                    )
-                    await self._db(
-                        self._store.finish_job,
-                        job.id,
-                        "failed",
-                        f"step {step.step_key} timed out during a paid call; "
-                        "outcome unknown, review required",
-                    )
+                    # One transaction records the unknown outcome and fails the
+                    # job. Even a crash between writes can never make this call
+                    # replayable: the attempt keeps outcome 'unknown' and
+                    # recovery checks that, finish timestamp or not.
+                    with contextlib.suppress(ConflictingWriteError):
+                        await self._db(
+                            self._store.record_unknown_paid_outcome,
+                            job.id,
+                            step.step_key,
+                            attempt.attempt_number,
+                            "timed out; paid-call outcome unknown",
+                            f"step {step.step_key} timed out during a paid call; "
+                            "outcome unknown, review required",
+                        )
                     return False
                 await self._db(
                     self._store.finish_step_attempt,

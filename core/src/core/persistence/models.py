@@ -224,6 +224,7 @@ class JobStatus:
     claimed_at: str | None
     heartbeat_at: str | None
     failure_reason: str | None
+    superseded_by_job_id: str | None
     policy: JSONValue
     updated_at: str
 
@@ -236,6 +237,7 @@ class JobStepAttempt:
     started_at: str
     finished_at: str | None
     failure_reason: str | None
+    outcome: str | None
 
 
 @dataclass(frozen=True, slots=True)

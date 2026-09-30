@@ -190,9 +190,9 @@ def seed_graph(
     return source_id, source_version, tuple(indexes), job.id
 
 
-def test_populated_upgrade_to_revision_three_preserves_records(data_dir: Path) -> None:
+def test_populated_upgrade_to_revision_four_preserves_records(data_dir: Path) -> None:
     migrations = load_migrations()
-    assert [migration.revision for migration in migrations] == [1, 2, 3]
+    assert [migration.revision for migration in migrations] == [1, 2, 3, 4]
 
     legacy = Database(DatabaseConfig(data_dir), migrations=migrations[:1])
     legacy.initialize()
@@ -203,7 +203,7 @@ def test_populated_upgrade_to_revision_three_preserves_records(data_dir: Path) -
     store = PersistenceStore(upgraded)
     assert store.load_source(source_id).id == source_id
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_job_status_claim_heartbeat_and_finish(store: PersistenceStore, database: Database) -> None:
@@ -394,6 +394,47 @@ def test_cancelling_an_older_job_keeps_a_newer_jobs_readiness(
     assert readiness is not None
     assert readiness.published_by_job_id == job_b.id
     assert readiness.index_version_ids == (new_index.id,)
+
+
+def test_cancelling_the_newer_result_does_not_restore_older_publish_rights(
+    store: PersistenceStore,
+) -> None:
+    """Supersession is tracked on the job, not on the removable readiness
+    record: cancelling the newer result must not revive the older job's
+    publishing rights."""
+    source_id, source_version, indexes, job_a = seed_graph(store, "superseded.pdf")
+    publish(store, job_a, source_id, source_version.id, [indexes[0].id])
+
+    graph = store.load_extraction(indexes[0].extraction_version_id)
+    new_index, chunks, mappings = make_index(graph.extraction, graph.passages)
+    job_b = store.create_job(
+        "extract:newer-superseder",
+        "extract",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=graph.extraction.id,
+    )
+    store.create_job_status(job_b.id)
+    store.claim_job(job_b.id, SEED_OWNER)
+    guard = commit_with_guard(store, job_b.id, "build-index-new")
+    store.commit_index_step(
+        job_b.id, "build-index-new", new_index, chunks, mappings, 1, {}, guard=guard
+    )
+    store.finish_step_attempt(job_b.id, "build-index-new", guard.expected_attempt_number)
+    publish(store, job_b.id, source_id, source_version.id, [new_index.id])
+
+    older_status = store.load_job_status(job_a)
+    assert older_status is not None
+    assert older_status.superseded_by_job_id == job_b.id
+
+    # Cancelling the newer job hides its readiness...
+    store.cancel_job(job_b.id, "cancelled newer result")
+    assert store.load_readiness(source_id) is None
+
+    # ...but the older job stays superseded and cannot publish again.
+    with pytest.raises(ConflictingWriteError):
+        publish(store, job_a, source_id, source_version.id, [indexes[0].id])
+    assert store.load_readiness(source_id) is None
 
 
 def test_reservation_refuses_when_another_source_references_the_file(
