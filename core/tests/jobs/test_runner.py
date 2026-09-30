@@ -598,6 +598,81 @@ def test_failure_recording_is_retried_until_truthful(store: PersistenceStore, mo
     assert runner.runner.snapshot().pending_failure_jobs == ()
 
 
+def test_paid_exception_records_unknown_outcome_and_is_not_replayed_on_restart(
+    store: PersistenceStore,
+) -> None:
+    """The PaidCallOutcomeUnknown path must record outcome 'unknown' durably
+    (single transaction) and restart recovery must never replay the call."""
+    calls = {"count": 0}
+
+    def paid_raiser(context: StepContext) -> StepOutcome:
+        calls["count"] += 1
+        raise PaidCallOutcomeUnknown("provider did not acknowledge the request")
+
+    steps = lambda: [StepDefinition("paid", paid_raiser, paid=True)]  # noqa: E731
+    runner = RunnerHarness(
+        store,
+        {"demo": steps()},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    job_id, _ = enqueue(store, "demo", "demo:paid-exception", "paid-exception.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, job_id)
+        assert wait_until(
+            lambda: store.load_job_status(job_id).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(job_id)
+    finally:
+        runner.stop()
+
+    attempts = store.load_step_attempts(job_id, "paid")
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "unknown", (
+        "the exception path must record the unknown outcome on the attempt"
+    )
+    assert calls["count"] == 1
+
+    # The crash boundary: an interrupted write can leave the attempt recorded
+    # while the job is still running. Restart recovery must not replay the
+    # call and must flag it for review.
+    resumed_job, _ = enqueue(
+        store, "demo", "demo:paid-exception-restart", "paid-exception-restart.pdf"
+    )
+    store.create_job_status(resumed_job)
+    store.claim_job(resumed_job, "core-old")
+    attempt = store.start_step_attempt(resumed_job, "paid")
+    store.finish_step_attempt(
+        resumed_job,
+        "paid",
+        attempt.attempt_number,
+        "paid-call outcome unknown; not retried automatically: interrupted write",
+        outcome="unknown",
+    )
+
+    second = RunnerHarness(
+        store,
+        {"demo": steps()},
+        policies={"generic": FAST_POLICY},
+        backoff_sleep=lambda d: None,
+    )
+    second.start()
+    try:
+        second.runner.notify()
+        assert wait_until(
+            lambda: store.load_job_status(resumed_job).status == "failed"  # type: ignore[union-attr]
+        ), store.load_job_status(resumed_job)
+    finally:
+        second.stop()
+
+    assert calls["count"] == 1, "the interrupted paid call must never run a second time"
+    status = store.load_job_status(resumed_job)
+    assert status is not None
+    assert "review required" in (status.failure_reason or "")
+    resumed_attempts = store.load_step_attempts(resumed_job, "paid")
+    assert resumed_attempts[0].outcome == "unknown"
+
+
 def test_release_running_jobs_recovers_every_running_job(store: PersistenceStore) -> None:
     """An immediate restart recovers fresh-heartbeat jobs too: the exclusive
     data-directory lock, not a heartbeat age, proves the previous core is gone."""
