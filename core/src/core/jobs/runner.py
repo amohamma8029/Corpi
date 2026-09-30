@@ -569,19 +569,18 @@ class JobRunner:
                 )
                 return False
             except PaidCallOutcomeUnknown as error:
-                await self._db(
-                    self._store.finish_step_attempt,
-                    job.id,
-                    step.step_key,
-                    attempt.attempt_number,
-                    f"paid-call outcome unknown; not retried automatically: {error}",
-                )
-                await self._db(
-                    self._store.finish_job,
-                    job.id,
-                    "failed",
-                    f"step {step.step_key} has an unknown paid-call outcome; review required",
-                )
+                # One transaction records outcome 'unknown' on the attempt and
+                # fails the job: a crash cannot leave recovery treating this
+                # call as safe to repeat (same guarantee as the timeout path).
+                with contextlib.suppress(ConflictingWriteError):
+                    await self._db(
+                        self._store.record_unknown_paid_outcome,
+                        job.id,
+                        step.step_key,
+                        attempt.attempt_number,
+                        f"paid-call outcome unknown; not retried automatically: {error}",
+                        f"step {step.step_key} has an unknown paid-call outcome; review required",
+                    )
                 return False
             except PermanentStepFailure as error:
                 await self._db(
