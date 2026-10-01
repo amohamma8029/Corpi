@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -189,16 +188,16 @@ def test_missing_data_directory_setting_fails_before_ready() -> None:
     assert "CORPI_CORE_READY" not in result.stdout
 
 
-def test_stream_delivers_chunks_over_live_socket(core_server: int) -> None:
-    events: list[dict] = []
-    with httpx.stream(
-        "GET",
-        f"http://127.0.0.1:{core_server}/demo/stream",
-        headers={"Authorization": f"Bearer {TOKEN}"},
-    ) as response:
-        assert response.status_code == 200
-        for line in response.iter_lines():
-            if line.startswith("data: "):
-                events.append(json.loads(line.removeprefix("data: ")))
-    assert [event["step"] for event in events if "step" in event] == [1, 2, 3, 4, 5]
-    assert events[-1] == {"done": True}
+def test_authenticated_notebook_routes_work_over_the_live_socket(core_server: int) -> None:
+    base = f"http://127.0.0.1:{core_server}"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    listed = httpx.get(f"{base}/notebooks", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json() == []
+
+    created = httpx.post(f"{base}/notebooks", headers=headers, json={"title": "Live core notebook"})
+    assert created.status_code == 201
+    notebook_id = created.json()["id"]
+    reopened = httpx.get(f"{base}/notebooks/{notebook_id}", headers=headers)
+    assert reopened.status_code == 200
+    assert reopened.json()["title"] == "Live core notebook"

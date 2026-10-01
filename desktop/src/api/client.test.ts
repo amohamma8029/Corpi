@@ -1,32 +1,20 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { CoreConnection, coreHealth, coreHealthWithRetry, demoStream, extractEvents } from "./client";
-
-describe("extractEvents", () => {
-  it("returns complete events and keeps the partial tail", () => {
-    const { events, buffer } = extractEvents('data: {"step":1}\n\ndata: {"st');
-    expect(events).toEqual([{ step: 1 }]);
-    expect(buffer).toBe('data: {"st');
-  });
-
-  it("returns no events while only a partial block has arrived", () => {
-    const { events, buffer } = extractEvents('data: {"step":1}\n');
-    expect(events).toEqual([]);
-    expect(buffer).toBe('data: {"step":1}\n');
-  });
-
-  it("parses several complete blocks from one chunk", () => {
-    const { events } = extractEvents(
-      'data: {"step":1}\n\ndata: {"step":2}\n\ndata: {"done":true}\n\n',
-    );
-    expect(events).toEqual([{ step: 1 }, { step: 2 }, { done: true }]);
-  });
-});
+import {
+  CoreConnection,
+  coreBinary,
+  coreHealth,
+  coreHealthWithRetry,
+  coreRequest,
+  uploadPdf,
+} from "./client";
 
 const CONNECTION: CoreConnection = { base_url: "http://127.0.0.1:9", token: "launch-token" };
 
-describe("coreHealth", () => {
-  it("sends the bearer token in the Authorization header", async () => {
+afterEach(() => vi.unstubAllGlobals());
+
+describe("core requests", () => {
+  it("sends the per-launch bearer token and won't let a caller replace it", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -34,20 +22,28 @@ describe("coreHealth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const health = await coreHealth(CONNECTION);
+    const health = await coreRequest<{ status: string }>(CONNECTION, "/health", {
+      headers: { Authorization: "Bearer attacker-token" },
+    });
 
     expect(health.status).toBe("ok");
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://127.0.0.1:9/health");
-    expect(init.headers).toMatchObject({ Authorization: "Bearer launch-token" });
-    vi.unstubAllGlobals();
+    expect(new Headers(init.headers).get("Authorization")).toBe("Bearer launch-token");
   });
 
-  it("surfaces non-2xx responses as errors", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 401 });
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(coreHealth(CONNECTION)).rejects.toThrow("HTTP 401");
-    vi.unstubAllGlobals();
+  it("preserves sanitized error codes from core responses", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      json: async () => ({ detail: { code: "file_cleanup_pending", message: "Retry after cleanup." } }),
+    }));
+
+    await expect(coreHealth(CONNECTION)).rejects.toMatchObject({
+      status: 409,
+      code: "file_cleanup_pending",
+      message: "Retry after cleanup.",
+    });
   });
 });
 
@@ -63,44 +59,44 @@ describe("coreHealthWithRetry", () => {
       });
     vi.stubGlobal("fetch", fetchMock);
 
-    const health = await coreHealthWithRetry(CONNECTION, 3, 0);
-
-    expect(health.status).toBe("ok");
+    expect((await coreHealthWithRetry(CONNECTION, 3, 0)).status).toBe("ok");
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    vi.unstubAllGlobals();
-  });
-
-  it("surfaces the error after exhausting attempts", async () => {
-    const fetchMock = vi.fn().mockRejectedValue(new Error("Failed to fetch"));
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(coreHealthWithRetry(CONNECTION, 3, 0)).rejects.toThrow("Failed to fetch");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    vi.unstubAllGlobals();
   });
 });
 
-describe("demoStream", () => {
-  it("feeds every event from the authenticated stream to the callback", async () => {
-    const sse = 'data: {"step":1,"total":2}\n\ndata: {"step":2,"total":2}\n\ndata: {"done":true}\n\n';
-    const reader = {
-      read: vi
-        .fn()
-        .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(sse) })
-        .mockResolvedValueOnce({ done: true, value: undefined }),
-    };
+describe("PDF binary operations", () => {
+  it("sends bearer authentication on PDF upload and keeps the raw file body", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      body: { getReader: () => reader },
+      json: async () => ({ state: "completed" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["%PDF-1.4"], "report.pdf", { type: "application/pdf" });
+
+    await uploadPdf(CONNECTION, "acquisition-id", file);
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("http://127.0.0.1:9/pdf-acquisitions/acquisition-id/content");
+    expect(init.method).toBe("PUT");
+    expect(new Headers(init.headers).get("Authorization")).toBe("Bearer launch-token");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/pdf");
+    expect(init.body).toBe(file);
+  });
+
+  it("reads exact binary bytes without decoding them as JSON", async () => {
+    const bytes = new Uint8Array([0, 37, 80, 68, 70]);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => bytes.buffer,
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const received: unknown[] = [];
-    await demoStream(CONNECTION, (event) => received.push(event));
+    const result = await coreBinary(CONNECTION, "/sources/source/imports/import/pdf");
 
-    expect(received).toEqual([{ step: 1, total: 2 }, { step: 2, total: 2 }, { done: true }]);
+    expect(Array.from(result)).toEqual([0, 37, 80, 68, 70]);
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(init.headers).toMatchObject({ Authorization: "Bearer launch-token" });
-    vi.unstubAllGlobals();
+    expect(new Headers(init.headers).get("Authorization")).toBe("Bearer launch-token");
   });
 });

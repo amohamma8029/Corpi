@@ -32,7 +32,7 @@ async def _preflight(send: Send, origin: str, request_headers: str) -> None:
         "status": 200,
         "headers": [
             (b"access-control-allow-origin", origin.encode("ascii")),
-            (b"access-control-allow-methods", b"GET, OPTIONS"),
+            (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
             (
                 b"access-control-allow-headers",
                 (request_headers or "authorization").encode("ascii"),

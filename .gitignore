@@ -10,6 +10,8 @@ target/
 
 # Tauri generated files
 desktop/src-tauri/gen/
+desktop/public/pdfjs/
+desktop/e2e-results/
 
 # Python caches
 __pycache__/

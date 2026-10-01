@@ -17,4 +17,15 @@ def test_exported_openapi_contains_core_routes(tmp_path: Path) -> None:
 
     schema = json.loads(output.read_text(encoding="utf-8"))
     assert "/health" in schema["paths"]
-    assert "/demo/stream" in schema["paths"]
+    assert "/notebooks" in schema["paths"]
+    assert "/notebooks/{notebook_id}/pdf-acquisitions" in schema["paths"]
+    upload = schema["paths"]["/pdf-acquisitions/{acquisition_id}/content"]["put"]
+    assert upload["requestBody"]["content"]["application/pdf"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+    pdf_response = schema["paths"]["/sources/{source_id}/imports/{import_id}/pdf"]["get"]
+    assert pdf_response["responses"]["200"]["content"]["application/pdf"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }

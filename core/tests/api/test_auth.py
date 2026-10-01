@@ -74,3 +74,18 @@ def test_preflight_from_foreign_origin_is_forbidden(client: TestClient) -> None:
         },
     )
     assert response.status_code == 403
+
+
+def test_preflight_allows_pdf_upload_and_file_history_writes(client: TestClient) -> None:
+    response = client.options(
+        "/notebooks/example/pdf-acquisitions",
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert "PUT" in response.headers["access-control-allow-methods"]
+    assert "DELETE" in response.headers["access-control-allow-methods"]
+    assert "authorization" in response.headers["access-control-allow-headers"]

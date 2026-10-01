@@ -113,15 +113,16 @@ access limits. These descriptions identify where work happens and how its result
 
 #### Desktop UI
 
-The UI lets users manage notebooks, import and select sources, chat, open citations, save notes,
-and view or edit artifacts. Provider configuration and local settings are available here as well.
+The UI lets users manage notebooks and PDF import history, inspect saved originals, import/select
+sources, chat, open citations, save notes, and view or edit artifacts. Provider configuration and
+local settings are available here as well.
 Each action passes to the Local Application Core, and the UI displays the resulting content or
 status under the [communication rules](#component-communication).
 
 #### Local Application Core
 
 The core receives user actions and coordinates the work needed to complete them. It manages
-notebooks, sources, and app state, reads and writes local data, and starts or tracks background jobs.
+notebooks, sources, PDF acquisitions, and app state, reads and writes local data, and starts or tracks background jobs.
 Model calls and URL fetching pass through its control boundary, so screen or source content cannot
 invoke them directly. The core also records model usage when that information is available.
 
@@ -133,7 +134,8 @@ is interrupted or disconnected before completion, its status must remain interru
 
 Local storage keeps work between sessions. App records hold notebooks, sources, conversations,
 notes, artifacts, and their relationships, while managed files hold originals, saved pages,
-previews, and other large content.
+previews, and other large content. M1.4 stores PDF imports as notebook/source-version history
+separate from the physical original bytes; several imports can refer to one verified original.
 
 Keyword and semantic/vector indexes retrieve replaceable chunks of text that map back to fixed
 citation passages. Keeping [these two text layers](#citation-passages-and-retrieval-chunks) separate
@@ -150,9 +152,15 @@ When the core requests long-running work, such as an import, index rebuild, or a
 it records a job for background execution. The job runs away from the UI thread and saves progress
 and results locally, allowing the core to report them to the UI.
 
-Import jobs parse each format, read PDF pages, split text into retrieval chunks, create local
-embeddings, and build indexes. Background execution also generates artifacts and owns per-step
-progress, retries, cancellation, reuse of completed work, and the final source-readiness check.
+PDF receipt first streams bytes into durable app-data staging and records an acquisition. Once the
+original and source/import records commit, Corpi enqueues a `pdf-extract` job. The runner leaves that
+known job queued with a visible waiting reason until M1.5 registers its extraction steps; an unknown
+job kind still fails. The original remains openable during this wait or after extraction failure.
+
+When processing steps are available, import jobs parse each format, read PDF pages, split text into
+retrieval chunks, create local embeddings, and build indexes. Background execution also generates
+artifacts and owns per-step progress, retries, cancellation, reuse of completed work, and the final
+source-readiness check.
 The [background-work rules](#background-work-and-model-calls) explain how these jobs resume
 after interruption without duplicating their effects.
 
@@ -189,9 +197,64 @@ preserving source-version and citation-passage references along the way.
 
 ### Source ingestion
 
-Source ingestion runs as local background work: Corpi acquires the content, extracts usable text,
-and prepares it for search. For PDFs, extraction may include optical character recognition (OCR)
-to read printed text from page images.
+PDF byte receipt runs in an authenticated request to the local core; extraction and search
+preparation run as local background work. The saved original is available before text extraction
+finishes. For PDFs, extraction may include optical character recognition (OCR) to read printed text
+from page images.
+
+#### Save and inspect the original PDF
+
+The desktop sends one raw `application/pdf` body to an authenticated loopback endpoint. The core
+counts bytes while streaming into `files/staging/<acquisition-id>.part`; it doesn't accept paths
+from the webview or buffer the complete upload on the event loop. Starting defaults are 25,000,000
+received bytes, 120 seconds from request acceptance, and 30 seconds without bytes. A trickle resets
+only the idle limit. One inbound transfer runs per core; a second receives a busy result without a
+source or partial original. These values are configurable and need real-file timing evidence.
+
+After Corpi flushes and syncs a complete staged PDF, it chooses its managed original under
+`files/objects/<managed-file-id>.pdf`. The acquisition record saves the planned identity before
+placement. Its canonical-original registry has a unique `(sha256, size_bytes)` key, but
+`managed_files` itself allows historical duplicates. New imports verify bytes before sharing a
+registered original. They may also adopt the earliest eligible old matching file on a later
+Add/Replace; migration and startup never merge or rewrite those older records.
+
+Every acquisition has a stable action key and `finalization_generation`. Before reusing an existing
+file, Corpi saves an indexed `planned_reuse_managed_file_id` hold in the same transaction that checks
+the durable per-file removal marker. A recoverable hold survives a crash and blocks purge until the
+acquisition commits its required source reference or releases the hold under the current generation.
+New-file placement intent is a planned ID/path, not a hold on another existing file. Finalization
+commits the managed-file record, source/content-version and import-history links, its outcome, and a
+queued job together. It uses an acquisition-specific guard because it happens before the runner has
+claimed a job step.
+
+Add matches bytes, not a filename. An identical current or pending PDF in the same notebook opens
+the existing source without another history entry or processing job. Replace creates a pending
+candidate while the earlier current/ready PDF stays usable. Only guarded successful readiness
+publication switches the current import; failure, cancellation, or supersession leaves the previous
+one in place. A changed filename alone never creates a content version.
+
+The Files section lists current, pending, and older imports with their saved names or an honest
+legacy-name fallback, date, size, processing state, and Open action. Earlier imports can enter
+30-day trash only when they're neither current nor pending and no live job needs them. Whole-source
+trash and earlier-import purge share the fingerprint coordinator and `managed_file_removals`
+reservation with acquisition finalization. The surviving-owner check and reservation share one
+short database transaction; filesystem unlink happens after that transaction and under the same
+fingerprint lock. A failed unlink remains retryable. Acquisition holds, import/history links, source
+versions, jobs, and unexpired trash all block a competing removal where they own the exact file.
+
+Opening an import fetches its exact managed file with the bearer header. The core rejects a reserved
+file or redirected path, verifies the opened bytes against saved size and SHA-256, and returns that
+same full byte buffer with `application/pdf` and `Cache-Control: no-store`. PDF.js 6.3.289 and its
+matching local worker render only the requested page, with navigation/zoom and a configurable
+20-megapixel canvas bound. The full PDF is still downloaded to memory; 25 MB is an upload limit, not
+a bound on decoded memory. PDF links/scripts aren't run, and PDF.js display text isn't citation
+evidence. Closing or switching imports cancels renders and releases the worker, document, and canvas.
+
+Acquisition reconciliation runs at startup before the job runner and trash sweeper, then on the
+existing hourly maintenance cadence. It resumes complete staged input or a planned placement,
+re-verifies reuse holds, and cleans only recorded temporary paths after writers stop. Staging with
+no live writer or resumable owner becomes abandoned after 24 hours without a write. It never deletes
+unexplained files from the objects directory by age alone.
 
 #### Import flow
 
@@ -251,15 +314,22 @@ contain printed text but extraction is missing, garbled, or incomplete, run OCR 
 any usable native text. Check the OCR result before accepting it; a sparse or blank page alone
 does not justify OCR.
 
-These PDF/OCR limits are **configurable starting defaults**:
+These PDF upload/render/OCR limits are **configurable starting defaults**:
 
 | Limit | Starting value |
 | --- | --- |
-| Document size | 25 MB |
+| Received PDF bytes | 25,000,000 bytes |
+| Total inbound transfer time | 120 seconds |
+| Time without receiving bytes | 30 seconds |
 | Document length | 200 pages |
 | Rendered page size | 20 megapixels (MP) |
 | OCR timeout per page | 60 seconds |
 | Total OCR time per source | 10 minutes |
+
+The idle deadline resets only when bytes arrive; the total deadline never resets. One inbound
+transfer runs per core, while other API and background work remains responsive. The viewer renders
+only the selected page, but it downloads the complete verified PDF into memory, which also holds
+decoded resources. The 25 MB upload cap isn't an application-memory guarantee.
 
 Time already spent counts against the total source OCR budget across retries, so retrying must
 not reset that budget. Identify unreadable pages, including pages whose processing fails or exceeds
@@ -485,8 +555,8 @@ and links to the work that produced or used it.
 
 | Storage responsibility | What it keeps |
 | --- | --- |
-| Local app records | One SQLite database under the user's Corpi app-data directory: notebooks; source details and versions; immutable citation passages and their retrieval-chunk links; search metadata; conversations, answers, notes, artifacts, and citations; citation-check failures; settings and job/task state. |
-| Corpi-managed files | Uploaded originals, saved web pages/PDFs, previews, generated documents/exports, and other large app-managed files. Export behavior is still open. |
+| Local app records | One SQLite database under the user's Corpi app-data directory: notebooks; sources, versions and PDF import history; durable PDF acquisitions/plans; canonical-original registry and removal reservations; immutable citation passages and their retrieval-chunk links; search metadata; conversations, answers, notes, artifacts, and citations; settings and job/task state. |
+| Corpi-managed files | Uploaded originals, saved web pages/PDFs, previews, generated documents/exports, and other large app-managed files. New PDF originals live at `files/objects/<managed-file-id>.pdf`; acquisition staging lives under `files/staging/`. Export behavior remains open. |
 | Search indexes | Local keyword and semantic/vector indexes. Record each index version, the source versions it covers, and the embedding model and version used for semantic search. |
 | Secure credential storage | External generation credentials, kept outside ordinary app/database fields. The storage/decryption technology and authorized component remain open. |
 
@@ -508,10 +578,11 @@ database through Python's standard-library `sqlite3`, with composite constraints
 #### Local database and migrations
 
 Store structured records for all notebooks in one SQLite database beneath Tauri's per-user app-data
-directory. Keep large originals outside the database and reference them through managed-file records;
-their directory layout and copy behavior remain part of the file-management milestone. Enable WAL
-and `synchronous=FULL`, with a configurable 5,000 ms starting lock wait on each connection. Require
-SQLite 3.51.3 or newer for the WAL-reset fix, and record the library actually loaded by Python.
+directory. Keep large originals outside the database and reference them through managed-file records.
+M1.4 fixes this layout for PDF originals and their acquisition staging; layout choices for later file
+types remain open. Enable WAL and `synchronous=FULL`, with a configurable 5,000 ms starting lock
+wait on each connection. Require SQLite 3.51.3 or newer for the WAL-reset fix, and record the
+library actually loaded by Python.
 
 Use ordered, checked-in SQL migrations with revision history and source/schema checksums. Acquire
 SQLite's `BEGIN IMMEDIATE` writer lock before trusting migration history so simultaneous core starts
@@ -626,13 +697,19 @@ communication (IPC). An internal HTTP server is not required.
 | Connection | Rules |
 | --- | --- |
 | Desktop UI ↔ Application Core | Route app actions through the core; UI content cannot directly change search internals, retrieve credentials, or bypass sandboxed fetching. |
-| Core ↔ Background Processing | Record jobs and share progress/results through local storage for the core/UI to read. No external job-routing service is assumed. |
+| Core ↔ Background Processing | Record jobs and share progress/results through local storage for the core/UI to read. PDF receipt is a pre-job acquisition; only a durable finalization transaction creates its queued processing job. No external job-routing service is assumed. |
 | Background Processing ↔ Fetch/Browser | Exchange only the fetch request, validated import parameters, and fetched content. Never send credentials or unrelated app state. |
 | Authorized model component ↔ Provider | Send required instructions/context with configured credentials; accept only responses that pass schema and validation checks. The credential-holding component remains open. |
 | Search ↔ Context selection ↔ Generation ↔ Citation checks | Keep steps independently testable and retain source-version and citation-passage references, including when candidates are dropped or rearranged. |
 
 These rules define responsibilities and the data passed between components. They do not specify
 endpoints or choose a communication protocol.
+
+The shipped Tauri UI calls the Python core over authenticated loopback HTTP. Notebook, PDF
+acquisition, retry/cancel, history, storage, and binary-view routes use the per-launch bearer token
+and pass the same `Origin`/`Host` checks. CORS preflight permits the write methods and headers those
+requests need. PDF viewing fetches the exact import with the bearer header; the route returns one
+verified full-file response and does not claim byte-range support.
 
 ### Security rules
 
@@ -705,8 +782,9 @@ Deferred items also state whether they await the artifact milestone or fall outs
 | Models | Use the user's configured external provider and BYOK credentials for generation. Corpi manages local embeddings by default. |
 | History | Make ready versions available all at once. Preserve source/output versions and template/rendering versions. Regenerate only on request. Use 30-day local trash. |
 | Local database and research-data protection | Use one standard-library SQLite database under the per-user app-data directory, relational versioned records, immutable citation passages, ordered SQL migrations, and the OS-account/app-data protection boundary without additional Corpi-managed research-data encryption in initial v1. Keep provider credentials in separate secure storage. |
-| Desktop shell and local core | Tauri 2 + React/TypeScript shell; Python 3.13 core managed with uv; FastAPI over loopback HTTP with a per-launch bearer token, `Origin`/`Host` validation, and authenticated streaming read with `fetch` (or a WebSocket authenticated on connect). Monorepo with `core/`, `desktop/`, and a root justfile. Electron is the documented fallback if Tauri sidecar packaging proves too painful. |
+| Desktop shell and local core | Tauri 2 + React/TypeScript shell; Python 3.13 core managed with uv; FastAPI over loopback HTTP with a per-launch bearer token, `Origin`/`Host` validation, and authenticated API requests through `fetch` (or a WebSocket authenticated on connect). Monorepo with `core/`, `desktop/`, and a root justfile. Electron is the documented fallback if Tauri sidecar packaging proves too painful. |
 | Background job runner and source lifecycle | One in-process asyncio runner per core with a bounded worker pool and durable SQLite job/step records; completion is proven by committed `job_steps` rows, never by status flags; one core per data directory via an OS advisory lock taken before database initialization; per-step-class timeout and retry starting defaults with the policy recorded on the job; cooperative cancellation with a guarded commit that rejects late results; atomic readiness publication through a readiness record with a currency recheck; 30-day trash with a resumable startup and wall-clock sweeper. |
+| PDF acquisition, original sharing, and viewer | Receive one authenticated raw PDF at a time with 25,000,000-byte, 120-second-total, and 30-second-idle starting limits. Keep durable acquisition attempts, planned placement IDs/paths, exact reuse holds, and an atomic pre-job finalization guard. Share verified immutable bytes through a `(sha256,size_bytes)` registry without merging source/evidence identities; coordinate every removal through the fingerprint lock and durable removal reservation. Fetch full verified bytes through the bearer-authenticated core and bundle matching PDF.js 6.3.289 assets/worker. Render selected pages under a configurable 20 MP bound. |
 
 ### Open implementation choices
 
@@ -717,7 +795,7 @@ Choose and record each open implementation detail before building the component 
 | Local keyword/FTS and vector search | **Needs Decision** | Both search implementations. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
 | Local embeddings | **Needs Decision** | Supported model and runtime; benchmark them before selection. Local-by-default processing is decided. |
 | Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
-| Local file layout | **Needs Decision** | Source/app file layout, safe copy behavior, and retention implementation. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
+| Local file layout | **Partially Decided** | PDF original/staging paths, safe copy, integrity verification, and shared-original removal are set by M1.4. Layouts for other file types remain open. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
 | Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
 | Fetch/browser | **Needs Decision** | Sandboxing and browser tools. |
 | Format tools | **Needs Decision** | Native PDF extraction library, separate OCR engine, DOCX parser, HTML/boilerplate extractor, and YouTube transcript method/library. |
