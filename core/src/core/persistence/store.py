@@ -29,9 +29,13 @@ from core.persistence.models import (
     ManagedFileRemoval,
     Notebook,
     Passage,
+    PdfAcquisition,
+    PdfImport,
+    PdfImportTrash,
     PersistenceSnapshot,
     RetrievalChunk,
     Source,
+    SourcePdfState,
     SourceReadiness,
     SourceTrash,
     SourceVersion,
@@ -110,6 +114,1572 @@ class PersistenceStore:
                 raise PersistenceError("source does not exist")
             row = _fetchone(connection, "SELECT * FROM sources WHERE id=?", (source_id,))
             return _source(_require_row(row))
+
+    def list_notebooks(self) -> tuple[Notebook, ...]:
+        with self.database.connect() as connection:
+            return tuple(
+                _notebook(row)
+                for row in connection.execute("SELECT * FROM notebooks ORDER BY updated_at DESC,id")
+            )
+
+    def list_notebook_sources(
+        self, notebook_id: str
+    ) -> tuple[tuple[Source, SourcePdfState | None], ...]:
+        validate_id(notebook_id)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT source.*, state.source_id AS state_source_id,
+                          state.current_import_id,state.pending_import_id,
+                          state.revision,state.updated_at AS state_updated_at
+                   FROM sources AS source
+                   LEFT JOIN source_pdf_state AS state ON state.source_id=source.id
+                   WHERE source.notebook_id=?
+                     AND NOT EXISTS (SELECT 1 FROM source_trash WHERE source_id=source.id)
+                   ORDER BY source.updated_at DESC,source.id""",
+                (notebook_id,),
+            ).fetchall()
+            result: list[tuple[Source, SourcePdfState | None]] = []
+            for row in rows:
+                state = None
+                if row["state_source_id"] is not None:
+                    state = SourcePdfState(
+                        row["state_source_id"],
+                        row["current_import_id"],
+                        row["pending_import_id"],
+                        int(row["revision"]),
+                        row["state_updated_at"],
+                    )
+                result.append((_source(row), state))
+            return tuple(result)
+
+    def create_pdf_acquisition(
+        self,
+        retry_key: str,
+        notebook_id: str,
+        intent: str,
+        display_filename: str,
+        owner_instance_id: str,
+        target_source_id: str | None = None,
+    ) -> PdfAcquisition:
+        retry_key = _required_text(retry_key, "retry key")
+        display_filename = _required_text(display_filename, "PDF filename")
+        owner_instance_id = _required_text(owner_instance_id, "owner instance id")
+        validate_id(notebook_id)
+        if intent not in ("add", "replace"):
+            raise ValueError("PDF acquisition intent must be add or replace")
+        if target_source_id is not None:
+            validate_id(target_source_id)
+        if (intent == "replace") != (target_source_id is not None):
+            raise ValueError("replace acquisitions require exactly one target source")
+        acquisition_id = new_id()
+        timestamp = utc_timestamp()
+        staging_path = f"files/staging/{acquisition_id}.part"
+        with self._transaction() as connection:
+            existing = _fetchone(
+                connection, "SELECT * FROM pdf_acquisitions WHERE retry_key=?", (retry_key,)
+            )
+            if existing is not None:
+                expected = (notebook_id, intent, target_source_id, display_filename)
+                actual = tuple(
+                    existing[field]
+                    for field in ("notebook_id", "intent", "target_source_id", "display_filename")
+                )
+                if actual != expected:
+                    raise ConflictingWriteError(
+                        "retry key already identifies a different PDF action"
+                    )
+                return _pdf_acquisition(existing)
+            if target_source_id is not None:
+                target = _fetchone(
+                    connection,
+                    """SELECT source.notebook_id,state.current_import_id
+                       FROM sources AS source
+                       LEFT JOIN source_pdf_state AS state ON state.source_id=source.id
+                       WHERE source.id=? AND NOT EXISTS (
+                           SELECT 1 FROM source_trash WHERE source_id=source.id
+                       )""",
+                    (target_source_id,),
+                )
+                if target is None or target["notebook_id"] != notebook_id:
+                    raise PersistenceError("replacement source does not exist in this notebook")
+                expected_current = target["current_import_id"]
+                if expected_current is None:
+                    raise PersistenceError("source has no saved PDF to replace")
+            else:
+                if (
+                    _fetchone(connection, "SELECT 1 FROM notebooks WHERE id=?", (notebook_id,))
+                    is None
+                ):
+                    raise PersistenceError("notebook does not exist")
+                expected_current = None
+            connection.execute(
+                """INSERT INTO pdf_acquisitions(
+                       id,retry_key,notebook_id,intent,target_source_id,expected_current_import_id,
+                       display_filename,state,finalization_generation,owner_instance_id,
+                       staging_relative_path,last_write_at,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,'awaiting_upload',1,?,?,?,?,?)""",
+                (
+                    acquisition_id,
+                    retry_key,
+                    notebook_id,
+                    intent,
+                    target_source_id,
+                    expected_current,
+                    display_filename,
+                    owner_instance_id,
+                    staging_path,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def load_pdf_acquisition(self, acquisition_id: str) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+            )
+            if row is None:
+                raise PersistenceError("PDF acquisition does not exist")
+            return _pdf_acquisition(row)
+
+    def list_recoverable_pdf_acquisitions(self) -> tuple[PdfAcquisition, ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM pdf_acquisitions
+                   WHERE state IN ('staged','finalizing','waiting_cleanup')
+                   ORDER BY created_at,id"""
+            ).fetchall()
+            return tuple(_pdf_acquisition(row) for row in rows)
+
+    def begin_pdf_upload(self, acquisition_id: str, owner_instance_id: str) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        owner_instance_id = _required_text(owner_instance_id, "owner instance id")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            if row["state"] not in ("awaiting_upload", "failed"):
+                raise ConflictingWriteError("PDF acquisition cannot receive another upload")
+            if row["input_complete_at"] is not None:
+                raise ConflictingWriteError(
+                    "complete staged input must be retried without re-upload"
+                )
+            connection.execute(
+                """UPDATE pdf_acquisitions
+                   SET state='receiving',finalization_generation=finalization_generation+1,
+                       owner_instance_id=?,failure_code=NULL,last_write_at=?,updated_at=?
+                   WHERE id=?""",
+                (owner_instance_id, timestamp, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def record_pdf_upload(
+        self,
+        acquisition_id: str,
+        owner_instance_id: str,
+        generation: int,
+        checksum: str,
+        size_bytes: int,
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        validate_sha256(checksum)
+        _integer(size_bytes, "PDF size")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "receiving")
+            if row["input_sha256"] is not None and (
+                row["input_sha256"] != checksum or row["input_size_bytes"] != size_bytes
+            ):
+                raise ConflictingWriteError("retry key already has different accepted PDF bytes")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='staged',input_sha256=?,input_size_bytes=?,
+                          input_complete_at=?,last_write_at=?,updated_at=? WHERE id=?""",
+                (checksum, size_bytes, timestamp, timestamp, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def note_pdf_upload_progress(
+        self, acquisition_id: str, owner_instance_id: str, generation: int, received_size_bytes: int
+    ) -> None:
+        validate_id(acquisition_id)
+        _integer(received_size_bytes, "received PDF size")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "receiving")
+            if received_size_bytes < int(row["received_size_bytes"]):
+                raise ConflictingWriteError("PDF transfer progress cannot move backwards")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET received_size_bytes=?,last_write_at=?,updated_at=?
+                   WHERE id=?""",
+                (received_size_bytes, timestamp, timestamp, acquisition_id),
+            )
+
+    def clear_pdf_reuse_hold(
+        self, acquisition_id: str, owner_instance_id: str, generation: int
+    ) -> None:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            connection.execute(
+                """UPDATE pdf_acquisitions
+                   SET planned_reuse_managed_file_id=NULL,updated_at=? WHERE id=?""",
+                (timestamp, acquisition_id),
+            )
+
+    def claim_pdf_finalization(
+        self, acquisition_id: str, owner_instance_id: str, *, recovery: bool = False
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        owner_instance_id = _required_text(owner_instance_id, "owner instance id")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            if row["input_complete_at"] is None:
+                raise ConflictingWriteError("PDF acquisition has no complete staged input")
+            if row["state"] not in ("staged", "finalizing", "waiting_cleanup"):
+                raise ConflictingWriteError("PDF acquisition is not finalizable")
+            generation = int(row["finalization_generation"])
+            if recovery or row["owner_instance_id"] != owner_instance_id:
+                generation += 1
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='finalizing',finalization_generation=?,
+                          owner_instance_id=?,failure_code=NULL,updated_at=? WHERE id=?""",
+                (generation, owner_instance_id, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def resume_failed_pdf_acquisition(
+        self, acquisition_id: str, owner_instance_id: str
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        owner_instance_id = _required_text(owner_instance_id, "owner instance id")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            if row["state"] != "failed" or row["input_complete_at"] is None:
+                raise ConflictingWriteError(
+                    "failed PDF acquisition has no retryable complete input"
+                )
+            if row["failure_code"] in ("integrity_failure", "integrity_conflict", "source_deleted"):
+                raise ConflictingWriteError("this PDF failure is terminal and cannot be retried")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='staged',
+                          finalization_generation=finalization_generation+1,
+                          owner_instance_id=?,failure_code=NULL,updated_at=? WHERE id=?""",
+                (owner_instance_id, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def expire_pdf_finalization(
+        self, acquisition_id: str, owner_instance_id: str, generation: int
+    ) -> PdfAcquisition:
+        """Invalidate a timed-out attempt; its already-running thread cannot commit later."""
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            if row["state"] == "completed":
+                return _pdf_acquisition(row)
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='staged',failure_code='finalization_timeout',
+                          finalization_generation=finalization_generation+1,
+                          updated_at=? WHERE id=?""",
+                (timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def set_pdf_reuse_hold(
+        self, acquisition_id: str, owner_instance_id: str, generation: int, managed_file_id: str
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        validate_id(managed_file_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET planned_reuse_managed_file_id=?,
+                          last_write_at=?,updated_at=? WHERE id=?""",
+                (managed_file_id, timestamp, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def set_pdf_placement_plan(
+        self,
+        acquisition_id: str,
+        owner_instance_id: str,
+        generation: int,
+        managed_file_id: str,
+        relative_path: str,
+        checksum: str,
+        size_bytes: int,
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        validate_id(managed_file_id)
+        validate_sha256(checksum)
+        _validate_relative_path(relative_path)
+        _integer(size_bytes, "planned PDF size")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            planned = row["planned_managed_file_id"]
+            if planned is not None and (
+                planned != managed_file_id
+                or row["planned_relative_path"] != relative_path
+                or row["planned_sha256"] != checksum
+                or row["planned_size_bytes"] != size_bytes
+            ):
+                raise ConflictingWriteError(
+                    "PDF acquisition already has a different placement plan"
+                )
+            connection.execute(
+                """UPDATE pdf_acquisitions SET planned_managed_file_id=?,planned_relative_path=?,
+                          planned_sha256=?,planned_size_bytes=?,placement_state='planned',
+                          last_write_at=?,updated_at=? WHERE id=?""",
+                (
+                    managed_file_id,
+                    relative_path,
+                    checksum,
+                    size_bytes,
+                    timestamp,
+                    timestamp,
+                    acquisition_id,
+                ),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def mark_pdf_placement_complete(
+        self, acquisition_id: str, owner_instance_id: str, generation: int
+    ) -> PdfAcquisition:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            if row["planned_managed_file_id"] is None:
+                raise ConflictingWriteError("PDF placement has no durable plan")
+            connection.execute(
+                "UPDATE pdf_acquisitions SET placement_state='placed',updated_at=? WHERE id=?",
+                (timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def find_active_notebook_pdf(
+        self, notebook_id: str, checksum: str, size_bytes: int
+    ) -> tuple[Source, PdfImport, ManagedFile] | None:
+        validate_id(notebook_id)
+        validate_sha256(checksum)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                """SELECT source.id AS source_id,source.notebook_id,source.display_name,
+                          source.created_at AS source_created_at,
+                          source.updated_at AS source_updated_at,
+                          pdf_import.id AS import_id,pdf_import.source_version_id,
+                          pdf_import.acquisition_id,pdf_import.display_filename,
+                          pdf_import.state AS import_state,
+                          pdf_import.failure_code,pdf_import.created_at AS import_created_at,
+                          pdf_import.updated_at AS import_updated_at,
+                          managed_files.id AS managed_file_id,managed_files.relative_path,
+                          managed_files.size_bytes,managed_files.sha256 AS managed_sha256,
+                          managed_files.created_at AS managed_created_at
+                   FROM sources AS source
+                   JOIN source_pdf_state AS state ON state.source_id=source.id
+                   JOIN pdf_imports AS pdf_import
+                     ON pdf_import.id IN (state.current_import_id,state.pending_import_id)
+                    AND pdf_import.source_id=source.id
+                   JOIN source_versions AS version
+                     ON version.id=pdf_import.source_version_id AND version.source_id=source.id
+                   JOIN managed_files ON managed_files.id=version.managed_file_id
+                   WHERE source.notebook_id=? AND version.content_sha256=?
+                     AND managed_files.sha256=?
+                     AND managed_files.size_bytes=?
+                     AND NOT EXISTS (SELECT 1 FROM source_trash WHERE source_id=source.id)
+                     AND NOT EXISTS (SELECT 1 FROM pdf_import_trash WHERE import_id=pdf_import.id)
+                   ORDER BY source.created_at,source.id LIMIT 1""",
+                (notebook_id, checksum, checksum, size_bytes),
+            )
+            if row is None:
+                return None
+            return (
+                Source(
+                    row["source_id"],
+                    row["notebook_id"],
+                    row["display_name"],
+                    row["source_created_at"],
+                    row["source_updated_at"],
+                ),
+                _pdf_import_from_join(row),
+                _managed_file_from_join(row),
+            )
+
+    def find_registry_managed_file(self, checksum: str, size_bytes: int) -> ManagedFile | None:
+        validate_sha256(checksum)
+        _integer(size_bytes, "PDF size")
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                """SELECT managed_files.* FROM original_registry
+                   JOIN managed_files ON managed_files.id=original_registry.managed_file_id
+                   WHERE original_registry.sha256=? AND original_registry.size_bytes=?""",
+                (checksum, size_bytes),
+            )
+            return None if row is None else _managed_file(row)
+
+    def canonical_pdf_has_eligible_owner(self, checksum: str, size_bytes: int, now: str) -> bool:
+        validate_sha256(checksum)
+        validate_utc_timestamp(now)
+        with self.database.connect() as connection:
+            return (
+                _fetchone(
+                    connection,
+                    """SELECT 1 FROM original_registry AS registry
+                       WHERE registry.sha256=? AND registry.size_bytes=?
+                         AND EXISTS (
+                             SELECT 1 FROM source_versions AS version
+                             JOIN sources AS source ON source.id=version.source_id
+                             LEFT JOIN source_trash AS source_trash
+                               ON source_trash.source_id=source.id
+                             WHERE version.managed_file_id=registry.managed_file_id
+                               AND (source_trash.source_id IS NULL
+                                    OR source_trash.purge_deadline_at>?)
+                               AND (source_trash.source_id IS NOT NULL OR NOT EXISTS (
+                                   SELECT 1 FROM pdf_imports AS item
+                                   JOIN pdf_import_trash AS item_trash
+                                     ON item_trash.import_id=item.id
+                                   WHERE item.source_version_id=version.id
+                                     AND item_trash.purge_deadline_at<=?
+                               ))
+                         ) LIMIT 1""",
+                    (checksum, size_bytes, now, now),
+                )
+                is not None
+            )
+
+    def managed_file_is_removing(self, managed_file_id: str) -> bool:
+        validate_id(managed_file_id)
+        with self.database.connect() as connection:
+            return (
+                _fetchone(
+                    connection,
+                    "SELECT 1 FROM managed_file_removals WHERE managed_file_id=?",
+                    (managed_file_id,),
+                )
+                is not None
+            )
+
+    def has_removal_marked_pdf_fingerprint(self, checksum: str, size_bytes: int) -> bool:
+        validate_sha256(checksum)
+        _integer(size_bytes, "PDF size")
+        with self.database.connect() as connection:
+            return (
+                _fetchone(
+                    connection,
+                    """SELECT 1 FROM managed_files AS file
+                       JOIN managed_file_removals AS removal ON removal.managed_file_id=file.id
+                       WHERE file.sha256=? AND file.size_bytes=? LIMIT 1""",
+                    (checksum, size_bytes),
+                )
+                is not None
+            )
+
+    def has_live_pdf_reuse_hold(self, managed_file_id: str) -> bool:
+        validate_id(managed_file_id)
+        with self.database.connect() as connection:
+            return (
+                _fetchone(
+                    connection,
+                    """SELECT 1 FROM pdf_acquisitions
+                   WHERE planned_reuse_managed_file_id=?
+                     AND state IN ('staged','finalizing','waiting_cleanup') LIMIT 1""",
+                    (managed_file_id,),
+                )
+                is not None
+            )
+
+    def list_legacy_pdf_candidates(
+        self, checksum: str, size_bytes: int, now: str
+    ) -> tuple[ManagedFile, ...]:
+        validate_sha256(checksum)
+        validate_utc_timestamp(now)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT DISTINCT managed_files.* FROM managed_files
+                   JOIN source_versions ON source_versions.managed_file_id=managed_files.id
+                   JOIN sources ON sources.id=source_versions.source_id
+                   LEFT JOIN source_trash ON source_trash.source_id=sources.id
+                   WHERE managed_files.sha256=? AND managed_files.size_bytes=?
+                     AND NOT EXISTS (SELECT 1 FROM managed_file_removals
+                                     WHERE managed_file_id=managed_files.id)
+                      AND (source_trash.source_id IS NULL OR source_trash.purge_deadline_at>?)
+                      AND (source_trash.source_id IS NULL OR source_trash.files_removed_at IS NULL)
+                      AND (source_trash.source_id IS NOT NULL OR NOT EXISTS (
+                          SELECT 1 FROM pdf_imports AS item
+                          JOIN pdf_import_trash AS item_trash ON item_trash.import_id=item.id
+                          WHERE item.source_version_id=source_versions.id
+                            AND item_trash.purge_deadline_at<=?
+                      ))
+                   ORDER BY managed_files.created_at,managed_files.id""",
+                (checksum, size_bytes, now, now),
+            ).fetchall()
+            return tuple(_managed_file(row) for row in rows)
+
+    def load_pdf_import(self, import_id: str) -> PdfImport:
+        validate_id(import_id)
+        with self.database.connect() as connection:
+            row = _fetchone(connection, "SELECT * FROM pdf_imports WHERE id=?", (import_id,))
+            if row is None:
+                raise PersistenceError("PDF import does not exist")
+            return _pdf_import(row)
+
+    def trash_pdf_import(self, import_id: str, purge_deadline_at: str) -> PdfImportTrash:
+        validate_id(import_id)
+        validate_utc_timestamp(purge_deadline_at)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            existing = _fetchone(
+                connection, "SELECT * FROM pdf_import_trash WHERE import_id=?", (import_id,)
+            )
+            if existing is not None:
+                return _pdf_import_trash(existing)
+            item = _require_row(
+                _fetchone(connection, "SELECT * FROM pdf_imports WHERE id=?", (import_id,))
+            )
+            state = _fetchone(
+                connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (item["source_id"],)
+            )
+            if state is not None and import_id in (
+                state["current_import_id"],
+                state["pending_import_id"],
+            ):
+                raise ConflictingWriteError(
+                    "current or pending PDF import cannot enter history trash"
+                )
+            active_job = _fetchone(
+                connection,
+                """SELECT 1 FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                   LIMIT 1""",
+                (item["source_version_id"],),
+            )
+            if active_job is not None:
+                raise ConflictingWriteError(
+                    "PDF import is still required by an active processing job"
+                )
+            connection.execute(
+                """INSERT INTO pdf_import_trash(
+                       import_id,source_id,trashed_at,purge_deadline_at,file_removed_at,updated_at
+                   ) VALUES(?,?,?,?,NULL,?)
+                   ON CONFLICT(import_id) DO UPDATE SET
+                       purge_deadline_at=excluded.purge_deadline_at,updated_at=excluded.updated_at""",
+                (import_id, item["source_id"], timestamp, purge_deadline_at, timestamp),
+            )
+            return _pdf_import_trash(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_import_trash WHERE import_id=?", (import_id,)
+                    )
+                )
+            )
+
+    def list_expired_pdf_import_trash(self, now: str) -> tuple[PdfImportTrash, ...]:
+        validate_utc_timestamp(now)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM pdf_import_trash WHERE purge_deadline_at<=?
+                   ORDER BY purge_deadline_at,import_id""",
+                (now,),
+            ).fetchall()
+            return tuple(_pdf_import_trash(row) for row in rows)
+
+    def mark_pdf_import_file_cleanup_complete(self, import_id: str) -> None:
+        validate_id(import_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE pdf_import_trash SET file_removed_at=?,updated_at=?
+                   WHERE import_id=?""",
+                (timestamp, timestamp, import_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("PDF import is not in trash")
+
+    def mark_pdf_import_snapshots_removed(self, import_id: str) -> None:
+        validate_id(import_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE pdf_import_trash SET snapshots_removed_at=?,updated_at=?
+                   WHERE import_id=?""",
+                (timestamp, timestamp, import_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("PDF import is not in trash")
+
+    def reserve_pdf_import_file_removal(
+        self, managed_file_id: str, relative_path: str, import_id: str
+    ) -> ManagedFileRemoval | None:
+        validate_id(managed_file_id)
+        validate_id(import_id)
+        relative_path = _required_text(relative_path, "relative path")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            target = _fetchone(
+                connection,
+                """SELECT source_id,source_version_id FROM pdf_imports WHERE id=?""",
+                (import_id,),
+            )
+            if target is None:
+                raise PersistenceError("PDF import does not exist")
+            expired = _fetchone(
+                connection,
+                """SELECT 1 FROM pdf_import_trash
+                   WHERE import_id=? AND purge_deadline_at<=?""",
+                (import_id, timestamp),
+            )
+            if expired is None:
+                raise ConflictingWriteError("PDF import is not eligible for physical removal")
+            state = _fetchone(
+                connection,
+                "SELECT * FROM source_pdf_state WHERE source_id=?",
+                (target["source_id"],),
+            )
+            if state is not None and import_id in (
+                state["current_import_id"],
+                state["pending_import_id"],
+            ):
+                raise ConflictingWriteError("current or pending PDF import cannot be removed")
+            active = _fetchone(
+                connection,
+                """SELECT 1 FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                   LIMIT 1""",
+                (target["source_version_id"],),
+            )
+            if active is not None:
+                raise ConflictingWriteError("PDF import is required by active processing")
+            file_row = _fetchone(
+                connection,
+                """SELECT 1 FROM source_versions
+                   WHERE managed_file_id=? AND NOT (
+                       id=? AND source_id=?
+                   ) LIMIT 1""",
+                (managed_file_id, target["source_version_id"], target["source_id"]),
+            )
+            if file_row is not None:
+                return None
+            hold = _fetchone(
+                connection,
+                """SELECT 1 FROM pdf_acquisitions
+                   WHERE planned_reuse_managed_file_id=?
+                     AND state IN ('staged','finalizing','waiting_cleanup') LIMIT 1""",
+                (managed_file_id,),
+            )
+            if hold is not None:
+                return None
+            connection.execute(
+                """INSERT INTO managed_file_removals(
+                       managed_file_id,relative_path,requested_at,removed_at,attempts,last_error
+                   ) VALUES(?,?,?,NULL,0,NULL) ON CONFLICT(managed_file_id) DO NOTHING""",
+                (managed_file_id, relative_path, timestamp),
+            )
+            return _managed_file_removal(
+                _require_row(
+                    _fetchone(
+                        connection,
+                        "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
+                        (managed_file_id,),
+                    )
+                )
+            )
+
+    def remove_trashed_pdf_import_records(self, import_id: str) -> None:
+        validate_id(import_id)
+        with self._transaction() as connection:
+            trash = _fetchone(
+                connection, "SELECT * FROM pdf_import_trash WHERE import_id=?", (import_id,)
+            )
+            if trash is None:
+                raise PersistenceError("PDF import is not in trash")
+            if trash["purge_deadline_at"] > utc_timestamp():
+                raise ConflictingWriteError("PDF import trash retention has not expired")
+            if trash["file_removed_at"] is None or trash["snapshots_removed_at"] is None:
+                raise PersistenceError("PDF import purge phases are incomplete")
+            item = _require_row(
+                _fetchone(connection, "SELECT * FROM pdf_imports WHERE id=?", (import_id,))
+            )
+            state = _fetchone(
+                connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (item["source_id"],)
+            )
+            if state is not None and import_id in (
+                state["current_import_id"],
+                state["pending_import_id"],
+            ):
+                raise ConflictingWriteError("current or pending PDF import cannot be purged")
+            active_job = _fetchone(
+                connection,
+                """SELECT 1 FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                   LIMIT 1""",
+                (item["source_version_id"],),
+            )
+            if active_job is not None:
+                raise ConflictingWriteError(
+                    "PDF import became required by an active processing job"
+                )
+            version = _fetchone(
+                connection,
+                "SELECT managed_file_id FROM source_versions WHERE id=?",
+                (item["source_version_id"],),
+            )
+            managed_file_id = None if version is None else version["managed_file_id"]
+            removal = None
+            if managed_file_id is not None:
+                removal = _fetchone(
+                    connection,
+                    "SELECT removed_at FROM managed_file_removals WHERE managed_file_id=?",
+                    (managed_file_id,),
+                )
+                if removal is not None and removal["removed_at"] is None:
+                    raise PersistenceError("PDF original removal is still pending")
+            jobs = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM jobs WHERE source_version_id=?",
+                    (item["source_version_id"],),
+                ).fetchall()
+            ]
+            for job_id in jobs:
+                connection.execute("DELETE FROM job_steps WHERE job_id=?", (job_id,))
+                connection.execute("DELETE FROM job_step_attempts WHERE job_id=?", (job_id,))
+                connection.execute("DELETE FROM job_status WHERE job_id=?", (job_id,))
+                connection.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            connection.execute(
+                "DELETE FROM chunk_passages WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM retrieval_chunks WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM index_versions WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM passages WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM extraction_versions WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute("DELETE FROM pdf_import_trash WHERE import_id=?", (import_id,))
+            connection.execute("DELETE FROM pdf_imports WHERE id=?", (import_id,))
+            connection.execute(
+                "DELETE FROM source_versions WHERE id=?", (item["source_version_id"],)
+            )
+            if (
+                managed_file_id is not None
+                and removal is not None
+                and removal["removed_at"] is not None
+            ):
+                connection.execute(
+                    "DELETE FROM managed_file_removals WHERE managed_file_id=?",
+                    (managed_file_id,),
+                )
+                connection.execute(
+                    """DELETE FROM managed_files WHERE id=?
+                       AND NOT EXISTS (SELECT 1 FROM source_versions WHERE managed_file_id=?)""",
+                    (managed_file_id, managed_file_id),
+                )
+
+    def find_notebook_historical_pdf(
+        self, notebook_id: str, checksum: str, size_bytes: int, now: str
+    ) -> tuple[Source, PdfImport, bool] | None:
+        validate_id(notebook_id)
+        validate_sha256(checksum)
+        validate_utc_timestamp(now)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                """SELECT source.id AS source_id,source.notebook_id,source.display_name,
+                          source.created_at AS source_created_at,
+                          source.updated_at AS source_updated_at,
+                          item.id AS import_id,item.source_version_id,item.acquisition_id,
+                          item.display_filename,item.state AS import_state,item.failure_code,
+                          item.created_at AS import_created_at,item.updated_at AS import_updated_at,
+                          CASE WHEN trash.import_id IS NULL THEN 0 ELSE 1 END AS import_trashed
+                   FROM sources AS source
+                   JOIN pdf_imports AS item ON item.source_id=source.id
+                   JOIN source_versions AS version
+                     ON version.id=item.source_version_id AND version.source_id=item.source_id
+                   JOIN managed_files AS file ON file.id=version.managed_file_id
+                   LEFT JOIN pdf_import_trash AS trash ON trash.import_id=item.id
+                   LEFT JOIN source_pdf_state AS active ON active.source_id=source.id
+                   WHERE source.notebook_id=? AND file.sha256=? AND file.size_bytes=?
+                      AND item.id IS NOT active.current_import_id
+                      AND item.id IS NOT active.pending_import_id
+                    ORDER BY item.created_at DESC,item.id LIMIT 1""",
+                (notebook_id, checksum, size_bytes),
+            )
+            if row is None:
+                return None
+            return (
+                Source(
+                    row["source_id"],
+                    row["notebook_id"],
+                    row["display_name"],
+                    row["source_created_at"],
+                    row["source_updated_at"],
+                ),
+                PdfImport(
+                    row["import_id"],
+                    row["source_id"],
+                    row["source_version_id"],
+                    row["acquisition_id"],
+                    row["display_filename"],
+                    row["import_state"],
+                    row["failure_code"],
+                    row["import_created_at"],
+                    row["import_updated_at"],
+                ),
+                bool(row["import_trashed"]),
+            )
+
+    def load_import_managed_file(self, import_id: str) -> ManagedFile:
+        validate_id(import_id)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                """SELECT file.* FROM pdf_imports AS item
+                   JOIN source_versions AS version ON version.id=item.source_version_id
+                   JOIN managed_files AS file ON file.id=version.managed_file_id
+                   WHERE item.id=?""",
+                (import_id,),
+            )
+            if row is None:
+                raise PersistenceError("PDF import has no managed original")
+            return _managed_file(row)
+
+    def list_pdf_imports(self, source_id: str) -> tuple[tuple[PdfImport, bool], ...]:
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT pdf_import.*,
+                          CASE WHEN trash.import_id IS NULL THEN 0 ELSE 1 END AS trashed
+                   FROM pdf_imports AS pdf_import
+                   LEFT JOIN pdf_import_trash AS trash ON trash.import_id=pdf_import.id
+                   WHERE pdf_import.source_id=?
+                   ORDER BY pdf_import.created_at DESC,pdf_import.id""",
+                (source_id,),
+            ).fetchall()
+            return tuple((_pdf_import(row), bool(row["trashed"])) for row in rows)
+
+    def retry_pdf_import_processing(self, import_id: str) -> str:
+        validate_id(import_id)
+        timestamp = utc_timestamp()
+        job_id = new_id()
+        retry_key = f"pdf-extract-retry:{import_id}:{new_id()}"
+        with self._transaction() as connection:
+            item = _require_row(
+                _fetchone(connection, "SELECT * FROM pdf_imports WHERE id=?", (import_id,))
+            )
+            if (
+                _fetchone(
+                    connection, "SELECT 1 FROM pdf_import_trash WHERE import_id=?", (import_id,)
+                )
+                is not None
+            ):
+                raise ConflictingWriteError("PDF import in trash cannot be processed")
+            active = _fetchone(
+                connection,
+                """SELECT 1 FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                   LIMIT 1""",
+                (item["source_version_id"],),
+            )
+            if active is not None:
+                raise ConflictingWriteError("PDF import already has processing work queued")
+            state = _fetchone(
+                connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (item["source_id"],)
+            )
+            if state is None:
+                raise PersistenceError("PDF source state is unavailable")
+            if state["current_import_id"] != import_id:
+                connection.execute(
+                    """UPDATE source_pdf_state SET pending_import_id=?,revision=revision+1,
+                              updated_at=? WHERE source_id=?""",
+                    (import_id, timestamp, item["source_id"]),
+                )
+            connection.execute(
+                "UPDATE pdf_imports SET state='pending',failure_code=NULL,updated_at=? WHERE id=?",
+                (timestamp, import_id),
+            )
+            connection.execute(
+                """INSERT INTO jobs(
+                       id,logical_work_key,kind,source_id,source_version_id,
+                       extraction_version_id,index_version_id,created_at,updated_at
+                   ) VALUES(?,?,'pdf-extract',?,?,NULL,NULL,?,?)""",
+                (
+                    job_id,
+                    retry_key,
+                    item["source_id"],
+                    item["source_version_id"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO job_status(job_id,status,updated_at) VALUES(?,'queued',?)",
+                (job_id, timestamp),
+            )
+            return job_id
+
+    def cancel_pdf_import_processing(self, import_id: str) -> str:
+        validate_id(import_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            item = _require_row(
+                _fetchone(connection, "SELECT * FROM pdf_imports WHERE id=?", (import_id,))
+            )
+            if (
+                _fetchone(
+                    connection, "SELECT 1 FROM pdf_import_trash WHERE import_id=?", (import_id,)
+                )
+                is not None
+            ):
+                raise ConflictingWriteError("PDF import is in trash")
+            job = _fetchone(
+                connection,
+                """SELECT jobs.id FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                   ORDER BY jobs.created_at DESC,jobs.id DESC LIMIT 1""",
+                (item["source_version_id"],),
+            )
+            if job is None:
+                raise ConflictingWriteError("PDF import has no active processing job")
+            connection.execute(
+                """UPDATE job_status SET status='cancelled',
+                          failure_reason='user cancelled PDF processing',updated_at=?
+                   WHERE job_id=? AND status IN ('queued','running')""",
+                (timestamp, job["id"]),
+            )
+            connection.execute(
+                """DELETE FROM source_readiness_indexes WHERE source_id IN (
+                       SELECT source_id FROM source_readiness WHERE published_by_job_id=?
+                   )""",
+                (job["id"],),
+            )
+            connection.execute(
+                "DELETE FROM source_readiness WHERE published_by_job_id=?", (job["id"],)
+            )
+            _mark_pdf_import_failed(
+                connection, item["source_version_id"], "processing_cancelled", timestamp
+            )
+            return str(job["id"])
+
+    def load_source_pdf_state(self, source_id: str) -> SourcePdfState | None:
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (source_id,)
+            )
+            return None if row is None else _source_pdf_state(row)
+
+    def finish_pdf_acquisition(
+        self,
+        acquisition_id: str,
+        owner_instance_id: str,
+        generation: int,
+        outcome_kind: str,
+        *,
+        managed_file: ManagedFile | None = None,
+        existing_source_id: str | None = None,
+        existing_import_id: str | None = None,
+        new_source_id: str | None = None,
+        source_version_id: str | None = None,
+        import_id: str | None = None,
+        pending_replacement: bool = False,
+    ) -> PdfAcquisition:
+        """Commit a PDF import outcome, references, and queued job atomically."""
+        validate_id(acquisition_id)
+        if outcome_kind not in ("created", "duplicate", "replaced", "unchanged"):
+            raise ValueError("unknown PDF acquisition outcome")
+        for identifier in (
+            existing_source_id,
+            existing_import_id,
+            new_source_id,
+            source_version_id,
+            import_id,
+        ):
+            if identifier is not None:
+                validate_id(identifier)
+        if managed_file is not None:
+            _validate_managed_file(managed_file)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            acquisition = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(
+                acquisition, owner_instance_id, generation, "finalizing"
+            )
+            if acquisition["input_complete_at"] is None:
+                raise ConflictingWriteError("PDF acquisition input is incomplete")
+            if outcome_kind in ("duplicate", "unchanged"):
+                if existing_source_id is None or existing_import_id is None:
+                    raise ValueError(
+                        "duplicate/no-op outcomes require an existing source and import"
+                    )
+                source_id = existing_source_id
+                result_import_id = existing_import_id
+                existing = _fetchone(
+                    connection,
+                    """SELECT source.notebook_id,item.source_id,version.managed_file_id,
+                              file.sha256,file.size_bytes,state.current_import_id,
+                              state.pending_import_id
+                       FROM sources AS source
+                       JOIN pdf_imports AS item
+                         ON item.id=? AND item.source_id=source.id
+                       JOIN source_versions AS version
+                         ON version.id=item.source_version_id AND version.source_id=item.source_id
+                       JOIN managed_files AS file ON file.id=version.managed_file_id
+                       JOIN source_pdf_state AS state ON state.source_id=source.id
+                       WHERE source.id=?
+                         AND NOT EXISTS (SELECT 1 FROM source_trash WHERE source_id=source.id)
+                         AND NOT EXISTS (SELECT 1 FROM pdf_import_trash WHERE import_id=item.id)
+                         AND NOT EXISTS (SELECT 1 FROM managed_file_removals
+                                         WHERE managed_file_id=file.id)""",
+                    (existing_import_id, existing_source_id),
+                )
+                if (
+                    existing is None
+                    or existing["notebook_id"] != acquisition["notebook_id"]
+                    or existing_import_id
+                    not in (existing["current_import_id"], existing["pending_import_id"])
+                    or existing["sha256"] != acquisition["input_sha256"]
+                    or existing["size_bytes"] != acquisition["input_size_bytes"]
+                ):
+                    raise ConflictingWriteError("duplicate PDF source changed before finalization")
+                if (
+                    outcome_kind == "unchanged"
+                    and existing["current_import_id"] != existing_import_id
+                ):
+                    raise ConflictingWriteError("unchanged PDF is no longer the current import")
+            else:
+                if source_version_id is None or import_id is None:
+                    raise ValueError(
+                        "new PDF outcomes require source-version and import identities"
+                    )
+                source_id = acquisition["target_source_id"] or new_source_id
+                if source_id is None:
+                    raise ValueError("Add outcome requires a new source identity")
+                validate_id(source_id)
+                if acquisition["target_source_id"] is None:
+                    if (
+                        _fetchone(
+                            connection,
+                            "SELECT 1 FROM notebooks WHERE id=?",
+                            (acquisition["notebook_id"],),
+                        )
+                        is None
+                    ):
+                        raise ConflictingWriteError("PDF acquisition notebook was removed")
+                    connection.execute(
+                        """INSERT INTO sources(id,notebook_id,display_name,created_at,updated_at)
+                           VALUES(?,?,?,?,?)""",
+                        (
+                            source_id,
+                            acquisition["notebook_id"],
+                            acquisition["display_filename"],
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                else:
+                    target_state = _fetchone(
+                        connection,
+                        """SELECT state.*,source.notebook_id FROM source_pdf_state AS state
+                           JOIN sources AS source ON source.id=state.source_id
+                           WHERE state.source_id=?
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM source_trash WHERE source_id=source.id
+                             )""",
+                        (source_id,),
+                    )
+                    current_import = (
+                        None if target_state is None else target_state["current_import_id"]
+                    )
+                    if (
+                        target_state is None
+                        or target_state["notebook_id"] != acquisition["notebook_id"]
+                    ):
+                        raise ConflictingWriteError("replacement source was deleted or moved")
+                    if current_import != acquisition["expected_current_import_id"]:
+                        raise ConflictingWriteError(
+                            "replacement target changed during PDF acquisition"
+                        )
+                    superseded_import_id = target_state["pending_import_id"]
+                    if superseded_import_id is not None:
+                        superseded = _fetchone(
+                            connection,
+                            "SELECT source_version_id FROM pdf_imports WHERE id=?",
+                            (superseded_import_id,),
+                        )
+                        if superseded is not None:
+                            connection.execute(
+                                """UPDATE job_status SET status='cancelled',
+                                          failure_reason='superseded by newer PDF replacement',
+                                          updated_at=?
+                                   WHERE status IN ('queued','running') AND job_id IN (
+                                       SELECT id FROM jobs WHERE source_version_id=?
+                                   )""",
+                                (timestamp, superseded["source_version_id"]),
+                            )
+                            connection.execute(
+                                """UPDATE pdf_imports SET state='failed',
+                                          failure_code='replacement_superseded',updated_at=?
+                                   WHERE id=? AND state='pending'""",
+                                (timestamp, superseded_import_id),
+                            )
+                    stale_acquisitions = connection.execute(
+                        """SELECT * FROM pdf_acquisitions WHERE target_source_id=? AND id<>?
+                           AND state IN ('awaiting_upload','receiving','staged','finalizing',
+                                         'waiting_cleanup')""",
+                        (source_id, acquisition_id),
+                    ).fetchall()
+                    for stale in stale_acquisitions:
+                        connection.execute(
+                            """INSERT INTO acquisition_file_cleanup(
+                                   id,acquisition_id,relative_path,file_kind,expected_sha256,
+                                   expected_size_bytes,created_at
+                               ) VALUES(?,?,?,'staging',?,?,?)
+                               ON CONFLICT(acquisition_id,relative_path) DO NOTHING""",
+                            (
+                                new_id(),
+                                stale["id"],
+                                stale["staging_relative_path"],
+                                stale["input_sha256"],
+                                stale["input_size_bytes"],
+                                timestamp,
+                            ),
+                        )
+                        if stale["planned_relative_path"] is not None:
+                            connection.execute(
+                                """INSERT INTO acquisition_file_cleanup(
+                                       id,acquisition_id,relative_path,file_kind,expected_sha256,
+                                       expected_size_bytes,created_at
+                                   ) VALUES(?,?,?,'planned_original',?,?,?)
+                                   ON CONFLICT(acquisition_id,relative_path) DO NOTHING""",
+                                (
+                                    new_id(),
+                                    stale["id"],
+                                    stale["planned_relative_path"],
+                                    stale["planned_sha256"],
+                                    stale["planned_size_bytes"],
+                                    timestamp,
+                                ),
+                            )
+                        connection.execute(
+                            """UPDATE pdf_acquisitions SET state='cancelled',
+                                      failure_code='replacement_superseded',
+                                      finalization_generation=finalization_generation+1,
+                                      planned_reuse_managed_file_id=NULL,updated_at=? WHERE id=?""",
+                            (timestamp, stale["id"]),
+                        )
+                file_id = (
+                    managed_file.id
+                    if managed_file is not None
+                    else (
+                        acquisition["planned_reuse_managed_file_id"]
+                        or acquisition["planned_managed_file_id"]
+                    )
+                )
+                if file_id is None:
+                    raise ConflictingWriteError("PDF acquisition has no verified managed file")
+                if acquisition["input_sha256"] != acquisition["planned_sha256"] and (
+                    acquisition["planned_managed_file_id"] is not None
+                ):
+                    raise ConflictingWriteError("planned PDF fingerprint changed")
+                if managed_file is not None:
+                    if managed_file.id != file_id:
+                        raise ConflictingWriteError(
+                            "managed file does not match the acquisition plan"
+                        )
+                    _save_managed_file(connection, managed_file)
+                elif acquisition["planned_reuse_managed_file_id"] != file_id:
+                    raise ConflictingWriteError("existing managed file has no recorded reuse hold")
+                checksum = acquisition["input_sha256"]
+                size_bytes = acquisition["input_size_bytes"]
+                assert checksum is not None and size_bytes is not None
+                file_row = _fetchone(
+                    connection, "SELECT * FROM managed_files WHERE id=?", (file_id,)
+                )
+                if (
+                    file_row is None
+                    or file_row["sha256"] != checksum
+                    or file_row["size_bytes"] != size_bytes
+                ):
+                    raise ConflictingWriteError("verified managed file identity changed")
+                registry = _fetchone(
+                    connection,
+                    "SELECT managed_file_id FROM original_registry WHERE sha256=? AND size_bytes=?",
+                    (checksum, size_bytes),
+                )
+                if registry is not None and registry["managed_file_id"] != file_id:
+                    raise ConflictingWriteError("another managed original is already canonical")
+                if registry is None:
+                    connection.execute(
+                        """INSERT INTO original_registry(
+                               sha256,size_bytes,managed_file_id,created_at
+                           )
+                           VALUES(?,?,?,?)""",
+                        (checksum, size_bytes, file_id, timestamp),
+                    )
+                source_version = SourceVersion(
+                    source_version_id, source_id, file_id, checksum, timestamp
+                )
+                _validate_source_version(source_version)
+                _save_source_version(connection, source_version)
+                connection.execute(
+                    """INSERT INTO pdf_imports(
+                           id,source_id,source_version_id,acquisition_id,display_filename,state,
+                           created_at,updated_at
+                       ) VALUES(?,?,?,?,?,'pending',?,?)""",
+                    (
+                        import_id,
+                        source_id,
+                        source_version_id,
+                        acquisition_id,
+                        acquisition["display_filename"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                current_state = _fetchone(
+                    connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (source_id,)
+                )
+                if acquisition["target_source_id"] is None:
+                    connection.execute(
+                        """INSERT INTO source_pdf_state(
+                               source_id,current_import_id,pending_import_id,revision,updated_at
+                           ) VALUES(?,?,NULL,1,?)""",
+                        (source_id, import_id, timestamp),
+                    )
+                elif pending_replacement:
+                    if current_state is None:
+                        connection.execute(
+                            """INSERT INTO source_pdf_state(
+                                   source_id,current_import_id,pending_import_id,revision,updated_at
+                               ) VALUES(?,NULL,?,1,?)""",
+                            (source_id, import_id, timestamp),
+                        )
+                    else:
+                        connection.execute(
+                            """UPDATE source_pdf_state SET pending_import_id=?,revision=revision+1,
+                                      updated_at=? WHERE source_id=?""",
+                            (import_id, timestamp, source_id),
+                        )
+                else:
+                    raise ConflictingWriteError("replacement must remain pending until publication")
+                self._insert_queued_pdf_job(connection, source_id, source_version_id, timestamp)
+                result_import_id = import_id
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='completed',outcome_kind=?,outcome_source_id=?,
+                          outcome_import_id=?,planned_reuse_managed_file_id=NULL,failure_code=NULL,
+                          updated_at=? WHERE id=?""",
+                (outcome_kind, source_id, result_import_id, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    @staticmethod
+    def _insert_queued_pdf_job(
+        connection: sqlite3.Connection, source_id: str, source_version_id: str, timestamp: str
+    ) -> None:
+        logical_key = f"pdf-extract:{source_version_id}"
+        proposed_id = new_id()
+        connection.execute(
+            """INSERT INTO jobs(
+                   id,logical_work_key,kind,source_id,source_version_id,
+                   extraction_version_id,index_version_id,created_at,updated_at
+               ) VALUES(?,?,'pdf-extract',?,?,NULL,NULL,?,?)
+               ON CONFLICT(logical_work_key) DO NOTHING""",
+            (proposed_id, logical_key, source_id, source_version_id, timestamp, timestamp),
+        )
+        job = _fetchone(connection, "SELECT * FROM jobs WHERE logical_work_key=?", (logical_key,))
+        if (
+            job is None
+            or job["source_id"] != source_id
+            or job["source_version_id"] != source_version_id
+        ):
+            raise ConflictingWriteError("PDF processing key already identifies different work")
+        connection.execute(
+            """INSERT INTO job_status(job_id,status,updated_at) VALUES(?,'queued',?)
+               ON CONFLICT(job_id) DO NOTHING""",
+            (job["id"], timestamp),
+        )
+
+    def mark_pdf_acquisition_waiting_cleanup(
+        self, acquisition_id: str, owner_instance_id: str, generation: int
+    ) -> PdfAcquisition:
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            _verify_pdf_acquisition_attempt(row, owner_instance_id, generation, "finalizing")
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state='waiting_cleanup',
+                          planned_reuse_managed_file_id=NULL,failure_code='file_cleanup_pending',
+                          updated_at=? WHERE id=?""",
+                (timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def fail_pdf_acquisition(
+        self,
+        acquisition_id: str,
+        owner_instance_id: str,
+        generation: int,
+        failure_code: str,
+        *,
+        cancelled: bool = False,
+    ) -> PdfAcquisition:
+        validate_id(acquisition_id)
+        failure_code = _required_text(failure_code, "failure code")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _require_row(
+                _fetchone(
+                    connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                )
+            )
+            if (
+                row["owner_instance_id"] != owner_instance_id
+                or int(row["finalization_generation"]) != generation
+            ):
+                raise ConflictingWriteError("PDF acquisition attempt was superseded")
+            if row["state"] in ("completed", "cancelled"):
+                raise ConflictingWriteError("PDF acquisition is already terminal")
+            state = "cancelled" if cancelled else "failed"
+            connection.execute(
+                """UPDATE pdf_acquisitions SET state=?,failure_code=?,
+                          finalization_generation=finalization_generation+1,
+                          planned_reuse_managed_file_id=NULL,updated_at=? WHERE id=?""",
+                (state, failure_code, timestamp, acquisition_id),
+            )
+            return _pdf_acquisition(
+                _require_row(
+                    _fetchone(
+                        connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
+                    )
+                )
+            )
+
+    def record_acquisition_file_cleanup(
+        self,
+        acquisition_id: str,
+        relative_path: str,
+        file_kind: str,
+        checksum: str | None = None,
+        size_bytes: int | None = None,
+    ) -> str:
+        validate_id(acquisition_id)
+        _validate_relative_path(relative_path)
+        if file_kind not in ("staging", "planned_original"):
+            raise ValueError("unknown acquisition cleanup file kind")
+        if checksum is not None:
+            validate_sha256(checksum)
+        if size_bytes is not None:
+            _integer(size_bytes, "cleanup file size")
+        cleanup_id = new_id()
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            existing = _fetchone(
+                connection,
+                """SELECT id FROM acquisition_file_cleanup
+                   WHERE acquisition_id=? AND relative_path=?""",
+                (acquisition_id, relative_path),
+            )
+            if existing is not None:
+                return str(existing["id"])
+            connection.execute(
+                """INSERT INTO acquisition_file_cleanup(
+                       id,acquisition_id,relative_path,file_kind,expected_sha256,
+                       expected_size_bytes,created_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    cleanup_id,
+                    acquisition_id,
+                    relative_path,
+                    file_kind,
+                    checksum,
+                    size_bytes,
+                    timestamp,
+                ),
+            )
+            return cleanup_id
+
+    def list_pending_acquisition_file_cleanup(
+        self,
+    ) -> tuple[tuple[str, str, str, str, str | None, int | None], ...]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,acquisition_id,relative_path,file_kind,
+                          expected_sha256,expected_size_bytes
+                   FROM acquisition_file_cleanup
+                   WHERE removed_at IS NULL ORDER BY created_at,id"""
+            ).fetchall()
+            return tuple(
+                (
+                    row["id"],
+                    row["acquisition_id"],
+                    row["relative_path"],
+                    row["file_kind"],
+                    row["expected_sha256"],
+                    row["expected_size_bytes"],
+                )
+                for row in rows
+            )
+
+    def mark_acquisition_file_removed(self, cleanup_id: str) -> None:
+        validate_id(cleanup_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE acquisition_file_cleanup SET removed_at=?,last_error=NULL WHERE id=?",
+                (timestamp, cleanup_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("acquisition cleanup record does not exist")
+
+    def record_acquisition_file_cleanup_failure(self, cleanup_id: str, error: str) -> None:
+        validate_id(cleanup_id)
+        error = _required_text(error, "cleanup error")
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE acquisition_file_cleanup SET attempts=attempts+1,last_error=?
+                   WHERE id=? AND removed_at IS NULL""",
+                (error, cleanup_id),
+            )
+            if cursor.rowcount != 1:
+                raise PersistenceError("acquisition cleanup record is not pending")
 
     def save_managed_file(self, managed_file: ManagedFile) -> ManagedFile:
         _validate_managed_file(managed_file)
@@ -408,6 +1978,11 @@ class PersistenceStore:
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not cancellable in its current status")
+            job = _fetchone(connection, "SELECT source_version_id FROM jobs WHERE id=?", (job_id,))
+            if job is not None and job["source_version_id"] is not None:
+                _mark_pdf_import_failed(
+                    connection, job["source_version_id"], "processing_cancelled", timestamp
+                )
             # Hide exactly what this job published; a newer job's readiness
             # remains untouched.
             connection.execute(
@@ -556,6 +2131,14 @@ class PersistenceStore:
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not active; finish rejected")
+            if status in ("failed", "cancelled"):
+                job = _fetchone(
+                    connection, "SELECT source_version_id FROM jobs WHERE id=?", (job_id,)
+                )
+                if job is not None and job["source_version_id"] is not None:
+                    _mark_pdf_import_failed(
+                        connection, job["source_version_id"], "processing_failed", timestamp
+                    )
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
 
@@ -789,6 +2372,38 @@ class PersistenceStore:
                     "INSERT INTO source_readiness_indexes(source_id,index_version_id) VALUES(?,?)",
                     (source_id, index_version_id),
                 )
+            pdf_import = _fetchone(
+                connection,
+                "SELECT id FROM pdf_imports WHERE source_id=? AND source_version_id=?",
+                (source_id, source_version_id),
+            )
+            if pdf_import is not None:
+                import_id = pdf_import["id"]
+                state = _fetchone(
+                    connection, "SELECT * FROM source_pdf_state WHERE source_id=?", (source_id,)
+                )
+                if state is None or import_id not in (
+                    state["current_import_id"],
+                    state["pending_import_id"],
+                ):
+                    raise ConflictingWriteError(
+                        "PDF version is no longer the source's current candidate"
+                    )
+                if (
+                    state["pending_import_id"] is not None
+                    and state["pending_import_id"] != import_id
+                ):
+                    raise ConflictingWriteError("a newer PDF replacement is pending")
+                connection.execute(
+                    """UPDATE pdf_imports SET state='ready',failure_code=NULL,updated_at=?
+                       WHERE id=?""",
+                    (timestamp, import_id),
+                )
+                connection.execute(
+                    """UPDATE source_pdf_state SET current_import_id=?,pending_import_id=NULL,
+                              revision=revision+1,updated_at=? WHERE source_id=?""",
+                    (import_id, timestamp, source_id),
+                )
             # Mark every older or same-instant peer superseded. The mark is
             # durable and independent of the readiness record, so cancelling
             # this (or any newer) result never restores an older job's right
@@ -824,6 +2439,44 @@ class PersistenceStore:
         validate_utc_timestamp(purge_deadline_at)
         timestamp = utc_timestamp()
         with self._transaction() as connection:
+            acquisitions = connection.execute(
+                """SELECT * FROM pdf_acquisitions WHERE target_source_id=?
+                   AND state IN ('awaiting_upload','receiving','staged','finalizing',
+                                 'waiting_cleanup')""",
+                (source_id,),
+            ).fetchall()
+            for acquisition in acquisitions:
+                connection.execute(
+                    """INSERT INTO acquisition_file_cleanup(
+                               id,acquisition_id,relative_path,file_kind,expected_sha256,
+                               expected_size_bytes,created_at
+                           ) VALUES(?,?,?,'staging',?,?,?)
+                           ON CONFLICT(acquisition_id,relative_path) DO NOTHING""",
+                    (
+                        new_id(),
+                        acquisition["id"],
+                        acquisition["staging_relative_path"],
+                        acquisition["input_sha256"],
+                        acquisition["input_size_bytes"],
+                        timestamp,
+                    ),
+                )
+                if acquisition["planned_relative_path"] is not None:
+                    connection.execute(
+                        """INSERT INTO acquisition_file_cleanup(
+                               id,acquisition_id,relative_path,file_kind,expected_sha256,
+                               expected_size_bytes,created_at
+                           ) VALUES(?,?,?,'planned_original',?,?,?)
+                           ON CONFLICT(acquisition_id,relative_path) DO NOTHING""",
+                        (
+                            new_id(),
+                            acquisition["id"],
+                            acquisition["planned_relative_path"],
+                            acquisition["planned_sha256"],
+                            acquisition["planned_size_bytes"],
+                            timestamp,
+                        ),
+                    )
             connection.execute(
                 "DELETE FROM source_readiness_indexes WHERE source_id=?", (source_id,)
             )
@@ -833,6 +2486,16 @@ class PersistenceStore:
                        updated_at=?
                    WHERE status IN ('queued','running')
                      AND job_id IN (SELECT id FROM jobs WHERE source_id=?)""",
+                (timestamp, source_id),
+            )
+            connection.execute(
+                """UPDATE pdf_acquisitions
+                   SET state='cancelled',failure_code='source_deleted',
+                       finalization_generation=finalization_generation+1,
+                       planned_reuse_managed_file_id=NULL,updated_at=?
+                   WHERE target_source_id=?
+                     AND state IN ('awaiting_upload','receiving','staged','finalizing',
+                                   'waiting_cleanup')""",
                 (timestamp, source_id),
             )
             connection.execute(
@@ -904,6 +2567,17 @@ class PersistenceStore:
             )
             if tracker is None:
                 raise PersistenceError("source is not in trash")
+            pending_cleanup = _fetchone(
+                connection,
+                """SELECT 1 FROM acquisition_file_cleanup AS cleanup
+                   JOIN pdf_acquisitions AS acquisition ON acquisition.id=cleanup.acquisition_id
+                   WHERE cleanup.removed_at IS NULL
+                     AND (acquisition.target_source_id=? OR acquisition.outcome_source_id=?)
+                   LIMIT 1""",
+                (source_id, source_id),
+            )
+            if pending_cleanup is not None:
+                raise PersistenceError("PDF acquisition cleanup is still pending")
             managed_file_ids = [
                 row[0]
                 for row in connection.execute(
@@ -912,6 +2586,17 @@ class PersistenceStore:
                     (source_id,),
                 ).fetchall()
             ]
+            connection.execute(
+                """DELETE FROM acquisition_file_cleanup
+                   WHERE acquisition_id IN (
+                       SELECT id FROM pdf_acquisitions
+                       WHERE target_source_id=? OR outcome_source_id=?
+                   )""",
+                (source_id, source_id),
+            )
+            connection.execute("DELETE FROM pdf_import_trash WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM source_pdf_state WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM pdf_imports WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM chunk_passages WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM retrieval_chunks WHERE source_id=?", (source_id,))
             connection.execute(
@@ -938,6 +2623,12 @@ class PersistenceStore:
             connection.execute("DELETE FROM index_versions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM extraction_versions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM source_versions WHERE source_id=?", (source_id,))
+            connection.execute(
+                """UPDATE pdf_acquisitions SET target_source_id=NULL,outcome_source_id=NULL,
+                          outcome_import_id=NULL,expected_current_import_id=NULL
+                   WHERE target_source_id=? OR outcome_source_id=?""",
+                (source_id, source_id),
+            )
             for managed_file_id in managed_file_ids:
                 removal = _fetchone(
                     connection,
@@ -986,6 +2677,14 @@ class PersistenceStore:
             ).fetchone()
             if shared is not None:
                 return None
+            held = connection.execute(
+                """SELECT 1 FROM pdf_acquisitions
+                   WHERE planned_reuse_managed_file_id=?
+                     AND state IN ('staged','finalizing','waiting_cleanup') LIMIT 1""",
+                (managed_file_id,),
+            ).fetchone()
+            if held is not None:
+                return None
             connection.execute(
                 """INSERT INTO managed_file_removals(
                        managed_file_id,relative_path,requested_at,removed_at,attempts,last_error
@@ -1010,6 +2709,18 @@ class PersistenceStore:
             )
             if cursor.rowcount != 1:
                 raise PersistenceError("managed file is not marked for removal")
+            connection.execute(
+                "DELETE FROM original_registry WHERE managed_file_id=?", (managed_file_id,)
+            )
+            connection.execute(
+                """UPDATE pdf_import_trash SET file_removed_at=?,updated_at=?
+                   WHERE import_id IN (
+                       SELECT item.id FROM pdf_imports AS item
+                       JOIN source_versions AS version ON version.id=item.source_version_id
+                       WHERE version.managed_file_id=?
+                   )""",
+                (timestamp, timestamp, managed_file_id),
+            )
             row = _fetchone(
                 connection,
                 "SELECT * FROM managed_file_removals WHERE managed_file_id=?",
@@ -1152,6 +2863,61 @@ def _fetchone(
     parameters: tuple[object, ...] = (),
 ) -> sqlite3.Row | None:
     return connection.execute(query, parameters).fetchone()
+
+
+def _verify_pdf_acquisition_attempt(
+    row: sqlite3.Row,
+    owner_instance_id: str,
+    generation: int,
+    expected_state: str,
+) -> None:
+    if row["owner_instance_id"] != owner_instance_id:
+        raise ConflictingWriteError("PDF acquisition belongs to another core instance")
+    if int(row["finalization_generation"]) != generation:
+        raise ConflictingWriteError("PDF acquisition attempt was superseded")
+    if row["state"] != expected_state:
+        raise ConflictingWriteError("PDF acquisition is not in the expected state")
+
+
+def _mark_pdf_import_failed(
+    connection: sqlite3.Connection,
+    source_version_id: str,
+    failure_code: str,
+    timestamp: str,
+) -> None:
+    row = _fetchone(
+        connection,
+        "SELECT id,source_id FROM pdf_imports WHERE source_version_id=?",
+        (source_version_id,),
+    )
+    if row is None:
+        return
+    import_id = row["id"]
+    source_id = row["source_id"]
+    connection.execute(
+        "UPDATE pdf_imports SET state='failed',failure_code=?,updated_at=? WHERE id=?",
+        (failure_code, timestamp, import_id),
+    )
+    connection.execute(
+        """UPDATE source_pdf_state SET pending_import_id=NULL,revision=revision+1,updated_at=?
+           WHERE source_id=? AND pending_import_id=?""",
+        (timestamp, source_id, import_id),
+    )
+
+
+def _validate_relative_path(path: str) -> None:
+    pure_path = PurePosixPath(path)
+    windows_path = PureWindowsPath(path)
+    if (
+        not path
+        or "\\" in path
+        or pure_path.is_absolute()
+        or windows_path.drive
+        or ".." in pure_path.parts
+        or not pure_path.parts
+        or pure_path.as_posix() != path
+    ):
+        raise ValueError("path must be a normalized app-data-relative path")
 
 
 def _require_row(row: sqlite3.Row | None) -> sqlite3.Row:
@@ -1784,6 +3550,99 @@ def _managed_file(row: sqlite3.Row) -> ManagedFile:
         row["size_bytes"],
         row["sha256"],
         row["created_at"],
+    )
+
+
+def _managed_file_from_join(row: sqlite3.Row) -> ManagedFile:
+    return ManagedFile(
+        row["managed_file_id"],
+        row["relative_path"],
+        row["size_bytes"],
+        row["managed_sha256"],
+        row["managed_created_at"],
+    )
+
+
+def _pdf_acquisition(row: sqlite3.Row) -> PdfAcquisition:
+    return PdfAcquisition(
+        row["id"],
+        row["retry_key"],
+        row["notebook_id"],
+        row["intent"],
+        row["target_source_id"],
+        row["expected_current_import_id"],
+        row["display_filename"],
+        row["state"],
+        int(row["finalization_generation"]),
+        row["owner_instance_id"],
+        row["staging_relative_path"],
+        row["input_sha256"],
+        row["input_size_bytes"],
+        int(row["received_size_bytes"]),
+        row["input_complete_at"],
+        row["last_write_at"],
+        row["planned_reuse_managed_file_id"],
+        row["planned_managed_file_id"],
+        row["planned_relative_path"],
+        row["planned_sha256"],
+        row["planned_size_bytes"],
+        row["placement_state"],
+        row["outcome_kind"],
+        row["outcome_source_id"],
+        row["outcome_import_id"],
+        row["failure_code"],
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _pdf_import(row: sqlite3.Row) -> PdfImport:
+    return PdfImport(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["acquisition_id"],
+        row["display_filename"],
+        row["state"],
+        row["failure_code"],
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _pdf_import_from_join(row: sqlite3.Row) -> PdfImport:
+    return PdfImport(
+        row["import_id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["acquisition_id"],
+        row["display_filename"],
+        row["import_state"],
+        row["failure_code"],
+        row["import_created_at"],
+        row["import_updated_at"],
+    )
+
+
+def _source_pdf_state(row: sqlite3.Row) -> SourcePdfState:
+    return SourcePdfState(
+        row["source_id"],
+        row["current_import_id"],
+        row["pending_import_id"],
+        int(row["revision"]),
+        row["updated_at"],
+    )
+
+
+def _pdf_import_trash(row: sqlite3.Row) -> PdfImportTrash:
+    return PdfImportTrash(
+        row["import_id"],
+        row["source_id"],
+        row["trashed_at"],
+        row["purge_deadline_at"],
+        row["file_removed_at"],
+        row["snapshots_removed_at"],
+        row["updated_at"],
     )
 
 

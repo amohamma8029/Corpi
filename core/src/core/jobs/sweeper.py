@@ -20,7 +20,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import stat
+from collections.abc import Callable
+from pathlib import Path
 
+from core.ingest.files import ManagedPdfFiles
+from core.ingest.locks import FingerprintLockCoordinator
+from core.persistence.errors import PersistenceError
 from core.persistence.models import utc_timestamp
 from core.persistence.store import PersistenceStore
 
@@ -37,9 +43,13 @@ class TrashSweeper:
         store: PersistenceStore,
         *,
         interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS,
+        fingerprint_locks: FingerprintLockCoordinator | None = None,
+        maintenance: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._interval = max(0.01, interval_seconds)
+        self._fingerprint_locks = fingerprint_locks
+        self._maintenance = maintenance
         self._task: asyncio.Task[None] | None = None
         self._stop: asyncio.Event | None = None
 
@@ -64,7 +74,7 @@ class TrashSweeper:
         assert self._stop is not None
         while True:
             try:
-                await asyncio.to_thread(self.sweep_once)
+                await asyncio.to_thread(self._run_maintenance)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - a failed sweep must not stop later sweeps
@@ -72,6 +82,11 @@ class TrashSweeper:
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
                 return
+
+    def _run_maintenance(self) -> None:
+        self.sweep_once()
+        if self._maintenance is not None:
+            self._maintenance()
 
     def sweep_once(self) -> tuple[str, ...]:
         """Purge every fully-expired source; returns the purged source ids.
@@ -116,28 +131,44 @@ class TrashSweeper:
         data_dir = self._store.database.config.data_dir.resolve()
         all_resolved = True
         for managed in self._store.list_source_managed_files(source_id):
-            removal = self._store.reserve_managed_file_removal(
-                managed.id, managed.relative_path, source_id
+            lock = (
+                None
+                if self._fingerprint_locks is None
+                else self._fingerprint_locks.lock_for(managed.sha256, managed.size_bytes)
             )
-            if removal is None:
-                continue  # another source still needs these bytes
-            if removal.removed_at is not None:
-                continue
-            candidate = (data_dir / managed.relative_path).resolve()
-            if not candidate.is_relative_to(data_dir):
-                logger.warning("skipping managed file outside the data directory")
-                self._store.record_managed_file_removal_failure(
-                    managed.id, "path escapes the data directory"
-                )
+            if lock is not None and not lock.acquire(timeout=30.0):
                 all_resolved = False
                 continue
             try:
-                candidate.unlink(missing_ok=True)
-            except OSError as error:
-                self._store.record_managed_file_removal_failure(managed.id, type(error).__name__)
-                all_resolved = False
-                continue
-            self._store.mark_managed_file_removed(managed.id)
+                removal = self._store.reserve_managed_file_removal(
+                    managed.id, managed.relative_path, source_id
+                )
+                if removal is None:
+                    if self._store.has_live_pdf_reuse_hold(managed.id):
+                        all_resolved = False
+                    continue  # another source or a live acquisition still needs these bytes
+                if removal.removed_at is not None:
+                    continue
+                try:
+                    if managed.relative_path.startswith("files/"):
+                        ManagedPdfFiles(data_dir).remove_recorded(managed.relative_path)
+                    else:
+                        candidate = (data_dir / managed.relative_path).resolve()
+                        if not candidate.is_relative_to(data_dir) or _has_redirected_component(
+                            data_dir, managed.relative_path
+                        ):
+                            raise OSError("managed file path is outside or redirected")
+                        candidate.unlink(missing_ok=True)
+                except (OSError, PersistenceError) as error:
+                    self._store.record_managed_file_removal_failure(
+                        managed.id, type(error).__name__
+                    )
+                    all_resolved = False
+                    continue
+                self._store.mark_managed_file_removed(managed.id)
+            finally:
+                if lock is not None:
+                    lock.release()
         return all_resolved
 
     def _cleanup_migration_snapshots(self) -> bool:
@@ -152,3 +183,20 @@ class TrashSweeper:
                 logger.warning("migration snapshot could not be removed during purge")
                 all_removed = False
         return all_removed
+
+
+def _has_redirected_component(root: Path, relative_path: str) -> bool:
+    current = root
+    parts = Path(relative_path).parts
+    for part in parts:
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode) or (
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            return True
+    return False

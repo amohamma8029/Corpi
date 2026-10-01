@@ -30,7 +30,11 @@ fn core_connection(state: State<'_, CoreState>) -> Result<CoreConnection, String
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "webdriver")]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .manage(CoreState::new())
         .setup(|app| {
             let state: State<CoreState> = app.state();

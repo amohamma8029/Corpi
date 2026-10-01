@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -190,9 +191,9 @@ def seed_graph(
     return source_id, source_version, tuple(indexes), job.id
 
 
-def test_populated_upgrade_to_revision_four_preserves_records(data_dir: Path) -> None:
+def test_populated_upgrade_to_revision_five_preserves_records(data_dir: Path) -> None:
     migrations = load_migrations()
-    assert [migration.revision for migration in migrations] == [1, 2, 3, 4]
+    assert [migration.revision for migration in migrations] == [1, 2, 3, 4, 5]
 
     legacy = Database(DatabaseConfig(data_dir), migrations=migrations[:1])
     legacy.initialize()
@@ -202,8 +203,162 @@ def test_populated_upgrade_to_revision_four_preserves_records(data_dir: Path) ->
     upgraded.initialize()
     store = PersistenceStore(upgraded)
     assert store.load_source(source_id).id == source_id
+    state = store.load_source_pdf_state(source_id)
+    assert state is not None and state.current_import_id is not None
+    legacy_import = store.load_pdf_import(state.current_import_id)
+    assert legacy_import.display_filename == "Earlier PDF (filename unknown)"
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
+@pytest.mark.parametrize("legacy_revision", [1, 4])
+def test_pdf_migration_preserves_separate_legacy_files_without_adopting_them(
+    data_dir: Path, legacy_revision: int
+) -> None:
+    migrations = load_migrations()
+    legacy = Database(DatabaseConfig(data_dir), migrations=migrations[:legacy_revision])
+    legacy.initialize()
+    store = PersistenceStore(legacy)
+    content = b"%PDF-1.4\nold separately stored PDF bytes\n"
+    checksum = hashlib.sha256(content).hexdigest()
+    old_paths: list[Path] = []
+    sources: list[tuple[str, str]] = []
+    for index in range(2):
+        notebook_id = new_id()
+        store.create_notebook(notebook_id, f"Legacy {index}")
+        source_id = new_id()
+        store.create_source(source_id, notebook_id, f"old-{index}.pdf")
+        relative_path = f"originals/old-{index}.pdf"
+        managed = ManagedFile(new_id(), relative_path, len(content), checksum, utc_timestamp())
+        store.save_managed_file(managed)
+        version = store.create_source_version(source_id, checksum, managed.id)
+        path = data_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        old_paths.append(path)
+        sources.append((source_id, version.id))
+
+    upgraded = Database(DatabaseConfig(data_dir))
+    upgraded.initialize()
+    upgraded_store = PersistenceStore(upgraded)
+
+    for source_id, version_id in sources:
+        state = upgraded_store.load_source_pdf_state(source_id)
+        assert state is not None and state.current_import_id is not None
+        item = upgraded_store.load_pdf_import(state.current_import_id)
+        assert item.source_version_id == version_id
+        assert item.state == "pending"
+    assert [path.read_bytes() for path in old_paths] == [content, content]
+    with upgraded.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM managed_files").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM original_registry").fetchone()[0] == 0
+
+
+def test_pdf_reuse_hold_survives_restart_and_blocks_removal(
+    store: PersistenceStore,
+    database: Database,
+) -> None:
+    notebook_id = new_id()
+    store.create_notebook(notebook_id, "Reuse hold")
+    source_id = new_id()
+    store.create_source(source_id, notebook_id, "held.pdf")
+    managed = ManagedFile(new_id(), "files/objects/held.pdf", 17, HASH_A, utc_timestamp())
+    store.save_managed_file(managed)
+    source_version = store.create_source_version(source_id, HASH_A, managed.id)
+    other_version = store.create_source_version(source_id, HASH_A, managed.id)
+    late_version = store.create_source_version(source_id, HASH_A, managed.id)
+    first_import_id = new_id()
+    other_import_id = new_id()
+    timestamp = utc_timestamp()
+    with database.connect() as connection:
+        for import_id, version_id in (
+            (first_import_id, source_version.id),
+            (other_import_id, other_version.id),
+        ):
+            connection.execute(
+                """INSERT INTO pdf_imports(
+                       id,source_id,source_version_id,acquisition_id,display_filename,
+                       state,created_at,updated_at
+                   ) VALUES(?,?,?,NULL,'held.pdf','ready',?,?)""",
+                (import_id, source_id, version_id, timestamp, timestamp),
+            )
+        connection.execute(
+            """INSERT INTO source_pdf_state(
+                   source_id,current_import_id,pending_import_id,revision,updated_at
+               ) VALUES(?,?,NULL,1,?)""",
+            (source_id, first_import_id, timestamp),
+        )
+    acquisition = store.create_pdf_acquisition(
+        "hold-retry-key", notebook_id, "add", "held.pdf", "core-one"
+    )
+    upload = store.begin_pdf_upload(acquisition.id, "core-one")
+    store.record_pdf_upload(acquisition.id, "core-one", upload.finalization_generation, HASH_A, 17)
+    claimed = store.claim_pdf_finalization(acquisition.id, "core-one")
+    store.set_pdf_reuse_hold(
+        acquisition.id, "core-one", claimed.finalization_generation, managed.id
+    )
+
+    restarted_store = PersistenceStore(database)
+    assert restarted_store.has_live_pdf_reuse_hold(managed.id)
+    recovered_attempt = restarted_store.claim_pdf_finalization(
+        acquisition.id, "core-two", recovery=True
+    )
+    assert recovered_attempt.planned_reuse_managed_file_id == managed.id
+    with pytest.raises(ConflictingWriteError):
+        restarted_store.clear_pdf_reuse_hold(
+            acquisition.id, "core-one", claimed.finalization_generation
+        )
+    assert (
+        restarted_store.reserve_managed_file_removal(managed.id, managed.relative_path, source_id)
+        is None
+    )
+
+    restarted_store.fail_pdf_acquisition(
+        acquisition.id,
+        "core-two",
+        recovered_attempt.finalization_generation,
+        "cancelled",
+        cancelled=True,
+    )
+    removal = restarted_store.reserve_managed_file_removal(
+        managed.id, managed.relative_path, source_id
+    )
+    assert removal is not None and removal.removed_at is None
+    second = restarted_store.create_pdf_acquisition(
+        "blocked-hold-key", notebook_id, "add", "held.pdf", "core-two"
+    )
+    with database.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE pdf_acquisitions SET planned_reuse_managed_file_id=? WHERE id=?",
+            (managed.id, second.id),
+        )
+    with database.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE source_pdf_state SET pending_import_id=? WHERE source_id=?",
+            (other_import_id, source_id),
+        )
+    with database.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO pdf_imports(
+                   id,source_id,source_version_id,acquisition_id,display_filename,state,
+                   created_at,updated_at
+               ) VALUES(?,?,?,NULL,'late.pdf','pending',?,?)""",
+            (new_id(), source_id, late_version.id, timestamp, timestamp),
+        )
+    with database.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO jobs(
+                   id,logical_work_key,kind,source_id,source_version_id,
+                   extraction_version_id,index_version_id,created_at,updated_at
+               ) VALUES(?,?,'pdf-extract',?,?,NULL,NULL,?,?)""",
+            (new_id(), "late-job", source_id, late_version.id, timestamp, timestamp),
+        )
+    with database.connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """INSERT INTO original_registry(sha256,size_bytes,managed_file_id,created_at)
+               VALUES(?,?,?,?)""",
+            (HASH_A, 17, managed.id, timestamp),
+        )
 
 
 def test_job_status_claim_heartbeat_and_finish(store: PersistenceStore, database: Database) -> None:

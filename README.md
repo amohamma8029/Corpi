@@ -17,7 +17,10 @@ Notebooks and saved research stay on the user's device. Answer generation uses t
   - MSVC build tools (Visual Studio Build Tools with the "Desktop development with C++" workload)
   - WebView2 runtime (Windows ships it with Edge)
 - macOS builds additionally need Homebrew Python 3.13 with SQLite 3.51.3 or newer; see the macOS setup below. `uv` still manages the core's packages.
-- End-to-end tests only: [tauri-driver](https://tauri.app/develop/tests/webdriver/) (`cargo install tauri-driver`) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`)
+- Native E2E tooling depends on the host:
+  - Windows: [tauri-driver](https://v2.tauri.app/develop/tests/webdriver/) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`).
+  - Ubuntu: the Tauri build libraries, `webkit2gtk-driver`, `xvfb`, `xauth`, and `dbus-x11`; install `tauri-driver` with `cargo install tauri-driver --version 2.1.0 --locked`.
+  - macOS: the test runner uses the embedded WebDriver plugin; it needs no external driver or paid subscription.
 
 `uv` manages the core's Python environment and packages. It downloads Python 3.13 by default; on macOS, select the Homebrew interpreter below so Python loads a supported SQLite version.
 
@@ -33,6 +36,36 @@ just dev
 ```
 
 With mise activated, `node`, `pnpm`, `just`, `uv`, and `cargo` resolve to the pinned versions inside this repository; outside it, your global mise tools are untouched.
+
+## Notebooks and PDF originals
+
+Create or open a notebook, then add one PDF at a time. Corpi copies the bytes into the user's
+app-data directory; moving the selected file later doesn't change the saved original. Replacing a
+PDF keeps the previous current file available until the new version is ready. The Files section
+opens the exact saved import, including older history. Identical current/pending PDFs in one
+notebook reuse their source entry, and healthy physical originals can be shared across notebooks.
+
+The core enforces a configurable **25,000,000-byte** starting upload limit, a **120-second** total
+transfer deadline, and a **30-second** no-bytes deadline. Only one incoming PDF transfer runs per
+core. PDF.js downloads the complete verified file and renders selected pages under a configurable
+**20-megapixel** starting canvas limit; the upload cap doesn't bound decoded memory. PDF.js and its
+matching worker/support assets are copied from the pinned `pdfjs-dist` package during `just dev`
+and desktop builds. Those generated assets are ignored by Git.
+
+Environment overrides are read by the core at startup:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `CORPI_PDF_MAX_BYTES` | `25000000` | Maximum received PDF bytes. |
+| `CORPI_PDF_UPLOAD_TIMEOUT_SECONDS` | `120` | Total time from transfer request acceptance through finalization. |
+| `CORPI_PDF_UPLOAD_IDLE_SECONDS` | `30` | Maximum wait for the next non-empty body chunk. |
+| `CORPI_PDF_RENDERED_PAGE_PIXELS` | `20000000` | Maximum canvas pixels for a rendered page. |
+| `CORPI_PDF_STAGING_AGE_SECONDS` | `86400` | Minimum idle age before unowned staging can be cleaned. |
+| `CORPI_MAINTENANCE_INTERVAL_SECONDS` | `3600` | Existing local maintenance interval. |
+
+Original-PDF import and viewing are implemented before extraction. The source remains available
+to inspect while `pdf-extract` waits for M1.5's parser and readability steps; it doesn't become
+searchable until the required extraction and indexing work publishes readiness.
 
 ### macOS Python and SQLite
 
@@ -63,11 +96,50 @@ Run from the repository root:
 | `just test` | Core tests (pytest), lint (Ruff), types (Pyright), UI unit tests (Vitest), and the OpenAPI schema drift check. |
 | `just core` | Core tests + Ruff + Pyright. |
 | `just ui` | UI unit tests. |
-| `just e2e` | WebdriverIO + tauri-driver smoke test against the real window, then an orphaned-core shutdown check. |
+| `just e2e` | Windows WebdriverIO + tauri-driver checks against the real window, including PDF import/viewer/worker, then an orphaned-core shutdown check. |
+| `pnpm --dir desktop run test:e2e` | Build and test the native app with the external driver on Windows/Linux or the embedded provider on macOS. |
+| `pnpm --dir desktop run test:e2e:embedded` | Test the embedded provider explicitly, including on a Windows development host. |
+| `pnpm --dir desktop run check:e2e` | Type-check the native E2E tests and WebdriverIO configuration. |
+| `pnpm --dir desktop run check:webdriver-isolation` | Check that default app dependencies and capabilities exclude the test automation plugin. |
 | `just schema-export` | Re-export `core/openapi.json` after changing core routes. |
 | `just schema-check` | Verify the committed OpenAPI schema still matches the live core routes. |
 
 Core setup is `uv sync` inside `core/`; desktop setup is `pnpm install` inside `desktop/`. On macOS, set `UV_PYTHON` as shown above before syncing or launching the core.
+
+## Native viewer tests in CI
+
+The existing GitHub Actions matrix runs the shared viewer suite on Ubuntu/WebKitGTK and
+macOS/WKWebView, after the core, UI, build, and launcher checks. Ubuntu launches the app under
+Xvfb and D-Bus:
+
+```sh
+dbus-run-session -- xvfb-run -a --server-args="-screen 0 1280x1024x24" pnpm --dir desktop run test:e2e
+```
+
+The macOS job runs `pnpm --dir desktop run test:e2e` with the Homebrew Python selection above.
+It uses WebdriverIO's Tauri launcher and the optional `webdriver` Cargo feature to control the
+actual app. Both jobs embed the built frontend, local PDF.js worker, and support assets; they
+use the real core and the app's CSP. The test build uses `app.corpi.desktop.e2e` as its Tauri
+identifier so its saved notebooks stay separate from ordinary Corpi data.
+
+The suite checks painted content on distinct pages, navigation and zoom, a 24,999,190-byte
+image-only PDF rendered under the 20-MP canvas cap, worker/canvas release after close and file
+switching, and a visible renderer error that leaves the original saved. Blank-canvas and
+stale-page controls check that the rendering assertions reject those failures.
+
+Each run writes screenshots, logs, fixture hashes, OS/webview/PDF.js versions, test results,
+the test binary hash, and a shutdown result under `desktop/e2e-results/<provider>/`. CI uploads
+these as `native-viewer-<runner>-<commit>` artifacts, including failed runs, for 14 days. A build
+or unit-test pass alone doesn't establish native viewer compatibility; use the native run's
+results and screenshots for that evidence.
+
+Ordinary builds omit the optional WebDriver dependency and test capabilities. Only the E2E
+runner passes `--features webdriver` and `tauri.webdriver.conf.json`; the default capability
+file stays unchanged. Production builds must run without that feature or test configuration.
+
+For test-only edits, `pnpm --dir desktop run test:e2e --reuse-build` reruns the external checks
+against the previous test binary after verifying its hash. Add `--embedded` for that provider.
+This option doesn't rebuild app changes; CI always builds a fresh binary.
 
 ## API contract
 

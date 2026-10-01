@@ -7,12 +7,15 @@ import time
 import uvicorn
 
 from core.api.app import create_app
+from core.ingest.locks import FingerprintLockCoordinator
+from core.ingest.service import PdfIngestService
 from core.jobs.runner import JobRunner
 from core.jobs.steps import STEP_SETS
 from core.jobs.sweeper import TrashSweeper
 from core.persistence.corelock import DataDirectoryLock
 from core.persistence.database import Database, DatabaseConfig, verify_sqlite_runtime
 from core.persistence.errors import PersistenceError
+from core.persistence.models import new_id
 from core.persistence.store import PersistenceStore
 
 READY_MARKER = "CORPI_CORE_READY"
@@ -89,14 +92,28 @@ def main() -> None:
         origins = allowed.split(",") if allowed else None
 
         store = PersistenceStore(database)
-        runner = JobRunner(store, STEP_SETS)
-        sweeper = TrashSweeper(store)
+        owner_instance_id = f"core-{new_id()}"
+        fingerprint_locks = FingerprintLockCoordinator()
+        runner = JobRunner(store, STEP_SETS, owner_instance_id=owner_instance_id)
+        pdf_ingest = PdfIngestService(
+            store,
+            owner_instance_id,
+            fingerprint_locks=fingerprint_locks,
+            notify_jobs=runner.notify,
+        )
+        sweeper = TrashSweeper(
+            store,
+            interval_seconds=pdf_ingest.limits.maintenance_interval_seconds,
+            fingerprint_locks=fingerprint_locks,
+            maintenance=pdf_ingest.maintenance,
+        )
 
         port = pick_free_port()
         app = create_app(
             token=token,
             allowed_origins=origins,
             store=store,
+            pdf_ingest=pdf_ingest,
             runner=runner,
             sweeper=sweeper,
         )

@@ -27,23 +27,6 @@
         }
       }
     },
-    "/demo/stream": {
-      "get": {
-        "summary": "Demo Stream",
-        "description": "Transport proof for authenticated streaming: SSE-formatted chunks over plain HTTP.\n\nRead with fetch + Authorization header, never browser EventSource (which cannot\nsend the per-launch token). Later import-progress and answer-token streams reuse\nthis shape.",
-        "operationId": "demo_stream_demo_stream_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
     "/jobs": {
       "get": {
         "summary": "List Jobs",
@@ -104,10 +87,849 @@
           }
         }
       }
+    },
+    "/notebooks": {
+      "get": {
+        "summary": "List Notebooks",
+        "operationId": "list_notebooks_notebooks_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/NotebookPayload"
+                  },
+                  "type": "array",
+                  "title": "Response List Notebooks Notebooks Get"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Notebook",
+        "operationId": "create_notebook_notebooks_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotebookCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotebookPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}": {
+      "get": {
+        "summary": "Get Notebook",
+        "operationId": "get_notebook_notebooks__notebook_id__get",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotebookPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}/sources": {
+      "get": {
+        "summary": "List Sources",
+        "operationId": "list_sources_notebooks__notebook_id__sources_get",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SourcePayload"
+                  },
+                  "title": "Response List Sources Notebooks  Notebook Id  Sources Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}/pdf-acquisitions": {
+      "post": {
+        "summary": "Create Acquisition",
+        "operationId": "create_acquisition_notebooks__notebook_id__pdf_acquisitions_post",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AcquisitionCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcquisitionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-acquisitions/{acquisition_id}": {
+      "get": {
+        "summary": "Get Acquisition",
+        "operationId": "get_acquisition_pdf_acquisitions__acquisition_id__get",
+        "parameters": [
+          {
+            "name": "acquisition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Acquisition Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcquisitionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-acquisitions/{acquisition_id}/content": {
+      "put": {
+        "summary": "Upload Pdf",
+        "operationId": "upload_pdf_pdf_acquisitions__acquisition_id__content_put",
+        "parameters": [
+          {
+            "name": "acquisition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Acquisition Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcquisitionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/pdf": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-acquisitions/{acquisition_id}/retry": {
+      "post": {
+        "summary": "Retry Pdf",
+        "operationId": "retry_pdf_pdf_acquisitions__acquisition_id__retry_post",
+        "parameters": [
+          {
+            "name": "acquisition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Acquisition Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcquisitionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/pdf-acquisitions/{acquisition_id}/cancel": {
+      "post": {
+        "summary": "Cancel Pdf",
+        "operationId": "cancel_pdf_pdf_acquisitions__acquisition_id__cancel_post",
+        "parameters": [
+          {
+            "name": "acquisition_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Acquisition Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcquisitionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/imports": {
+      "get": {
+        "summary": "List Imports",
+        "operationId": "list_imports_sources__source_id__imports_get",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ImportPayload"
+                  },
+                  "title": "Response List Imports Sources  Source Id  Imports Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/imports/{import_id}": {
+      "delete": {
+        "summary": "Trash Import",
+        "operationId": "trash_import_sources__source_id__imports__import_id__delete",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "import_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Import Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrashPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/imports/{import_id}/retry": {
+      "post": {
+        "summary": "Retry Import Processing",
+        "operationId": "retry_import_processing_sources__source_id__imports__import_id__retry_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "import_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Import Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingActionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/imports/{import_id}/cancel": {
+      "post": {
+        "summary": "Cancel Import Processing",
+        "operationId": "cancel_import_processing_sources__source_id__imports__import_id__cancel_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "import_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Import Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingActionPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}": {
+      "delete": {
+        "summary": "Trash Source",
+        "operationId": "trash_source_sources__source_id__delete",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrashPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/imports/{import_id}/pdf": {
+      "get": {
+        "summary": "Open Import",
+        "operationId": "open_import_sources__source_id__imports__import_id__pdf_get",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          },
+          {
+            "name": "import_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Import Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The verified saved PDF bytes.",
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/storage/originals": {
+      "get": {
+        "summary": "Storage Report",
+        "operationId": "storage_report_storage_originals_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoragePayload"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "AcquisitionCreate": {
+        "properties": {
+          "retry_key": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Retry Key"
+          },
+          "filename": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Filename"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent",
+            "default": "add"
+          },
+          "target_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Source Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "retry_key",
+          "filename"
+        ],
+        "title": "AcquisitionCreate"
+      },
+      "AcquisitionPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "retry_key": {
+            "type": "string",
+            "title": "Retry Key"
+          },
+          "notebook_id": {
+            "type": "string",
+            "title": "Notebook Id"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          },
+          "target_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Source Id"
+          },
+          "filename": {
+            "type": "string",
+            "title": "Filename"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          },
+          "received_size_bytes": {
+            "type": "integer",
+            "title": "Received Size Bytes"
+          },
+          "expected_size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Size Bytes"
+          },
+          "input_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Sha256"
+          },
+          "planned_managed_file_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Planned Managed File Id"
+          },
+          "outcome_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome Kind"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Id"
+          },
+          "import_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Import Id"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "retry_key",
+          "notebook_id",
+          "intent",
+          "target_source_id",
+          "filename",
+          "state",
+          "generation",
+          "received_size_bytes",
+          "expected_size_bytes",
+          "input_sha256",
+          "planned_managed_file_id",
+          "outcome_kind",
+          "source_id",
+          "import_id",
+          "failure_code",
+          "updated_at"
+        ],
+        "title": "AcquisitionPayload"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -120,6 +942,81 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "ImportPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "source_version_id": {
+            "type": "string",
+            "title": "Source Version Id"
+          },
+          "filename": {
+            "type": "string",
+            "title": "Filename"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "title": "Size Bytes"
+          },
+          "sha256": {
+            "type": "string",
+            "title": "Sha256"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "trashed": {
+            "type": "boolean",
+            "title": "Trashed"
+          },
+          "is_current": {
+            "type": "boolean",
+            "title": "Is Current"
+          },
+          "is_pending": {
+            "type": "boolean",
+            "title": "Is Pending"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "source_id",
+          "source_version_id",
+          "filename",
+          "state",
+          "failure_code",
+          "size_bytes",
+          "sha256",
+          "created_at",
+          "trashed",
+          "is_current",
+          "is_pending"
+        ],
+        "title": "ImportPayload"
       },
       "JobAttemptPayload": {
         "properties": {
@@ -281,6 +1178,202 @@
         "title": "JobStepPayload"
       },
       "JsonValue": {},
+      "NotebookCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "notebook_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notebook Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "NotebookCreate"
+      },
+      "NotebookPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "NotebookPayload"
+      },
+      "ProcessingActionPayload": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "title": "ProcessingActionPayload"
+      },
+      "SourcePayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "notebook_id": {
+            "type": "string",
+            "title": "Notebook Id"
+          },
+          "display_name": {
+            "type": "string",
+            "title": "Display Name"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "title": "Updated At"
+          },
+          "current_import_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Import Id"
+          },
+          "pending_import_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Import Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "notebook_id",
+          "display_name",
+          "created_at",
+          "updated_at",
+          "current_import_id",
+          "pending_import_id"
+        ],
+        "title": "SourcePayload"
+      },
+      "StoragePayload": {
+        "properties": {
+          "original_file_count": {
+            "type": "integer",
+            "title": "Original File Count"
+          },
+          "original_bytes": {
+            "type": "integer",
+            "title": "Original Bytes"
+          },
+          "bytes_pending_removal": {
+            "type": "integer",
+            "title": "Bytes Pending Removal"
+          },
+          "retained_staging_bytes": {
+            "type": "integer",
+            "title": "Retained Staging Bytes"
+          },
+          "max_upload_bytes": {
+            "type": "integer",
+            "title": "Max Upload Bytes"
+          },
+          "rendered_page_pixel_limit": {
+            "type": "integer",
+            "title": "Rendered Page Pixel Limit"
+          }
+        },
+        "type": "object",
+        "required": [
+          "original_file_count",
+          "original_bytes",
+          "bytes_pending_removal",
+          "retained_staging_bytes",
+          "max_upload_bytes",
+          "rendered_page_pixel_limit"
+        ],
+        "title": "StoragePayload"
+      },
+      "TrashPayload": {
+        "properties": {
+          "import_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Import Id"
+          },
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "purge_deadline_at": {
+            "type": "string",
+            "title": "Purge Deadline At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id",
+          "purge_deadline_at"
+        ],
+        "title": "TrashPayload"
+      },
       "ValidationError": {
         "properties": {
           "loc": {

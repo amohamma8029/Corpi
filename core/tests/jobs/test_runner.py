@@ -125,6 +125,31 @@ def test_runs_steps_in_order_and_records_completions(store: PersistenceStore) ->
         ]
 
 
+def test_pdf_extract_waits_for_m15_steps_without_failing_or_completing(
+    store: PersistenceStore,
+) -> None:
+    runner = RunnerHarness(store, {})
+    job_id, _ = enqueue(store, "pdf-extract", "pdf-extract:waiting", "waiting.pdf")
+    runner.start()
+    try:
+        runner.enqueue_and_notify(store, job_id)
+        assert wait_until(
+            lambda: (
+                (status := store.load_job_status(job_id)) is not None
+                and status.status == "queued"
+                and status.failure_reason is not None
+            )
+        ), store.load_job_status(job_id)
+    finally:
+        runner.stop()
+
+    status = store.load_job_status(job_id)
+    assert status is not None and status.status == "queued"
+    assert "M1.5" in (status.failure_reason or "")
+    assert store.load_job_steps(job_id) == ()
+    assert store.load_step_attempts(job_id, "extract-text") == ()
+
+
 def test_failed_attempt_retries_then_completes(store: PersistenceStore) -> None:
     records: dict[str, list[int]] = {}
 

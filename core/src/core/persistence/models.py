@@ -285,6 +285,71 @@ class SourceTrash:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfAcquisition:
+    id: str
+    retry_key: str
+    notebook_id: str
+    intent: str
+    target_source_id: str | None
+    expected_current_import_id: str | None
+    display_filename: str
+    state: str
+    finalization_generation: int
+    owner_instance_id: str
+    staging_relative_path: str
+    input_sha256: str | None
+    input_size_bytes: int | None
+    received_size_bytes: int
+    input_complete_at: str | None
+    last_write_at: str
+    planned_reuse_managed_file_id: str | None
+    planned_managed_file_id: str | None
+    planned_relative_path: str | None
+    planned_sha256: str | None
+    planned_size_bytes: int | None
+    placement_state: str
+    outcome_kind: str | None
+    outcome_source_id: str | None
+    outcome_import_id: str | None
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PdfImport:
+    id: str
+    source_id: str
+    source_version_id: str
+    acquisition_id: str | None
+    display_filename: str
+    state: str
+    failure_code: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePdfState:
+    source_id: str
+    current_import_id: str | None
+    pending_import_id: str | None
+    revision: int
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PdfImportTrash:
+    import_id: str
+    source_id: str
+    trashed_at: str
+    purge_deadline_at: str
+    file_removed_at: str | None
+    snapshots_removed_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExtractionGraph:
     extraction: ExtractionVersion
     passages: tuple[Passage, ...]

@@ -46,6 +46,10 @@ from core.persistence.store import PersistenceStore
 
 logger = logging.getLogger(__name__)
 
+WAITING_FOR_IMPLEMENTATION = {
+    "pdf-extract": "PDF text extraction is waiting for the M1.5 processing steps.",
+}
+
 
 class PermanentStepFailure(Exception):
     """A step failure that must not be retried (invalid input, unsupported data)."""
@@ -202,6 +206,7 @@ class JobRunner:
         # Database operations get their own single-worker capacity so a busy
         # or locked database never blocks the event loop or the step workers.
         self._db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="corpi-db")
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._wakeup: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
         self._stopping = threading.Event()
@@ -217,6 +222,7 @@ class JobRunner:
     async def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("runner is already started")
+        self._loop = asyncio.get_running_loop()
         self._wakeup = asyncio.Event()
         # The exclusive data-directory lock proves a previous core is gone, so
         # every job still marked running belongs to that dead instance and can
@@ -234,13 +240,16 @@ class JobRunner:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        self._loop = None
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._db_executor.shutdown(wait=False, cancel_futures=True)
 
     def notify(self) -> None:
         """Wake the runner after new work is enqueued."""
-        if self._wakeup is not None:
-            self._wakeup.set()
+        loop = self._loop
+        wakeup = self._wakeup
+        if loop is not None and wakeup is not None:
+            loop.call_soon_threadsafe(wakeup.set)
 
     def snapshot(self) -> RunnerSnapshot:
         return RunnerSnapshot(
@@ -301,6 +310,19 @@ class JobRunner:
             try:
                 job = await self._db(self._store.load_job_by_id, candidate.job_id)
             except Exception:  # noqa: BLE001 - unknown jobs are simply not claimable
+                continue
+            waiting_reason = WAITING_FOR_IMPLEMENTATION.get(job.kind)
+            if waiting_reason is not None and job.kind not in self._step_sets:
+                # M1.4 can persist the saved original and queued handoff before
+                # M1.5 provides extraction. Keep this known kind visibly queued;
+                # genuinely unknown kinds retain the ordinary failed-job path.
+                if candidate.failure_reason != waiting_reason:
+                    try:
+                        await self._db(
+                            self._store.annotate_queued_job, candidate.job_id, waiting_reason
+                        )
+                    except ConflictingWriteError:
+                        pass
                 continue
             policy_payload = self._policy_payload(job)
             try:
