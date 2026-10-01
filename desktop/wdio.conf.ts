@@ -39,7 +39,9 @@ export const config: WebdriverIO.Config = {
   services: embedded ? [launcherService] : [],
   capabilities: [
     {
-      browserName: "wry",
+      // tauri-driver preserves browserName on Linux; WebKitWebDriver rejects
+      // "wry". Let it select its native browser, as in Tauri's manual example.
+      ...(process.platform === "linux" && !embedded ? {} : { browserName: "wry" }),
       "tauri:options": {
         application: APPLICATION,
       },
