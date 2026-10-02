@@ -20,7 +20,16 @@ const provider = process.platform === "darwin" || process.argv.includes("--embed
 const results = path.join(desktop, "e2e-results", provider);
 const binary = path.join(desktop, `src-tauri/target/release/corpi-desktop${windows ? ".exe" : ""}`);
 const reuseBuild = process.argv.includes("--reuse-build");
-const previousBuild = reuseBuild ? JSON.parse(readFileSync(path.join(results, "run.json"), "utf8")) : null;
+let previousBuild = null;
+if (reuseBuild) {
+  try {
+    previousBuild = JSON.parse(readFileSync(path.join(results, "run.json"), "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const firstRun = provider === "embedded" ? "test:e2e:embedded" : "test:e2e";
+    throw new Error(`No previous test build found. Run without --reuse-build first: pnpm --dir desktop run ${firstRun}`);
+  }
+}
 if (reuseBuild && (previousBuild.provider !== provider || !previousBuild.testBinarySha256
   || createHash("sha256").update(readFileSync(binary)).digest("hex") !== previousBuild.testBinarySha256)) {
   throw new Error("The previous test binary is unavailable or changed; rerun without --reuse-build.");
