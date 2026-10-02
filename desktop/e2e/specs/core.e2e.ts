@@ -130,7 +130,12 @@ async function openPdf(filename: string) {
   });
   await $(".import-list").$("button=Open").click();
   await $("[data-testid='pdf-viewer']").waitForDisplayed();
-  await expect($("[data-testid='pdf-viewer'] h2")).toHaveText(filename);
+  await $("[data-testid='pdf-viewer'] h2").waitForDisplayed();
+  // WebKitGTK's rendered-text endpoint reports empty text for this clipped
+  // heading, even when the retained screenshot visibly shows the filename.
+  await browser.waitUntil(async () => (await viewerSnapshot()).filename === filename, {
+    timeout: 15000, timeoutMsg: `The visible PDF viewer did not identify ${filename}`,
+  });
 }
 
 async function closePdf() {

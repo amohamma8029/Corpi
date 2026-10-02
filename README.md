@@ -113,8 +113,12 @@ macOS/WKWebView, after the core, UI, build, and launcher checks. Ubuntu launches
 Xvfb and D-Bus:
 
 ```sh
-dbus-run-session -- xvfb-run -a --server-args="-screen 0 1280x1024x24" pnpm --dir desktop run test:e2e
+xvfb-run -a --server-args="-screen 0 1280x1024x24" dbus-run-session -- pnpm --dir desktop run test:e2e
 ```
+
+Start Xvfb before D-Bus so activated desktop services inherit `DISPLAY`. The CI dependency
+step uses bounded APT download timeouts/retries and a ten-minute step timeout, so an unavailable
+package mirror cannot consume the whole test job.
 
 The macOS job runs `pnpm --dir desktop run test:e2e` with the Homebrew Python selection above.
 It uses WebdriverIO's Tauri launcher and the optional `webdriver` Cargo feature to control the
