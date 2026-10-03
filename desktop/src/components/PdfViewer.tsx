@@ -177,6 +177,20 @@ export function PdfViewer({
       aria-modal="true"
       data-testid="pdf-viewer"
       onCancel={(event) => { event.preventDefault(); onClose(); }}
+      onKeyDown={(event) => {
+        if (event.key !== "Tab" || event.altKey || event.ctrlKey || event.metaKey) return;
+        // Keep the toolbar cycle consistent when a native webview would focus
+        // the dialog/container between the last and first enabled controls.
+        const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+          "button:not(:disabled), input:not(:disabled)",
+        ));
+        if (!controls.length) return;
+        const index = controls.findIndex((control) => control === window.document.activeElement);
+        const next = index < 0 ? (event.shiftKey ? controls.length - 1 : 0)
+          : (index + (event.shiftKey ? -1 : 1) + controls.length) % controls.length;
+        event.preventDefault();
+        controls[next].focus();
+      }}
     >
       <header className="pdf-viewer__toolbar">
         <div>

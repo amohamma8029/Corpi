@@ -48,6 +48,13 @@ it("keeps the canvas usable after a page error and clears the error when another
   expect((await screen.findByRole("alert")).textContent).toContain("Page one cannot render");
   const canvas = document.querySelector("canvas")!;
   expect(canvas.parentElement!.hidden).toBe(false);
+  const close = screen.getByRole("button", { name: "Close PDF" });
+  const pageInput = screen.getByRole("spinbutton", { name: "Page number" });
+  close.focus();
+  fireEvent.keyDown(close, { key: "Tab" });
+  expect(document.activeElement).toBe(pageInput); // skip disabled Previous page
+  fireEvent.keyDown(pageInput, { key: "Tab", shiftKey: true });
+  expect(document.activeElement).toBe(close);
   fireEvent.click(screen.getByRole("button", { name: "Next page" }));
   await waitFor(() => expect(canvas.parentElement!.getAttribute("aria-busy")).toBe("false"));
   expect(screen.queryByRole("alert")).toBeNull();
