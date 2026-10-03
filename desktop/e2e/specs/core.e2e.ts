@@ -235,13 +235,20 @@ describe("Corpi native notebook and PDF workflow", () => {
     await expect(inertBackground).toBe(true);
     const nativeKeys = process.env.CORPI_E2E_PROVIDER !== "embedded";
     if (nativeKeys) {
+      // Establish a known starting control after the inert-background probe.
+      // The keyboard sequence must not depend on that probe's resulting focus.
+      await browser.execute(() => {
+        const controls = document.querySelectorAll<HTMLButtonElement>(".pdf-viewer__controls button");
+        controls[controls.length - 1].focus();
+      });
       for (const name of ["Page number", "Next page", "Zoom out", "Zoom in", "Close PDF", "Page number"]) {
         await browser.keys("Tab");
-        const focused = await browser.execute(() => ({
-          insideViewer: document.querySelector("[data-testid='pdf-viewer']")!.contains(document.activeElement),
-          name: document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.textContent?.trim(),
-        }));
-        await expect(focused).toEqual({ insideViewer: true, name });
+        // Native input dispatch can return before WebKit's focus transition.
+        // Still require the exact next control, not merely any modal descendant.
+        await browser.waitUntil(() => browser.execute((expected) =>
+          document.querySelector("[data-testid='pdf-viewer']")!.contains(document.activeElement)
+            && (document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.textContent?.trim()) === expected,
+        name), { timeout: 5000, timeoutMsg: `Native Tab did not focus ${name} in visual order` });
       }
     }
     record("modal-keyboard-focus", {
