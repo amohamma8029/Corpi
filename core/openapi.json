@@ -780,6 +780,135 @@
           }
         }
       }
+    },
+    "/sources/{source_id}/extraction": {
+      "get": {
+        "summary": "Get Extraction",
+        "operationId": "get_extraction_sources__source_id__extraction_get",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionReportPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/extractions/{extraction_id}/review": {
+      "post": {
+        "summary": "Decide Review",
+        "description": "Confirm or Decline the exact extraction the user reviewed (currency rechecked).",
+        "operationId": "decide_review_extractions__extraction_id__review_post",
+        "parameters": [
+          {
+            "name": "extraction_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Extraction Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReviewDecisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionReviewPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/extractions/{extraction_id}/review/reopen": {
+      "post": {
+        "summary": "Reopen Review",
+        "description": "Review Again: reopen the decision and supersede older open dialogs.",
+        "operationId": "reopen_review_extractions__extraction_id__review_reopen_post",
+        "parameters": [
+          {
+            "name": "extraction_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Extraction Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionReviewPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -985,6 +1114,195 @@
           "requires_upload"
         ],
         "title": "AcquisitionPayload"
+      },
+      "ExtractionPagePayload": {
+        "properties": {
+          "page_number": {
+            "type": "integer",
+            "title": "Page Number"
+          },
+          "classification": {
+            "type": "string",
+            "title": "Classification"
+          },
+          "text_drawn": {
+            "type": "boolean",
+            "title": "Text Drawn"
+          },
+          "extracted_chars": {
+            "type": "integer",
+            "title": "Extracted Chars"
+          },
+          "unmapped_ratio": {
+            "type": "number",
+            "title": "Unmapped Ratio"
+          },
+          "image_area_ratio": {
+            "type": "number",
+            "title": "Image Area Ratio"
+          }
+        },
+        "type": "object",
+        "required": [
+          "page_number",
+          "classification",
+          "text_drawn",
+          "extracted_chars",
+          "unmapped_ratio",
+          "image_area_ratio"
+        ],
+        "title": "ExtractionPagePayload"
+      },
+      "ExtractionReportPayload": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "extraction_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraction Id"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Detail"
+          },
+          "parser_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parser Name"
+          },
+          "parser_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parser Version"
+          },
+          "normalization_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normalization Version"
+          },
+          "passage_count": {
+            "type": "integer",
+            "title": "Passage Count"
+          },
+          "pages": {
+            "items": {
+              "$ref": "#/components/schemas/ExtractionPagePayload"
+            },
+            "type": "array",
+            "title": "Pages"
+          },
+          "review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtractionReviewPayload"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id",
+          "extraction_id",
+          "outcome",
+          "failure_code",
+          "failure_detail",
+          "parser_name",
+          "parser_version",
+          "normalization_version",
+          "passage_count",
+          "pages",
+          "review"
+        ],
+        "title": "ExtractionReportPayload"
+      },
+      "ExtractionReviewPayload": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "state",
+          "generation",
+          "decided_at"
+        ],
+        "title": "ExtractionReviewPayload"
       },
       "HTTPValidationError": {
         "properties": {
@@ -1305,6 +1623,24 @@
           "status"
         ],
         "title": "ProcessingActionPayload"
+      },
+      "ReviewDecisionRequest": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "title": "Decision"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "decision",
+          "generation"
+        ],
+        "title": "ReviewDecisionRequest"
       },
       "SourcePayload": {
         "properties": {

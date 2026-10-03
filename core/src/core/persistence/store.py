@@ -2123,6 +2123,40 @@ class PersistenceStore:
                 raise PersistenceError("managed file does not exist")
             return _managed_file(row)
 
+    def load_extraction_report_for_source(self, source_id: str) -> ExtractionReport | None:
+        """The newest extraction on the source's current version, if one is committed."""
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            current_row = connection.execute(
+                """SELECT id FROM source_versions WHERE source_id=?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (source_id,),
+            ).fetchone()
+            if current_row is None:
+                return None
+            row = connection.execute(
+                """SELECT id FROM extraction_versions
+                   WHERE source_id=? AND source_version_id=?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (source_id, current_row[0]),
+            ).fetchone()
+            if row is None:
+                return None
+            return _load_extraction_report(connection, row["id"])
+
+    def load_latest_extraction_job_status(self, source_id: str) -> JobStatus | None:
+        """The newest `pdf-extract` job status for a source (carries failure codes)."""
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT job_status.* FROM job_status
+                   JOIN jobs ON jobs.id = job_status.job_id
+                   WHERE jobs.source_id=? AND jobs.kind='pdf-extract'
+                   ORDER BY jobs.created_at DESC, jobs.rowid DESC LIMIT 1""",
+                (source_id,),
+            ).fetchone()
+            return None if row is None else _job_status(row)
+
     def load_job_by_id(self, job_id: str) -> Job:
         validate_id(job_id)
         with self.database.connect() as connection:
@@ -2481,8 +2515,9 @@ class PersistenceStore:
         unresolved); the job must belong to this source, target the source's
         current version, and have committed every required index as one of its
         own step outputs. An older job cannot replace a newer job's readiness,
-        a trashed source can never publish, and cancelling the job later hides
-        exactly the readiness it published.
+        a trashed source can never publish, an extraction whose decision is
+        missing, pending, or declined never publishes, and cancelling the job
+        later hides exactly the readiness it published.
         """
         validate_id(job_id)
         validate_id(source_id)
@@ -2529,6 +2564,7 @@ class PersistenceStore:
             )
             if trash_row is not None:
                 raise ConflictingWriteError("source is deleted; publication rejected")
+            _verify_extraction_decision(connection, source_id, source_version_id)
             committed_outputs = {
                 row[0]
                 for row in connection.execute(
@@ -3605,6 +3641,34 @@ def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionRe
     )
     if import_trash is not None:
         raise ConflictingWriteError("candidate import is trashed; confirmation rejected")
+
+
+def _verify_extraction_decision(
+    connection: sqlite3.Connection, source_id: str, source_version_id: str
+) -> None:
+    """Reject publication when an extraction decision is missing or not confirmed.
+
+    Sources with no extraction keep 1.3's publication behaviour (1.6's steps refuse
+    extraction-less work). A committed extraction must be `complete` or carry a confirmed
+    review decision before readiness can publish.
+    """
+    extraction_row = _fetchone(
+        connection,
+        """SELECT extraction_version_id, outcome FROM extraction_outcomes
+           WHERE source_id=? AND source_version_id=?""",
+        (source_id, source_version_id),
+    )
+    if extraction_row is None or extraction_row["outcome"] == "complete":
+        return
+    review_row = _fetchone(
+        connection,
+        "SELECT state FROM extraction_reviews WHERE extraction_version_id=?",
+        (extraction_row["extraction_version_id"],),
+    )
+    if review_row is None or review_row["state"] != "confirmed":
+        raise ConflictingWriteError(
+            "extraction decision is missing or declined; publication rejected"
+        )
 
 
 def _save_extraction(
