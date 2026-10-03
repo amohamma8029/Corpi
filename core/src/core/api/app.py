@@ -5,6 +5,7 @@ from typing import Protocol
 from fastapi import FastAPI
 
 from core.api.auth import AuthMiddleware
+from core.api.extraction import router as extraction_router
 from core.api.identity import APP_VERSION
 from core.api.jobs import router as jobs_router
 from core.api.notebooks import router as notebooks_router
@@ -84,4 +85,5 @@ def create_app(
     app.include_router(jobs_router)
     app.include_router(notebooks_router)
     app.include_router(pdfs_router)
+    app.include_router(extraction_router)
     return app

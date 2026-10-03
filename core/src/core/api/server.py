@@ -10,7 +10,7 @@ from core.api.app import create_app
 from core.ingest.locks import FingerprintLockCoordinator
 from core.ingest.service import PdfIngestService
 from core.jobs.runner import JobRunner
-from core.jobs.steps import STEP_SETS
+from core.jobs.steps import register_pdf_extract_steps
 from core.jobs.sweeper import TrashSweeper
 from core.persistence.corelock import DataDirectoryLock
 from core.persistence.database import Database, DatabaseConfig, verify_sqlite_runtime
@@ -94,7 +94,8 @@ def main() -> None:
         store = PersistenceStore(database)
         owner_instance_id = f"core-{new_id()}"
         fingerprint_locks = FingerprintLockCoordinator()
-        runner = JobRunner(store, STEP_SETS, owner_instance_id=owner_instance_id)
+        step_sets = register_pdf_extract_steps(store)
+        runner = JobRunner(store, step_sets, owner_instance_id=owner_instance_id)
         pdf_ingest = PdfIngestService(
             store,
             owner_instance_id,

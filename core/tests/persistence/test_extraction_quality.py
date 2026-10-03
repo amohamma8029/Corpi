@@ -7,6 +7,7 @@ import pytest
 from core.persistence.database import Database
 from core.persistence.errors import ConflictingWriteError, PersistenceError
 from core.persistence.models import (
+    AttemptGuard,
     ExtractionOutcome,
     ExtractionPage,
     ExtractionReview,
@@ -417,6 +418,59 @@ def test_blank_page_may_carry_decorative_image(store: PersistenceStore) -> None:
         make_outcome(extraction, "complete"),
     )
     assert report.pages[0].classification == "blank"
+
+
+def test_publication_rejects_unconfirmed_extraction_decision(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        extraction,
+        (make_passage(extraction),),
+        (make_page(extraction),),
+        (),
+        make_outcome(extraction, "partial"),
+        make_review(extraction),
+    )
+    job = store.create_job(
+        "guard:publish", "index-build", source_id, source_version_id=source_version.id
+    )
+    store.create_job_status(job.id)
+    store.claim_job(job.id, "guard-tests")
+    attempt = store.start_step_attempt(job.id, "build-index")
+    guard = AttemptGuard("guard-tests", "build-index", attempt.attempt_number)
+    unconfirmed_index = new_id()
+
+    with pytest.raises(ConflictingWriteError, match="extraction decision"):
+        store.publish_readiness(
+            job.id, source_id, source_version.id, [unconfirmed_index], guard=guard
+        )
+
+    store.record_review_decision(extraction.id, "confirmed", 1)
+    with pytest.raises(ConflictingWriteError, match="not committed"):
+        store.publish_readiness(
+            job.id, source_id, source_version.id, [unconfirmed_index], guard=guard
+        )
+
+
+def test_publication_allows_a_complete_extraction_decision(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        extraction,
+        (make_passage(extraction),),
+        (make_page(extraction),),
+        (),
+        make_outcome(extraction, "complete"),
+    )
+    job = store.create_job(
+        "guard:complete", "index-build", source_id, source_version_id=source_version.id
+    )
+    store.create_job_status(job.id)
+    store.claim_job(job.id, "guard-tests")
+    attempt = store.start_step_attempt(job.id, "build-index")
+    guard = AttemptGuard("guard-tests", "build-index", attempt.attempt_number)
+    with pytest.raises(ConflictingWriteError, match="not committed"):
+        store.publish_readiness(job.id, source_id, source_version.id, [new_id()], guard=guard)
 
 
 def test_conflicting_retry_rejected_identical_retry_reuses(store: PersistenceStore) -> None:
