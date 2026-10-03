@@ -114,7 +114,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** List Unfinished Acquisitions */
+        get: operations["list_unfinished_acquisitions_notebooks__notebook_id__pdf_acquisitions_get"];
         put?: never;
         /** Create Acquisition */
         post: operations["create_acquisition_notebooks__notebook_id__pdf_acquisitions_post"];
@@ -365,6 +366,12 @@ export interface components {
             failure_code: string | null;
             /** Updated At */
             updated_at: string;
+            /** Can Retry */
+            can_retry: boolean;
+            /** Can Cancel */
+            can_cancel: boolean;
+            /** Requires Upload */
+            requires_upload: boolean;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -710,6 +717,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SourcePayload"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_unfinished_acquisitions_notebooks__notebook_id__pdf_acquisitions_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcquisitionPayload"][];
                 };
             };
             /** @description Validation Error */

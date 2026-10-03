@@ -275,6 +275,47 @@
             }
           }
         }
+      },
+      "get": {
+        "summary": "List Unfinished Acquisitions",
+        "operationId": "list_unfinished_acquisitions_notebooks__notebook_id__pdf_acquisitions_get",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AcquisitionPayload"
+                  },
+                  "title": "Response List Unfinished Acquisitions Notebooks  Notebook Id  Pdf Acquisitions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/pdf-acquisitions/{acquisition_id}": {
@@ -906,6 +947,18 @@
           "updated_at": {
             "type": "string",
             "title": "Updated At"
+          },
+          "can_retry": {
+            "type": "boolean",
+            "title": "Can Retry"
+          },
+          "can_cancel": {
+            "type": "boolean",
+            "title": "Can Cancel"
+          },
+          "requires_upload": {
+            "type": "boolean",
+            "title": "Requires Upload"
           }
         },
         "type": "object",
@@ -926,7 +979,10 @@
           "source_id",
           "import_id",
           "failure_code",
-          "updated_at"
+          "updated_at",
+          "can_retry",
+          "can_cancel",
+          "requires_upload"
         ],
         "title": "AcquisitionPayload"
       },

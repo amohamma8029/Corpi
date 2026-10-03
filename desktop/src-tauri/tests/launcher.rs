@@ -1,11 +1,12 @@
 //! Focused launcher tests: exercise the real `core_process` code paths (spawn
 //! uv, READY handshake, stop) rather than a re-implementation.
 //!
-//! Two scenarios, mirroring how the app shuts down:
+//! Shutdown scenarios, mirroring how the app exits:
 //! 1. stop after the core is ready;
-//! 2. stop while a launch is in progress (startup).
+//! 2. stop while a launch is in progress (startup);
+//! 3. stop during a held partial PDF upload and discover its state on restart.
 //!
-//! Both assert that no `/health` listener and no core process remains. The
+//! Shutdown checks assert that no `/health` listener and no core process remains. The
 //! process-group probe is Unix-specific; Windows shutdown is additionally
 //! covered by `just e2e`.
 
@@ -16,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corpi_desktop_lib::core_process::CoreState;
+use corpi_desktop_lib::core_process::{CoreConnection, CoreState};
 
 fn ensure_core_dir() {
     if std::env::var("CORPI_CORE_DIR").is_err() {
@@ -113,6 +114,35 @@ fn http_status(port: u16, token: Option<&str>) -> Option<u16> {
 /// notices stdin EOF and exits); allow a bounded drain either way.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn core_json(
+    connection: &CoreConnection,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let port = port_of(&connection.base_url);
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to real core");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound HTTP read");
+    let body = body.map(|value| value.to_string()).unwrap_or_default();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        connection.token, body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("send HTTP request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read HTTP response");
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response body");
+    let status: u16 = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert!((200..300).contains(&status), "core returned HTTP {status}");
+    serde_json::from_str(body).expect("core JSON response")
+}
+
 fn assert_port_dead(port: u16) {
     let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
     loop {
@@ -165,6 +195,90 @@ fn stops_after_the_core_is_ready() {
     // kernel answers by terminating every job member — including this test
     // process. The app relies on that at exit; leak it here instead.
     std::mem::forget(state);
+}
+
+#[test]
+fn stops_during_a_pdf_upload_and_discovers_the_interrupted_attempt_on_restart() {
+    ensure_core_dir();
+    let (state, data_dir) = isolated_core_state();
+    state.prepare_for_spawn().expect("prepare_for_spawn");
+    let connection = state.launch_blocking().expect("core should start");
+    let port = port_of(&connection.base_url);
+    let notebook = core_json(
+        &connection,
+        "POST",
+        "/notebooks",
+        Some(serde_json::json!({"title": "Interrupted upload"})),
+    );
+    let notebook_id = notebook["id"].as_str().unwrap();
+    let attempts_path = format!("/notebooks/{notebook_id}/pdf-acquisitions");
+    let attempt = core_json(
+        &connection,
+        "POST",
+        &attempts_path,
+        Some(
+            serde_json::json!({"filename": "interrupted.pdf", "retry_key": "window-close-upload"}),
+        ),
+    );
+    let attempt_id = attempt["id"].as_str().unwrap();
+    let attempt_path = format!("/pdf-acquisitions/{attempt_id}");
+    // Keep a real request open with incomplete bytes, then enter the same stop
+    // handler called by the shell's Exit event. Poll persistence before stopping.
+    let mut upload = TcpStream::connect(("127.0.0.1", port)).expect("start held upload");
+    upload.write_all(format!(
+        "PUT {attempt_path}/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Type: application/pdf\r\nContent-Length: 25000000\r\n\r\n%PDF-1.4\npartial input",
+        connection.token
+    ).as_bytes()).expect("send partial PDF bytes");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = core_json(&connection, "GET", &attempt_path, None);
+        if current["state"] == "receiving" && current["received_size_bytes"].as_u64().unwrap() > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "held request never entered receiving"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _pid = state.child_pid().expect("live core during upload");
+    let started = Instant::now();
+    state.stop();
+    assert!(
+        started.elapsed() < SHUTDOWN_DRAIN_TIMEOUT,
+        "upload delayed shell shutdown"
+    );
+    assert_port_dead(port);
+    assert!(state.child_pid().is_none());
+    #[cfg(unix)]
+    assert_group_dead(_pid);
+    drop(upload);
+    std::mem::forget(state);
+
+    let reopened = CoreState::new();
+    reopened.set_data_dir(data_dir.0.clone());
+    reopened.prepare_for_spawn().expect("prepare reopened core");
+    let connection = reopened
+        .launch_blocking()
+        .expect("reopen after interrupted upload");
+    let attempts = core_json(&connection, "GET", &attempts_path, None);
+    let attempts = attempts.as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["id"], attempt_id);
+    assert_eq!(attempts[0]["state"], "failed");
+    assert_eq!(attempts[0]["failure_code"], "upload_interrupted");
+    assert_eq!(attempts[0]["requires_upload"], true);
+    assert_eq!(attempts[0]["can_retry"], false);
+    let sources = core_json(
+        &connection,
+        "GET",
+        &format!("/notebooks/{notebook_id}/sources"),
+        None,
+    );
+    assert!(sources.as_array().unwrap().is_empty());
+    reopened.stop();
+    assert_port_dead(port_of(&connection.base_url));
+    std::mem::forget(reopened);
 }
 
 #[test]

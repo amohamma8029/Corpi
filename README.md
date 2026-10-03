@@ -45,6 +45,12 @@ PDF keeps the previous current file available until the new version is ready. Th
 opens the exact saved import, including older history. Identical current/pending PDFs in one
 notebook reuse their source entry, and healthy physical originals can be shared across notebooks.
 
+Unfinished imports reappear when their notebook is reopened. Complete saved input offers Retry;
+an interrupted partial upload asks you to select the PDF again for the same attempt. Cancel
+discards the unfinished attempt. The PDF viewer keeps keyboard focus inside while open and
+returns it to the Open button on close; Escape also closes it. A failed open shows a wrapping error
+message while retaining the original file.
+
 The core enforces a configurable **25,000,000-byte** starting upload limit, a **120-second** total
 transfer deadline, and a **30-second** no-bytes deadline. Only one incoming PDF transfer runs per
 core. PDF.js downloads the complete verified file and renders selected pages under a configurable
@@ -129,7 +135,14 @@ identifier so its saved notebooks stay separate from ordinary Corpi data.
 The suite checks painted content on distinct pages, navigation and zoom, a 24,999,190-byte
 image-only PDF rendered under the 20-MP canvas cap, worker/canvas release after close and file
 switching, and a visible renderer error that leaves the original saved. Blank-canvas and
-stale-page controls check that the rendering assertions reject those failures.
+stale-page controls check that the rendering assertions reject those failures. Controlled response
+and animation-frame waits exercise Close during fetch/render and successful reopening. The suite
+also checks modal keyboard focus, blocked background focus, and long-filename error wrapping.
+External drivers exercise trusted Tab/Escape input. The embedded provider sends synthetic keys,
+so its checks cover native modal focus, background inertness, return focus, and the cancel API;
+they do not establish physical-key navigation or screen-reader announcements.
+The launcher tests stop the real core during a held partial upload, reopen the same isolated data,
+and check that recovery reports file reselection rather than claiming a saved complete PDF.
 
 Each run writes screenshots, logs, fixture hashes, OS/webview/PDF.js versions, test results,
 the test binary hash, and a shutdown result under `desktop/e2e-results/<provider>/`. CI uploads

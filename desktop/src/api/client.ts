@@ -97,6 +97,13 @@ export function createPdfAcquisition(
   });
 }
 
+export function listPdfAcquisitions(
+  connection: CoreConnection,
+  notebookId: string,
+): Promise<PdfAcquisition[]> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebookId)}/pdf-acquisitions`);
+}
+
 export async function uploadPdf(
   connection: CoreConnection,
   acquisitionId: string,

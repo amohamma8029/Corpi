@@ -256,6 +256,18 @@ re-verifies reuse holds, and cleans only recorded temporary paths after writers 
 no live writer or resumable owner becomes abandoned after 24 hours without a write. It never deletes
 unexplained files from the objects directory by age alone.
 
+Opening a notebook also discovers its unfinished acquisitions through the authenticated API.
+The core reports whether an attempt can Retry, Cancel, or needs file reselection. The UI restores
+those attempts after restart, including complete input still waiting for cleanup; partial input
+resumes through the same acquisition after reselection rather than creating another action.
+Completed and cancelled receipts remain persisted but are omitted from that unfinished list.
+
+The viewer uses a native modal dialog: background controls cannot receive keyboard focus, and
+closing it restores focus to the opening control. A fatal load error hides the empty page area
+without unmounting its owned canvas. Page-render errors remain separate so another page can render
+and clear the error. Native checks hold the real response/render scheduler at known boundaries to
+exercise cancellation during work; the launcher checks stop/restart during an actual partial upload.
+
 #### Import flow
 
 Read the diagram from top to bottom. The groups are phases of an import, and diamonds are decisions.

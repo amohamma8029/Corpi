@@ -1,12 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import {
   coreHealthWithRetry,
   createNotebook,
+  cancelPdfAcquisition,
+  createPdfAcquisition,
+  getPdfAcquisition,
   listNotebooks,
   listNotebookSources,
+  listPdfAcquisitions,
+  listPdfImports,
+  retryPdfAcquisition,
+  uploadPdf,
+  type PdfAcquisition,
   storageReport,
 } from "./api/client";
 import { App } from "./App";
@@ -21,7 +29,42 @@ vi.mock("./api/client", async (loadActual) => {
     storageReport: vi.fn(),
     createNotebook: vi.fn(),
     listNotebookSources: vi.fn(),
+    listPdfAcquisitions: vi.fn(),
+    listPdfImports: vi.fn(),
+    retryPdfAcquisition: vi.fn(),
+    cancelPdfAcquisition: vi.fn(),
+    getPdfAcquisition: vi.fn(),
+    createPdfAcquisition: vi.fn(),
+    uploadPdf: vi.fn(),
   };
+});
+
+const connection = { base_url: "http://127.0.0.1:4567", token: "launch-token" };
+const notebook = {
+  id: "0f5098ac-4a1b-47a5-9c20-c2ab1dbfcb3c", title: "Field notes",
+  created_at: "2026-09-30T00:00:00.000000Z", updated_at: "2026-09-30T00:00:00.000000Z",
+};
+const savedAttempt: PdfAcquisition = {
+  id: "attempt-1", retry_key: "key-1", notebook_id: notebook.id, intent: "add",
+  target_source_id: null, filename: "saved.pdf", state: "waiting_cleanup", generation: 2,
+  received_size_bytes: 200, expected_size_bytes: 200, input_sha256: "a".repeat(64),
+  planned_managed_file_id: null, outcome_kind: null, source_id: null, import_id: null,
+  failure_code: "file_cleanup_pending", updated_at: notebook.updated_at,
+  can_retry: true, can_cancel: true, requires_upload: false,
+};
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  vi.mocked(invoke).mockResolvedValue(connection);
+  vi.mocked(coreHealthWithRetry).mockResolvedValue({ app: "corpi-core", version: "0.1.0", status: "ok" });
+  vi.mocked(listNotebooks).mockResolvedValue([notebook]);
+  vi.mocked(listNotebookSources).mockResolvedValue([]);
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  vi.mocked(listPdfImports).mockResolvedValue([]);
+  vi.mocked(storageReport).mockResolvedValue({
+    original_file_count: 0, original_bytes: 0, bytes_pending_removal: 0, retained_staging_bytes: 200,
+    max_upload_bytes: 25_000_000, rendered_page_pixel_limit: 20_000_000,
+  });
 });
 
 afterEach(() => {
@@ -84,4 +127,87 @@ it("creates a notebook through the authenticated core client", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Create notebook" }));
 
   await waitFor(() => expect(createNotebook).toHaveBeenCalledWith(connection, "Field notes"));
+});
+
+it("restores complete and partial attempts with the correct recovery controls", async () => {
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([
+    savedAttempt,
+    { ...savedAttempt, id: "partial", filename: "partial.pdf", state: "failed", input_sha256: null,
+      can_retry: false, requires_upload: true, failure_code: "upload_interrupted" },
+  ]);
+  render(<App />);
+  const complete = await screen.findByRole("region", { name: "PDF import status: saved.pdf" });
+  expect(within(complete).getByRole("button", { name: "Retry from saved PDF" })).toBeTruthy();
+  const partial = screen.getByRole("region", { name: "PDF import status: partial.pdf" });
+  expect(within(partial).getByRole("button", { name: "Select PDF again" })).toBeTruthy();
+  expect(within(partial).queryByRole("button", { name: "Retry from saved PDF" })).toBeNull();
+  expect(partial.textContent).toContain("no complete file was saved");
+
+  vi.mocked(cancelPdfAcquisition).mockResolvedValue({ ...savedAttempt, state: "cancelled", can_retry: false, can_cancel: false });
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  fireEvent.click(within(complete).getByRole("button", { name: "Cancel import" }));
+  await waitFor(() => expect(screen.queryByRole("region", { name: "PDF import status: saved.pdf" })).toBeNull());
+  expect(cancelPdfAcquisition).toHaveBeenCalledWith(connection, savedAttempt.id);
+});
+
+it("retries a restored attempt and removes its status after a committed result", async () => {
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([savedAttempt]);
+  vi.mocked(retryPdfAcquisition).mockResolvedValue({ ...savedAttempt, state: "completed", can_retry: false, can_cancel: false });
+  render(<App />);
+  const retry = await screen.findByRole("button", { name: "Retry from saved PDF" });
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  fireEvent.click(retry);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Retry from saved PDF" })).toBeNull());
+  expect(retryPdfAcquisition).toHaveBeenCalledWith(connection, savedAttempt.id);
+});
+
+it("ignores a previous notebook's discovery reply after switching notebooks", async () => {
+  const other = { ...notebook, id: "other-notebook", title: "Other notebook" };
+  vi.mocked(listNotebooks).mockResolvedValue([notebook, other]);
+  let resolveFirst!: (items: PdfAcquisition[]) => void;
+  vi.mocked(listPdfAcquisitions).mockImplementation((_connection, id) => id === notebook.id
+    ? new Promise((resolve) => { resolveFirst = resolve; })
+    : Promise.resolve([{ ...savedAttempt, id: "other-attempt", notebook_id: other.id, filename: "other.pdf" }]));
+  render(<App />);
+  await waitFor(() => expect(listPdfAcquisitions).toHaveBeenCalledWith(connection, notebook.id));
+  fireEvent.change(screen.getByLabelText("Open notebook"), { target: { value: other.id } });
+  await screen.findByRole("region", { name: "PDF import status: other.pdf" });
+  await act(async () => resolveFirst([savedAttempt]));
+  expect(screen.queryByRole("region", { name: "PDF import status: saved.pdf" })).toBeNull();
+  expect(screen.getByRole("region", { name: "PDF import status: other.pdf" })).toBeTruthy();
+});
+
+it("uses fresh persisted state when reopening a notebook after another recovery completed", async () => {
+  const other = { ...notebook, id: "other-notebook", title: "Other notebook" };
+  vi.mocked(listNotebooks).mockResolvedValue([notebook, other]);
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([savedAttempt]);
+  vi.mocked(retryPdfAcquisition).mockRejectedValue(new Error("Still waiting for cleanup"));
+  vi.mocked(getPdfAcquisition).mockResolvedValue(savedAttempt);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry from saved PDF" }));
+  await screen.findByRole("alert");
+  await waitFor(() => expect((screen.getByLabelText("Open notebook") as HTMLSelectElement).disabled).toBe(false));
+  // Maintenance completed the attempt after the failed retry; discovery is now empty.
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  fireEvent.change(screen.getByLabelText("Open notebook"), { target: { value: other.id } });
+  await waitFor(() => expect(listPdfAcquisitions).toHaveBeenCalledWith(connection, other.id));
+  fireEvent.change(screen.getByLabelText("Open notebook"), { target: { value: notebook.id } });
+  await waitFor(() => expect(listPdfAcquisitions).toHaveBeenCalledTimes(3));
+  expect(screen.queryByRole("button", { name: "Retry from saved PDF" })).toBeNull();
+});
+
+it("reselects partial input for the existing attempt instead of creating a second action", async () => {
+  const partial = { ...savedAttempt, id: "partial", filename: "partial.pdf", state: "failed",
+    input_sha256: null, can_retry: false, requires_upload: true, failure_code: "upload_interrupted" };
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([partial]);
+  vi.mocked(getPdfAcquisition).mockResolvedValue(partial);
+  vi.mocked(uploadPdf).mockResolvedValue({ ...partial, state: "completed", requires_upload: false, can_cancel: false });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Select PDF again" }));
+  const file = new File(["%PDF-1.4"], "partial.pdf", { type: "application/pdf" });
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  fireEvent.change(document.querySelector("[data-testid='pdf-file-input']")!, { target: { files: [file] } });
+  await waitFor(() => expect(uploadPdf).toHaveBeenCalledWith(connection, partial.id, file, expect.any(AbortSignal)));
+  expect(createPdfAcquisition).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Select PDF again" })).toBeNull());
 });

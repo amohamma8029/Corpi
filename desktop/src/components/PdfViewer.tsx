@@ -35,9 +35,21 @@ export function PdfViewer({
   const [pageNumber, setPageNumber] = useState(1);
   const [zoom, setZoom] = useState(1);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const renderRef = useRef<RenderTask | null>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const opener = window.document.activeElement;
+    dialog?.showModal();
+    return () => {
+      dialog?.close();
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    };
+  }, []);
 
   useEffect(() => {
     let current = true;
@@ -52,7 +64,8 @@ export function PdfViewer({
     setRenderedPage(null);
     setPageNumber(1);
     setLoading(true);
-    setError(null);
+    setLoadError(null);
+    setRenderError(null);
 
     async function loadPdf() {
       try {
@@ -81,7 +94,7 @@ export function PdfViewer({
         nativeWorker?.terminate();
         if (current && !(cause instanceof DOMException && cause.name === "AbortError")) {
           const message = cause instanceof Error ? cause.message : String(cause);
-          setError(`Couldn't open ${filename}: ${message}`);
+          setLoadError(`Couldn't open ${filename}: ${message}`);
         }
       } finally {
         if (current) setLoading(false);
@@ -109,6 +122,7 @@ export function PdfViewer({
     if (!document) return;
     const activeDocument = document;
     setRenderedPage(null);
+    setRenderError(null);
     let cancelled = false;
     let renderTask: RenderTask | undefined;
 
@@ -134,10 +148,13 @@ export function PdfViewer({
         renderTask = page.render({ canvas, viewport });
         renderRef.current = renderTask;
         await renderTask.promise;
-        if (!cancelled) setRenderedPage({ document: activeDocument, pageNumber, zoom });
+        if (!cancelled) {
+          setRenderError(null);
+          setRenderedPage({ document: activeDocument, pageNumber, zoom });
+        }
       } catch (cause) {
         if (!cancelled && !(cause instanceof Error && cause.name === "RenderingCancelledException")) {
-          setError(cause instanceof Error ? cause.message : "The selected page could not be rendered.");
+          setRenderError(cause instanceof Error ? cause.message : "The selected page could not be rendered.");
         }
       }
     }
@@ -153,7 +170,14 @@ export function PdfViewer({
   const pageCount = document?.numPages ?? 0;
 
   return (
-    <section className="pdf-viewer" aria-label="PDF viewer" data-testid="pdf-viewer">
+    <dialog
+      ref={dialogRef}
+      className="pdf-viewer"
+      aria-label="PDF viewer"
+      aria-modal="true"
+      data-testid="pdf-viewer"
+      onCancel={(event) => { event.preventDefault(); onClose(); }}
+    >
       <header className="pdf-viewer__toolbar">
         <div>
           <h2>{filename}</h2>
@@ -189,18 +213,28 @@ export function PdfViewer({
           <button type="button" onClick={() => setZoom((value) => Math.min(3, value + 0.1))} disabled={!document || zoom >= 3}>
             Zoom in
           </button>
-          <button type="button" onClick={onClose}>Close PDF</button>
+          <button type="button" autoFocus onClick={onClose}>Close PDF</button>
         </div>
       </header>
-      {error ? <p role="alert">{error}</p> : null}
-      {loading ? <p role="status">Verifying and opening the saved copy…</p> : null}
-      <div
-        className="pdf-viewer__page"
-        aria-label={`Page ${pageNumber}`}
-        aria-busy={renderedPage?.document !== document || renderedPage?.pageNumber !== pageNumber || renderedPage?.zoom !== zoom}
-      >
-        <canvas ref={canvasRef} aria-label={`${filename}, page ${pageNumber}`} />
+      <div className="pdf-viewer__content">
+        {loadError ? (
+          <div className="pdf-viewer__message">
+            <h3>The saved PDF could not be opened</h3>
+            <p role="alert">{loadError}</p>
+            <p>The saved original is retained. Close the viewer to return to Files.</p>
+          </div>
+        ) : null}
+        {loading ? <p className="pdf-viewer__message" role="status">Verifying and opening the saved copy…</p> : null}
+        {renderError ? <p className="pdf-viewer__message" role="alert">{renderError}</p> : null}
+        <div
+          className="pdf-viewer__page"
+          hidden={loading || loadError !== null}
+          aria-label={`Page ${pageNumber}`}
+          aria-busy={document !== null && (renderedPage?.document !== document || renderedPage?.pageNumber !== pageNumber || renderedPage?.zoom !== zoom)}
+        >
+          <canvas ref={canvasRef} aria-label={`${filename}, page ${pageNumber}`} />
+        </div>
       </div>
-    </section>
+    </dialog>
   );
 }

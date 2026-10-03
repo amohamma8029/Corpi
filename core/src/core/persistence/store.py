@@ -260,6 +260,18 @@ class PersistenceStore:
             ).fetchall()
             return tuple(_pdf_acquisition(row) for row in rows)
 
+    def list_unfinished_pdf_acquisitions(self, notebook_id: str) -> tuple[PdfAcquisition, ...]:
+        """Discover saved attempts without exposing another notebook's work or replay receipts."""
+        validate_id(notebook_id)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM pdf_acquisitions
+                   WHERE notebook_id=? AND state NOT IN ('completed','cancelled')
+                   ORDER BY created_at,id""",
+                (notebook_id,),
+            ).fetchall()
+            return tuple(_pdf_acquisition(row) for row in rows)
+
     def begin_pdf_upload(self, acquisition_id: str, owner_instance_id: str) -> PdfAcquisition:
         validate_id(acquisition_id)
         owner_instance_id = _required_text(owner_instance_id, "owner instance id")
