@@ -6,10 +6,22 @@ Raw PDF assembly (no generator dependency), byte-stable for identical inputs —
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 PAGE_WIDTH = 612.0
 PAGE_HEIGHT = 792.0
 
 IMAGE_RGB_2X2 = bytes([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255])
+
+
+@dataclass(frozen=True, slots=True)
+class PageSpec:
+    content: bytes
+    helvetica: bool = False
+    cid: bool = False
+    image: bool = False
+    rotate: int = 0
+    cropbox: tuple[float, float, float, float] | None = None
 
 
 def native_text_stream(text: str, *, x: float = 72, y: float = 720, size: int = 24) -> bytes:
@@ -31,8 +43,8 @@ def image_draw_stream(
     return f"q {width} 0 0 {height} {x} {y} cm /Im1 Do Q".encode("ascii")
 
 
-def build_pdf(pages: list[tuple[bytes, bool, bool, bool]]) -> bytes:
-    """Assemble pages of (content_stream, needs_helvetica, needs_cid_font, needs_image)."""
+def build_pdf(pages: list[PageSpec]) -> bytes:
+    """Assemble pages from specs (object 1 catalog, object 2 pages tree)."""
     objects: dict[int, bytes] = {}
     next_id = 3
 
@@ -65,16 +77,17 @@ def build_pdf(pages: list[tuple[bytes, bool, bool, bool]]) -> bytes:
     )
 
     page_ids: list[int] = []
-    for content, needs_helvetica, needs_cid, needs_image in pages:
+    for spec in pages:
         fonts = b""
-        if needs_helvetica:
+        if spec.helvetica:
             fonts += b" /F1 " + f"{helvetica_id} 0 R".encode()
-        if needs_cid:
+        if spec.cid:
             fonts += b" /F2 " + f"{type0_id} 0 R".encode()
         resources = b"<< /Font <<" + fonts + b" >>"
-        if needs_image:
+        if spec.image:
             resources += b" /XObject << /Im1 " + f"{image_id} 0 R".encode() + b" >>"
         resources += b" >>"
+        content = spec.content
         stream_body = (
             b"<< /Length "
             + str(len(content)).encode()
@@ -83,17 +96,20 @@ def build_pdf(pages: list[tuple[bytes, bool, bool, bool]]) -> bytes:
             + b"\nendstream"
         )
         content_id = add(stream_body)
-        page_ids.append(
-            add(
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 "
-                + f"{PAGE_WIDTH:g} {PAGE_HEIGHT:g}".encode()
-                + b"] /Contents "
-                + f"{content_id} 0 R".encode()
-                + b" /Resources "
-                + resources
-                + b" >>"
-            )
+        page_dict = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 "
+            + f"{PAGE_WIDTH:g} {PAGE_HEIGHT:g}".encode()
+            + b"]"
         )
+        if spec.cropbox is not None:
+            x0, y0, x1, y1 = spec.cropbox
+            page_dict += b" /CropBox [" + f"{x0:g} {y0:g} {x1:g} {y1:g}".encode() + b"]"
+        if spec.rotate:
+            page_dict += b" /Rotate " + str(spec.rotate).encode()
+        page_dict += (
+            b" /Contents " + f"{content_id} 0 R".encode() + b" /Resources " + resources + b" >>"
+        )
+        page_ids.append(add(page_dict))
 
     kids = b"[" + b" ".join(f"{obj_id} 0 R".encode() for obj_id in page_ids) + b"]"
     objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
@@ -118,21 +134,52 @@ def build_pdf(pages: list[tuple[bytes, bool, bool, bool]]) -> bytes:
 
 
 def native_text_pdf(*texts: str) -> bytes:
-    return build_pdf([(native_text_stream(text), True, False, False) for text in texts])
+    return build_pdf([PageSpec(native_text_stream(text), helvetica=True) for text in texts])
 
 
 def undecodable_text_pdf() -> bytes:
-    return build_pdf([(undecodable_stream(), False, True, False)])
+    return build_pdf([PageSpec(undecodable_stream(), cid=True)])
 
 
 def image_only_pdf() -> bytes:
-    return build_pdf([(image_draw_stream(), False, False, True)])
+    return build_pdf([PageSpec(image_draw_stream(), image=True)])
 
 
 def scanned_page_number_pdf() -> bytes:
     content = image_draw_stream() + b"\n" + page_number_stream(3)
-    return build_pdf([(content, True, False, True)])
+    return build_pdf([PageSpec(content, helvetica=True, image=True)])
 
 
 def blank_pdf() -> bytes:
-    return build_pdf([(b"", False, False, False)])
+    return build_pdf([PageSpec(b"")])
+
+
+def rotated_text_pdf(text: str, rotate: int) -> bytes:
+    return build_pdf([PageSpec(native_text_stream(text), helvetica=True, rotate=rotate)])
+
+
+def cropped_text_pdf(
+    text: str,
+    cropbox: tuple[float, float, float, float],
+    *,
+    rotate: int = 0,
+    x: float = 150,
+    y: float = 300,
+) -> bytes:
+    return build_pdf(
+        [
+            PageSpec(
+                native_text_stream(text, x=x, y=y),
+                helvetica=True,
+                rotate=rotate,
+                cropbox=cropbox,
+            )
+        ]
+    )
+
+
+def two_column_pdf(left: str, right: str) -> bytes:
+    content = (
+        native_text_stream(left, x=72, y=600) + b"\n" + native_text_stream(right, x=350, y=600)
+    )
+    return build_pdf([PageSpec(content, helvetica=True)])

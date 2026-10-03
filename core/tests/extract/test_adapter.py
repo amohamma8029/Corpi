@@ -5,6 +5,7 @@ import math
 
 from pdf_fixtures import (
     IMAGE_RGB_2X2,
+    PageSpec,
     blank_pdf,
     build_pdf,
     image_draw_stream,
@@ -49,7 +50,7 @@ def test_undecodable_glyph_runs_never_count_as_extracted_text() -> None:
 
 def test_unmapped_tokens_count_at_the_parser_boundary() -> None:
     content = b"BT /F1 24 Tf 72 720 Td (Hi) Tj ET\nBT /F2 24 Tf 200 720 Td <00010002> Tj ET"
-    pages = extract_all(build_pdf([(content, True, True, False)]))
+    pages = extract_all(build_pdf([PageSpec(content, helvetica=True, cid=True)]))
     metrics = pages[0].metrics
     assert metrics.text_drawn is True
     assert metrics.extracted_chars == 2
