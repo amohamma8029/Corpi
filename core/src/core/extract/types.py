@@ -7,6 +7,9 @@ Metrics follow the ticket's definitions exactly:
   unmapped-glyph tokens are excluded.
 - `unmapped_ratio`: unmapped tokens divided by total glyph runs, counted at the parser boundary.
 - `image_area_ratio`: fraction of the displayed page area covered by image/figure placements.
+
+`PageFrame` carries the page geometry needed to convert layout boxes into the displayed
+CropBox frame; `image_boxes` are the raw image/figure placements kept as visual metadata.
 """
 
 from __future__ import annotations
@@ -30,7 +33,16 @@ class PageMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class PageFrame:
+    cropbox: tuple[float, float, float, float]
+    mediabox: tuple[float, float, float, float]
+    rotation: int
+
+
+@dataclass(frozen=True, slots=True)
 class PageExtraction:
     page_number: int
     blocks: tuple[ExtractedBlock, ...]
     metrics: PageMetrics
+    frame: PageFrame
+    image_boxes: tuple[tuple[float, float, float, float], ...]

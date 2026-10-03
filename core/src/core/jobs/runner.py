@@ -79,6 +79,7 @@ STEP_POLICIES: dict[str, StepPolicy] = {
     "model_call": StepPolicy(120.0, 3, 2.0),
     "ocr_page": StepPolicy(60.0, 2, 1.0, backoff_max_seconds=5.0),
     "parse": StepPolicy(300.0, 2, 2.0),
+    "extract": StepPolicy(600.0, 2, 2.0),
     "embedding_batch": StepPolicy(120.0, 2, 2.0),
     "index_build": StepPolicy(300.0, 2, 2.0),
     "file_write": StepPolicy(60.0, 2, 1.0, backoff_max_seconds=10.0),
