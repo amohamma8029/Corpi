@@ -30,6 +30,10 @@ declare global {
       canvas: HTMLCanvasElement | null;
       errors: string[];
       cspViolations: string[];
+      fetchHeld: boolean;
+      fetchAborted: boolean;
+      renderHeld: boolean;
+      releaseWork?: () => void;
     };
   }
 }
@@ -37,7 +41,7 @@ declare global {
 const results = process.env.CORPI_E2E_RESULTS ?? path.resolve("e2e-results");
 const textPdf: PdfFixture = { filename: "native-text.pdf", kind: "text" };
 const rasterPdf: PdfFixture = { filename: "native-raster.pdf", kind: "raster" };
-const invalidPdf: PdfFixture = { filename: "native-invalid.pdf", kind: "invalid" };
+const invalidPdf: PdfFixture = { filename: `native-invalid-${"x".repeat(180)}.pdf`, kind: "invalid" };
 const evidence: Record<string, unknown> = { fixtures: [], observations: [] };
 const firstPageColor = [51, 128, 204];
 const secondPageColor = [204, 51, 77];
@@ -136,15 +140,30 @@ async function openPdf(filename: string) {
   await browser.waitUntil(async () => (await viewerSnapshot()).filename === filename, {
     timeout: 15000, timeoutMsg: `The visible PDF viewer did not identify ${filename}`,
   });
+  await browser.waitUntil(() => browser.execute(() => {
+    const viewer = document.querySelector("[data-testid='pdf-viewer']");
+    return viewer?.matches(":modal") && viewer.contains(document.activeElement);
+  }), { timeout: 5000, timeoutMsg: "Opening the PDF did not move focus into a modal viewer" });
 }
 
-async function closePdf() {
-  await $("[data-testid='pdf-viewer']").$("button=Close PDF").click();
+async function closePdf(viaCancel = false) {
+  if (viaCancel && process.env.CORPI_E2E_PROVIDER === "embedded") {
+    // This provider dispatches untrusted KeyboardEvents, which cannot trigger
+    // native Escape dismissal. Exercise the browser's actual cancel API instead.
+    await browser.execute(() => {
+      document.querySelector<HTMLDialogElement>("[data-testid='pdf-viewer']")!.requestClose();
+    });
+  } else if (viaCancel) await browser.keys("Escape");
+  else await $("[data-testid='pdf-viewer']").$("button=Close PDF").click();
   await browser.waitUntil(async () => {
     const snapshot = await viewerSnapshot();
     return !snapshot.filename && snapshot.activeWorkers === 0 && snapshot.clearedCanvas;
   }, { timeout: 15000, timeoutMsg: "Closing the PDF did not release its worker and canvas" });
   record("closed", await viewerSnapshot());
+  await browser.waitUntil(() => browser.execute(() => {
+    const focused = document.activeElement;
+    return focused?.closest(".import-list") !== null && focused?.textContent === "Open";
+  }), { timeout: 5000, timeoutMsg: "Closing the viewer did not restore focus to its Open button" });
 }
 
 describe("Corpi native notebook and PDF workflow", () => {
@@ -175,6 +194,7 @@ describe("Corpi native notebook and PDF workflow", () => {
       const observation: Window["__corpiE2E"] = {
         activeWorkers: new Set(), startedWorkers: 0, terminatedWorkers: 0,
         canvas: null, errors: [], cspViolations: [],
+        fetchHeld: false, fetchAborted: false, renderHeld: false,
       };
       window.__corpiE2E = observation;
       const NativeWorker = window.Worker;
@@ -193,6 +213,8 @@ describe("Corpi native notebook and PDF workflow", () => {
       document.addEventListener("securitypolicyviolation", (event) => {
         observation.cspViolations.push(event.violatedDirective);
       });
+      window.addEventListener("error", (event) => observation.errors.push(event.message));
+      window.addEventListener("unhandledrejection", () => observation.errors.push("Unhandled rejection"));
       return { userAgent: navigator.userAgent, origin: location.origin, devicePixelRatio: devicePixelRatio };
     });
     record("native-platform", { ...platform, capabilities: browser.capabilities });
@@ -206,6 +228,26 @@ describe("Corpi native notebook and PDF workflow", () => {
     await importPdf(textPdf);
     await openPdf(textPdf.filename);
     const first = await waitForPage(firstPageColor);
+    const inertBackground = await browser.execute(() => {
+      document.querySelector<HTMLInputElement>("#new-notebook-title")!.focus();
+      return document.querySelector("[data-testid='pdf-viewer']")!.contains(document.activeElement);
+    });
+    await expect(inertBackground).toBe(true);
+    const nativeKeys = process.env.CORPI_E2E_PROVIDER !== "embedded";
+    if (nativeKeys) {
+      for (const name of ["Page number", "Next page", "Zoom out", "Zoom in", "Close PDF", "Page number"]) {
+        await browser.keys("Tab");
+        const focused = await browser.execute(() => ({
+          insideViewer: document.querySelector("[data-testid='pdf-viewer']")!.contains(document.activeElement),
+          name: document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.textContent?.trim(),
+        }));
+        await expect(focused).toEqual({ insideViewer: true, name });
+      }
+    }
+    record("modal-keyboard-focus", {
+      backgroundFocusBlocked: inertBackground, trustedTabSteps: nativeKeys ? 6 : 0,
+      keyboardCoverage: nativeKeys ? "native key input" : "embedded keys are synthetic; modal focus/inert/cancel API checked",
+    });
     await expect(first.activeWorkers).toBe(1);
     await expect(matchesPage(first, secondPageColor)).toBe(false); // stale page control
     const blank = await browser.execute(() => {
@@ -260,11 +302,92 @@ describe("Corpi native notebook and PDF workflow", () => {
     await closePdf();
   });
 
-  it("shows a renderer failure while retaining the saved original", async () => {
+  it("closes during a real fetch and render, releases work, and reopens first try", async () => {
+    await browser.execute(() => {
+      const observation = window.__corpiE2E;
+      const nativeFetch = window.fetch;
+      let release: (() => void) | undefined;
+      observation.fetchHeld = false;
+      observation.fetchAborted = false;
+      window.fetch = async (input, init) => {
+        const response = await nativeFetch(input, init);
+        if (String(input).endsWith("/pdf")) {
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => {
+              observation.fetchAborted = true;
+              reject(new DOMException("Viewer closed", "AbortError"));
+            };
+            release = () => { init?.signal?.removeEventListener("abort", abort); resolve(); };
+            init?.signal?.addEventListener("abort", abort, { once: true });
+            observation.fetchHeld = true;
+            if (init?.signal?.aborted) abort();
+          });
+        }
+        return response;
+      };
+      observation.releaseWork = () => { window.fetch = nativeFetch; release?.(); };
+    });
+    await openPdf(rasterPdf.filename);
+    await browser.waitUntil(() => browser.execute(() => window.__corpiE2E.fetchHeld),
+      { timeout: 15000, timeoutMsg: "The real PDF response never reached the controlled fetch boundary" });
+    await expect($("[data-testid='pdf-viewer'] [role='status']")).toBeDisplayed();
+    record("close-during-fetch", await viewerSnapshot());
+    await closePdf();
+    await expect(await browser.execute(() => window.__corpiE2E.fetchAborted)).toBe(true);
+    await browser.execute(() => window.__corpiE2E.releaseWork?.());
+
+    await openPdf(rasterPdf.filename);
+    await waitForPage(rasterColor);
+    await browser.execute(() => {
+      const observation = window.__corpiE2E;
+      const nativeFrame = window.requestAnimationFrame;
+      const pending: Array<() => void> = [];
+      observation.renderHeld = false;
+      window.requestAnimationFrame = (callback) => nativeFrame((timestamp) => {
+        if (document.querySelector(".pdf-viewer__page")?.getAttribute("aria-busy") === "true") {
+          pending.push(() => callback(timestamp));
+          observation.renderHeld = true;
+        } else callback(timestamp);
+      });
+      observation.releaseWork = () => {
+        window.requestAnimationFrame = nativeFrame;
+        for (const callback of pending) callback();
+      };
+    });
+    await $("[data-testid='pdf-viewer']").$("button=Zoom in").click();
+    await browser.waitUntil(async () => {
+      const held = await browser.execute(() => window.__corpiE2E.renderHeld);
+      const snapshot = await viewerSnapshot();
+      return held && snapshot.rendering && snapshot.width > 0 && snapshot.activeWorkers === 1;
+    }, { timeout: 15000, timeoutMsg: "The real renderer never reached the controlled animation-frame boundary" });
+    record("close-during-render", await viewerSnapshot());
+    await closePdf();
+    await browser.execute(() => window.__corpiE2E.releaseWork?.());
+    await openPdf(rasterPdf.filename);
+    record("reopened-after-cancel", await waitForPage(rasterColor));
+    await closePdf(true);
+    await expect(await browser.execute(() => window.__corpiE2E.errors)).toEqual([]);
+  });
+
+  it("shows a readable load failure while retaining the saved original", async () => {
     await importPdf(invalidPdf);
     await openPdf(invalidPdf.filename);
     await $("[data-testid='pdf-viewer'] [role='alert']").waitForDisplayed({ timeout: 30000 });
     await expect($("[data-testid='pdf-viewer'] [role='alert']")).toHaveText(/Couldn't open/);
+    const layout = await browser.execute(() => {
+      const viewer = document.querySelector("[data-testid='pdf-viewer']")!;
+      const message = viewer.querySelector<HTMLElement>(".pdf-viewer__message")!;
+      const page = viewer.querySelector<HTMLElement>(".pdf-viewer__page")!;
+      const rect = message.getBoundingClientRect();
+      return {
+        pageHidden: page.hidden && page.getClientRects().length === 0,
+        wraps: getComputedStyle(message).overflowWrap === "anywhere",
+        boundedWidth: rect.width <= viewer.getBoundingClientRect().width,
+        noHorizontalOverflow: message.scrollWidth <= message.clientWidth,
+      };
+    });
+    await expect(layout).toEqual({ pageHidden: true, wraps: true, boundedWidth: true, noHorizontalOverflow: true });
+    record("fatal-load-layout", layout);
     record("invalid-pdf-error", await viewerSnapshot());
     await browser.saveScreenshot(path.join(results, "invalid-pdf-error.png"));
     await closePdf();

@@ -240,12 +240,24 @@ main.app-shell {
 
 .pdf-viewer {
   position: fixed;
-  z-index: 5;
   inset: 1rem;
-  display: grid;
+  width: calc(100% - 2rem);
+  height: calc(100% - 2rem);
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  color: inherit;
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
-  box-shadow: 0 0 0 100vmax rgb(20 25 35 / 55%);
+}
+
+.pdf-viewer[open] {
+  display: grid;
+}
+
+.pdf-viewer::backdrop {
+  background: rgb(20 25 35 / 55%);
 }
 
 .pdf-viewer__toolbar {
@@ -277,12 +289,20 @@ main.app-shell {
   width: 4.5rem;
 }
 
-.pdf-viewer > [role="alert"],
-.pdf-viewer > [role="status"] {
-  margin: 0.7rem 1rem;
+.pdf-viewer__content {
+  min-height: 0;
+  overflow: auto;
+}
+
+.pdf-viewer__message {
+  max-width: 65ch;
+  margin: 1.5rem auto;
+  padding: 0 1.5rem;
+  overflow-wrap: anywhere;
 }
 
 .pdf-viewer__page {
+  height: 100%;
   overflow: auto;
   padding: 1rem;
   background: #626a76;

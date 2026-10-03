@@ -43,6 +43,9 @@ class AcquisitionPayload(BaseModel):
     import_id: str | None
     failure_code: str | None
     updated_at: str
+    can_retry: bool
+    can_cancel: bool
+    requires_upload: bool
 
 
 class ImportPayload(BaseModel):
@@ -95,6 +98,11 @@ def _service(request: Request) -> PdfIngestService:
 
 
 def _acquisition_payload(item: PdfAcquisition) -> AcquisitionPayload:
+    terminal_failure = item.failure_code in (
+        "integrity_failure",
+        "integrity_conflict",
+        "source_deleted",
+    )
     return AcquisitionPayload(
         id=item.id,
         retry_key=item.retry_key,
@@ -113,6 +121,17 @@ def _acquisition_payload(item: PdfAcquisition) -> AcquisitionPayload:
         import_id=item.outcome_import_id,
         failure_code=item.failure_code,
         updated_at=item.updated_at,
+        can_retry=(
+            item.input_complete_at is not None
+            and item.state in ("staged", "finalizing", "waiting_cleanup", "failed")
+            and not terminal_failure
+        ),
+        can_cancel=item.state not in ("completed", "cancelled"),
+        requires_upload=(
+            item.input_complete_at is None
+            and item.state in ("awaiting_upload", "failed")
+            and not terminal_failure
+        ),
     )
 
 
@@ -142,6 +161,19 @@ def create_acquisition(
     except PdfImportError as error:
         _raise_pdf_error(error)
     return _acquisition_payload(result)
+
+
+@router.get("/notebooks/{notebook_id}/pdf-acquisitions", response_model=list[AcquisitionPayload])
+def list_unfinished_acquisitions(notebook_id: str, request: Request) -> list[AcquisitionPayload]:
+    store = _store(request)
+    try:
+        store.load_notebook(notebook_id)
+        return [
+            _acquisition_payload(item)
+            for item in store.list_unfinished_pdf_acquisitions(notebook_id)
+        ]
+    except (PersistenceError, ValueError) as error:
+        raise HTTPException(status_code=404, detail="notebook does not exist") from error
 
 
 @router.get("/pdf-acquisitions/{acquisition_id}", response_model=AcquisitionPayload)

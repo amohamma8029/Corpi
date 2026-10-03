@@ -102,6 +102,57 @@ def acquire(client: TestClient, notebook_id: str, retry_key: str, content: bytes
     return uploaded.json()
 
 
+def test_unfinished_pdf_attempts_are_authenticated_scoped_and_truthful(app_client) -> None:
+    client, store, database = app_client
+    notebook_a = store.create_notebook(new_id(), "Interrupted imports")
+    notebook_b = store.create_notebook(new_id(), "Other notebook")
+    path = f"/notebooks/{notebook_a.id}/pdf-acquisitions"
+    partial = store.create_pdf_acquisition(
+        "partial", notebook_a.id, "add", "partial.pdf", "core-test"
+    )
+    receiving = store.begin_pdf_upload(partial.id, "core-test")
+    with ManagedPdfFiles(database.config.data_dir).open_staging(
+        receiving.staging_relative_path
+    ) as stage:
+        stage.write(b"%PDF-partial")
+    client.app.state.pdf_ingest.reconcile_startup()
+    store.create_pdf_acquisition("other", notebook_b.id, "add", "other.pdf", "core-test")
+    cancelled = store.create_pdf_acquisition(
+        "cancelled", notebook_a.id, "add", "cancelled.pdf", "core-test"
+    )
+    client.post(f"/pdf-acquisitions/{cancelled.id}/cancel", headers=auth_headers())
+    acquire(client, notebook_a.id, "completed", minimal_pdf("completed"))
+
+    assert client.get(path).status_code == 401
+    assert (
+        client.get(f"/notebooks/{new_id()}/pdf-acquisitions", headers=auth_headers()).status_code
+        == 404
+    )
+    response = client.get(path, headers=auth_headers())
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    attempt = response.json()[0]
+    assert attempt["id"] == partial.id
+    assert attempt["state"] == "failed"
+    assert attempt["failure_code"] == "upload_interrupted"
+    assert attempt["requires_upload"] is True
+    assert attempt["can_retry"] is False
+    assert attempt["can_cancel"] is True
+    assert attempt["input_sha256"] is None
+    assert "staging_relative_path" not in attempt
+    # File reselection resumes the same intent instead of creating a second attempt.
+    content = minimal_pdf("reselected")
+    resumed = client.put(
+        f"/pdf-acquisitions/{partial.id}/content",
+        headers={**auth_headers(), "Content-Type": "application/pdf"},
+        content=content,
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["id"] == partial.id
+    assert resumed.json()["state"] == "completed"
+    assert client.get(path, headers=auth_headers()).json() == []
+
+
 def publish_pdf_import(store: PersistenceStore, source_id: str, import_id: str) -> None:
     item = store.load_pdf_import(import_id)
     timestamp = utc_timestamp()
@@ -1041,6 +1092,22 @@ def test_import_blocked_by_failed_removal_retries_saved_input_after_cleanup(
 
     ingest.reconcile_startup()
     assert (database.config.data_dir / current.staging_relative_path).is_file()
+    reopened = create_app(
+        TOKEN,
+        allowed_origins=(ORIGIN,),
+        store=store,
+        pdf_ingest=PdfIngestService(store, "core-reopened"),
+    )
+    with TestClient(reopened, base_url="http://127.0.0.1") as reopened_client:
+        restored = reopened_client.get(
+            f"/notebooks/{new_notebook['id']}/pdf-acquisitions", headers=auth_headers()
+        ).json()
+        assert len(restored) == 1
+        assert restored[0]["id"] == current.id
+        assert restored[0]["state"] == "waiting_cleanup"
+        assert restored[0]["can_retry"] is True
+        assert restored[0]["can_cancel"] is True
+        assert restored[0]["requires_upload"] is False
     monkeypatch.setattr(type(saved_path), "unlink", original_unlink)
     assert sweeper.sweep_once() == (first["source_id"],)
 

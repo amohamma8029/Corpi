@@ -12,6 +12,7 @@ import {
   getPdfAcquisition,
   listNotebookSources,
   listNotebooks,
+  listPdfAcquisitions,
   listPdfImports,
   Notebook,
   NotebookSource,
@@ -53,10 +54,11 @@ export function App() {
   const [imports, setImports] = useState<PdfImport[]>([]);
   const [storage, setStorage] = useState<StorageReport | null>(null);
   const [acquisition, setAcquisition] = useState<PdfAcquisition | null>(null);
+  const [savedAcquisitions, setSavedAcquisitions] = useState<PdfAcquisition[]>([]);
   const [uploading, setUploading] = useState(false);
   const [viewerImport, setViewerImport] = useState<PdfImport | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const nextIntentRef = useRef<{ intent: ImportIntent; sourceId?: string }>({ intent: "add" });
+  const nextIntentRef = useRef<{ intent: ImportIntent; sourceId?: string; acquisitionId?: string }>({ intent: "add" });
   const uploadControllerRef = useRef<AbortController | null>(null);
   const acquisitionIdRef = useRef("");
 
@@ -103,16 +105,23 @@ export function App() {
   }, [connection]);
 
   useEffect(() => {
+    setAcquisition(null);
     if (!connection || !selectedNotebookId) {
       setSources([]);
+      setSavedAcquisitions([]);
       setSelectedSourceId("");
       return;
     }
     let cancelled = false;
-    void listNotebookSources(connection, selectedNotebookId)
-      .then((items) => {
+    setSavedAcquisitions([]);
+    void Promise.all([
+      listNotebookSources(connection, selectedNotebookId),
+      listPdfAcquisitions(connection, selectedNotebookId),
+    ])
+      .then(([items, attempts]) => {
         if (cancelled) return;
         setSources(items);
+        setSavedAcquisitions(attempts);
         setSelectedSourceId((selected) =>
           items.some((item) => item.id === selected) ? selected : items[0]?.id || "",
         );
@@ -145,21 +154,35 @@ export function App() {
 
   useEffect(() => {
     if (!connection || !acquisition || !uploading) return;
+    let cancelled = false;
     const timer = window.setInterval(() => {
       void getPdfAcquisition(connection, acquisition.id)
-        .then((latest) => setAcquisition(latest))
+        .then((latest) => { if (!cancelled) rememberAcquisition(latest); })
         .catch(() => undefined);
     }, 180);
-    return () => window.clearInterval(timer);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, [acquisition?.id, connection, uploading]);
 
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? null;
+  const visibleAcquisitions = [
+    ...savedAcquisitions.filter((item) => item.id !== acquisition?.id),
+    ...(acquisition ? [acquisition] : []),
+  ].filter((item) => item.notebook_id === selectedNotebookId && item.state !== "completed" && item.state !== "cancelled");
+
+  function rememberAcquisition(item: PdfAcquisition) {
+    setAcquisition(item);
+    setSavedAcquisitions((items) => [
+      ...items.filter((saved) => saved.id !== item.id),
+      ...(item.state === "completed" || item.state === "cancelled" ? [] : [item]),
+    ]);
+  }
 
   async function refreshNotebook(notebookId: string, preferredSourceId?: string) {
     if (!connection) return;
-    const [sourceItems, report] = await Promise.all([
+    const [sourceItems, report, attempts] = await Promise.all([
       listNotebookSources(connection, notebookId),
       storageReport(connection),
+      listPdfAcquisitions(connection, notebookId),
     ]);
     setSources(sourceItems);
     setSelectedSourceId((selected) => {
@@ -169,6 +192,7 @@ export function App() {
       return sourceItems.some((item) => item.id === selected) ? selected : sourceItems[0]?.id || "";
     });
     setStorage(report);
+    setSavedAcquisitions(attempts);
   }
 
   async function submitNotebook(event: React.FormEvent<HTMLFormElement>) {
@@ -186,9 +210,9 @@ export function App() {
     }
   }
 
-  function choosePdf(intent: ImportIntent, sourceId?: string) {
+  function choosePdf(intent: ImportIntent, sourceId?: string, acquisitionId?: string) {
     if (!selectedNotebookId || uploading) return;
-    nextIntentRef.current = { intent, sourceId };
+    nextIntentRef.current = { intent, sourceId, acquisitionId };
     fileInputRef.current?.click();
   }
 
@@ -196,26 +220,28 @@ export function App() {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
     if (!file || !connection || !selectedNotebookId) return;
-    await importPdf(file, nextIntentRef.current.intent, nextIntentRef.current.sourceId);
+    await importPdf(file, nextIntentRef.current.intent, nextIntentRef.current.sourceId, nextIntentRef.current.acquisitionId);
   }
 
-  async function importPdf(file: File, intent: ImportIntent, targetSourceId?: string) {
+  async function importPdf(file: File, intent: ImportIntent, targetSourceId?: string, resumeId?: string) {
     if (!connection || uploading) return;
     setUploading(true);
     setError(null);
     const controller = new AbortController();
     uploadControllerRef.current = controller;
+    acquisitionIdRef.current = resumeId ?? "";
     try {
-      const action = await createPdfAcquisition(connection, selectedNotebookId, {
+      const action = resumeId ? await getPdfAcquisition(connection, resumeId) : await createPdfAcquisition(connection, selectedNotebookId, {
         retry_key: crypto.randomUUID(),
         filename: file.name || "import.pdf",
         intent,
         ...(targetSourceId ? { target_source_id: targetSourceId } : {}),
       });
-      setAcquisition(action);
+      if (action.notebook_id !== selectedNotebookId) throw new Error("This import belongs to another notebook.");
+      rememberAcquisition(action);
       acquisitionIdRef.current = action.id;
       const saved = await uploadPdf(connection, action.id, file, controller.signal);
-      setAcquisition(saved);
+      rememberAcquisition(saved);
       if (saved.source_id) setSelectedSourceId(saved.source_id);
       await refreshNotebook(selectedNotebookId, saved.source_id ?? undefined);
       setError(null);
@@ -224,7 +250,7 @@ export function App() {
       if (acquisitionIdRef.current) {
         void getPdfAcquisition(connection, acquisitionIdRef.current)
           .then(async (latest) => {
-            setAcquisition(latest);
+            rememberAcquisition(latest);
             if (latest.state === "completed") {
               if (latest.source_id) setSelectedSourceId(latest.source_id);
               await refreshNotebook(selectedNotebookId,latest.source_id ?? undefined);
@@ -238,28 +264,31 @@ export function App() {
     }
   }
 
-  async function retryImport() {
-    if (!connection || !acquisition) return;
+  async function retryImport(item: PdfAcquisition) {
+    if (!connection || uploading || !item.can_retry) return;
+    rememberAcquisition(item);
     setUploading(true);
     setError(null);
     try {
-      const saved = await retryPdfAcquisition(connection, acquisition.id);
-      setAcquisition(saved);
+      const saved = await retryPdfAcquisition(connection, item.id);
+      rememberAcquisition(saved);
       if (saved.source_id) setSelectedSourceId(saved.source_id);
       if (selectedNotebookId) await refreshNotebook(selectedNotebookId);
     } catch (cause) {
       setError(messageFor(cause));
+      rememberAcquisition(await getPdfAcquisition(connection, item.id).catch(() => item));
     } finally {
       setUploading(false);
     }
   }
 
-  async function cancelImport() {
-    if (!connection || !acquisition) return;
-    uploadControllerRef.current?.abort();
+  async function cancelImport(item: PdfAcquisition) {
+    if (!connection || !item.can_cancel) return;
+    if (item.id === acquisitionIdRef.current) uploadControllerRef.current?.abort();
     try {
-      setAcquisition(await cancelPdfAcquisition(connection, acquisition.id));
-      setUploading(false);
+      rememberAcquisition(await cancelPdfAcquisition(connection, item.id));
+      if (item.id === acquisitionIdRef.current) setUploading(false);
+      if (selectedNotebookId) await refreshNotebook(selectedNotebookId);
     } catch (cause) {
       setError(messageFor(cause));
     }
@@ -339,6 +368,7 @@ export function App() {
             <select
               id="notebook-select"
               value={selectedNotebookId}
+              disabled={uploading}
               onChange={(event) => setSelectedNotebookId(event.currentTarget.value)}
             >
               <option value="">Choose a notebook</option>
@@ -355,7 +385,7 @@ export function App() {
                 maxLength={200}
                 required
               />
-              <button id="create-notebook" type="submit">Create notebook</button>
+              <button id="create-notebook" type="submit" disabled={uploading}>Create notebook</button>
             </form>
             {selectedNotebookId ? (
               <>
@@ -429,7 +459,7 @@ export function App() {
                         </div>
                         <button
                           type="button"
-                          onClick={() => setViewerImport(item)}
+                          onClick={(event) => { event.currentTarget.focus(); setViewerImport(item); }}
                           disabled={item.trashed}
                         >
                           Open
@@ -461,25 +491,31 @@ export function App() {
               </div>
             )}
 
-            {acquisition && (uploading || acquisition.state !== "completed") ? (
-              <section className="acquisition-status" aria-label="PDF import status" aria-live="polite">
-                <h3>{acquisition.filename}</h3>
-                <p>{acquisitionStatus(acquisition, uploading)}</p>
-                {uploading ? (
-                  <progress
-                    max={Math.max(acquisition.expected_size_bytes ?? 1, 1)}
-                    value={acquisition.received_size_bytes}
-                    aria-label="PDF upload progress"
-                  />
-                ) : null}
-                {acquisition.input_sha256 && acquisition.state !== "completed" ? (
-                  <button type="button" onClick={retryImport}>Retry from saved PDF</button>
-                ) : null}
-                {uploading || ["awaiting_upload", "receiving", "staged", "finalizing"].includes(acquisition.state) ? (
-                  <button type="button" onClick={cancelImport}>Cancel import</button>
-                ) : null}
-              </section>
-            ) : null}
+            {visibleAcquisitions.map((item) => {
+              const activeUpload = uploading && item.id === acquisition?.id;
+              return (
+                <section key={item.id} className="acquisition-status" aria-label={`PDF import status: ${item.filename}`} aria-live="polite">
+                  <h3>{item.filename}</h3>
+                  <p>{acquisitionStatus(item, activeUpload)}</p>
+                  {activeUpload ? (
+                    <progress
+                      max={Math.max(item.expected_size_bytes ?? 1, 1)}
+                      value={item.received_size_bytes}
+                      aria-label="PDF upload progress"
+                    />
+                  ) : null}
+                  {item.can_retry ? (
+                    <button type="button" disabled={uploading} onClick={() => void retryImport(item)}>Retry from saved PDF</button>
+                  ) : null}
+                  {item.requires_upload ? (
+                    <button type="button" disabled={uploading} onClick={() => choosePdf(item.intent === "replace" ? "replace" : "add", item.target_source_id ?? undefined, item.id)}>Select PDF again</button>
+                  ) : null}
+                  {item.can_cancel ? (
+                    <button type="button" disabled={uploading && !activeUpload} onClick={() => void cancelImport(item)}>Cancel import</button>
+                  ) : null}
+                </section>
+              );
+            })}
           </section>
         </div>
       )}
@@ -535,8 +571,9 @@ function acquisitionStatus(item: PdfAcquisition, uploading: boolean): string {
   }
   if (item.state === "waiting_cleanup") return "The previous copy is still being removed. Retry after cleanup finishes.";
   if (item.state === "staged" || item.state === "finalizing") return "PDF saved; completing the import…";
-  if (item.state === "failed") return `Import stopped${item.failure_code ? ` (${item.failure_code})` : ""}. The original file remains available if it was saved.`;
+  if (item.state === "failed") return `Import stopped${item.failure_code ? ` (${item.failure_code})` : ""}. ${item.requires_upload ? "Select the PDF again; no complete file was saved." : "The original file remains available if it was saved."}`;
   if (item.state === "cancelled") return "Import cancelled.";
+  if (item.requires_upload) return "Select the PDF again; the interrupted upload did not save a complete file.";
   if (item.outcome_kind === "duplicate") return "This PDF is already in the notebook. Open the existing source.";
   if (item.outcome_kind === "unchanged") return "The selected PDF matches the current file; no replacement was needed.";
   return "PDF saved. Text extraction will become available when M1.5 processing is connected.";
