@@ -3377,10 +3377,8 @@ def _validate_extraction_result(
             raise ValueError("decoded characters require drawn text")
         if page.classification == "extracted" and page.extracted_chars == 0:
             raise ValueError("an extracted page has decoded text")
-        if page.classification == "blank" and (
-            page.text_drawn or page.extracted_chars or page.image_area_ratio
-        ):
-            raise ValueError("a blank page has no content operations")
+        if page.classification == "blank" and (page.text_drawn or page.extracted_chars):
+            raise ValueError("a blank page draws no text and decodes no characters")
         if page.classification == "unreadable" and not page.text_drawn:
             raise ValueError("an unreadable page has drawn text that did not decode")
         validate_utc_timestamp(page.created_at)
