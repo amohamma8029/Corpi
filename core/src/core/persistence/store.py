@@ -17,6 +17,10 @@ from core.persistence.models import (
     AttemptGuard,
     ChunkPassage,
     ExtractionGraph,
+    ExtractionOutcome,
+    ExtractionPage,
+    ExtractionReport,
+    ExtractionReview,
     ExtractionVersion,
     IndexGraph,
     IndexVersion,
@@ -39,6 +43,7 @@ from core.persistence.models import (
     SourceReadiness,
     SourceTrash,
     SourceVersion,
+    VisualLocation,
     decode_json,
     encode_json,
     new_id,
@@ -1743,6 +1748,161 @@ class PersistenceStore:
             _save_extraction(connection, extraction, passages)
             return _load_extraction(connection, extraction.id)
 
+    def save_extraction_result(
+        self,
+        extraction: ExtractionVersion,
+        passages: Sequence[Passage],
+        pages: Sequence[ExtractionPage],
+        visuals: Sequence[VisualLocation],
+        outcome: ExtractionOutcome,
+        review: ExtractionReview | None = None,
+    ) -> ExtractionReport:
+        """Commit one extraction result as a single guarded transaction.
+
+        The extraction version, its passages, per-page quality records, visual metadata, the
+        recorded outcome, and (exactly for partial outcomes) its review state commit together
+        with save_extraction's existing nonempty-passage and retry-conflict discipline. A retry
+        of the same extraction must carry the same records.
+        """
+        with self._transaction() as connection:
+            _save_extraction_result(
+                connection, extraction, passages, pages, visuals, outcome, review
+            )
+            return _load_extraction_report(connection, extraction.id)
+
+    def load_extraction_report(self, extraction_version_id: str) -> ExtractionReport:
+        validate_id(extraction_version_id)
+        with self.database.connect() as connection:
+            return _load_extraction_report(connection, extraction_version_id)
+
+    def lookup_reusable_extraction(
+        self,
+        source_id: str,
+        source_version_id: str,
+        parser_name: str,
+        parser_version: str,
+        normalization_version: str,
+        settings_format_version: int,
+        settings: JSONValue,
+    ) -> ExtractionReport | None:
+        """Find a saved extraction a new job can reuse (cross-job reuse identity).
+
+        Identity covers source version, verified content (the version pins it), parser and
+        normalization versions, and the effective rule/settings payload. The lookup is scoped
+        to one source, so notebooks sharing PDF bytes never combine evidence ownership.
+        """
+        validate_id(source_id)
+        validate_id(source_version_id)
+        _required_text(parser_name, "parser name")
+        _required_text(parser_version, "parser version")
+        _required_text(normalization_version, "normalization version")
+        _integer(settings_format_version, "settings format version", minimum=1)
+        settings_json = encode_json(settings)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """SELECT id FROM extraction_versions
+                   WHERE source_id=? AND source_version_id=?
+                     AND parser_name=? AND parser_version=?
+                     AND normalization_version=? AND settings_format_version=?
+                     AND settings_json=?
+                   ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+                (
+                    source_id,
+                    source_version_id,
+                    parser_name,
+                    parser_version,
+                    normalization_version,
+                    settings_format_version,
+                    settings_json,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            return _load_extraction_report(connection, row["id"])
+
+    def record_review_decision(
+        self,
+        extraction_version_id: str,
+        decision: str,
+        generation: int,
+    ) -> ExtractionReview:
+        """Record Confirm/Decline idempotently against the reviewed generation.
+
+        Confirm rechecks currency first — a superseded source version, a trashed source, or a
+        trashed candidate import cannot be confirmed (the readiness-publication recheck shape).
+        Repeating the same decision at the same generation is a no-op returning the recorded
+        state; a stale generation or a conflicting decision is rejected.
+        """
+        validate_id(extraction_version_id)
+        if decision not in ("confirmed", "declined"):
+            raise ValueError("review decision must be 'confirmed' or 'declined'")
+        _integer(generation, "review generation", minimum=1)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+                (extraction_version_id,),
+            )
+            if row is None:
+                raise PersistenceError("extraction has no review state")
+            review = _extraction_review(row)
+            if generation < review.generation:
+                raise ConflictingWriteError(
+                    "review decision is stale; a newer review generation exists"
+                )
+            if generation > review.generation:
+                raise ValueError("review generation does not exist")
+            if review.state == decision:
+                return review
+            if review.state != "pending":
+                raise ConflictingWriteError("review was already decided differently")
+            if decision == "confirmed":
+                _verify_review_currency(connection, review)
+            connection.execute(
+                """UPDATE extraction_reviews
+                   SET state=?, decided_at=?, updated_at=?
+                   WHERE extraction_version_id=?""",
+                (decision, timestamp, timestamp, extraction_version_id),
+            )
+            updated = _fetchone(
+                connection,
+                "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+                (extraction_version_id,),
+            )
+            assert updated is not None
+            return _extraction_review(updated)
+
+    def reopen_review(self, extraction_version_id: str) -> ExtractionReview:
+        """Review Again: reopen the decision and supersede older open dialogs.
+
+        Bumping the generation invalidates any open dialog from an earlier generation, so only
+        the newest one can confirm.
+        """
+        validate_id(extraction_version_id)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+                (extraction_version_id,),
+            )
+            if row is None:
+                raise PersistenceError("extraction has no review state")
+            connection.execute(
+                """UPDATE extraction_reviews
+                   SET state='pending', generation=generation+1, decided_at=NULL, updated_at=?
+                   WHERE extraction_version_id=?""",
+                (timestamp, extraction_version_id),
+            )
+            updated = _fetchone(
+                connection,
+                "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+                (extraction_version_id,),
+            )
+            assert updated is not None
+            return _extraction_review(updated)
+
     def save_index(
         self,
         index: IndexVersion,
@@ -3144,6 +3304,273 @@ def _save_source_version(connection: sqlite3.Connection, item: SourceVersion) ->
     )
 
 
+def _validate_extraction_result(
+    extraction: ExtractionVersion,
+    passages: Sequence[Passage],
+    pages: Sequence[ExtractionPage],
+    visuals: Sequence[VisualLocation],
+    outcome: ExtractionOutcome,
+    review: ExtractionReview | None,
+) -> None:
+    _validate_extraction(extraction, passages)
+    if (
+        outcome.extraction_version_id != extraction.id
+        or outcome.source_id != extraction.source_id
+        or outcome.source_version_id != extraction.source_version_id
+    ):
+        raise ValueError("extraction outcome ownership does not match its extraction")
+    if outcome.outcome not in ("complete", "partial"):
+        raise ValueError("extraction outcome must be 'complete' or 'partial'")
+    validate_utc_timestamp(outcome.created_at)
+    if (outcome.outcome == "partial") != (review is not None):
+        raise ValueError(
+            "partial extractions require a review state; complete extractions must not carry one"
+        )
+    if review is not None:
+        if (
+            review.extraction_version_id != extraction.id
+            or review.source_id != extraction.source_id
+            or review.source_version_id != extraction.source_version_id
+        ):
+            raise ValueError("extraction review ownership does not match its extraction")
+        if review.state != "pending":
+            raise ValueError("a new extraction's review starts pending")
+        _integer(review.generation, "review generation", minimum=1)
+        if review.generation != 1:
+            raise ValueError("a new extraction's review starts at generation 1")
+        if review.decided_at is not None:
+            raise ValueError("a pending review has no decision time")
+        validate_utc_timestamp(review.updated_at)
+    if len({page.id for page in pages}) != len(pages):
+        raise ValueError("page identities must be unique within an extraction")
+    if len({page.page_number for page in pages}) != len(pages):
+        raise ValueError("page numbers must be unique within an extraction")
+    for page in pages:
+        validate_id(page.id)
+        if (
+            page.source_id != extraction.source_id
+            or page.source_version_id != extraction.source_version_id
+            or page.extraction_version_id != extraction.id
+        ):
+            raise ValueError("page ownership does not match its extraction")
+        _integer(page.page_number, "page number", minimum=1)
+        if not isinstance(page.text_drawn, bool):
+            raise ValueError("page text-drawn flag must be a boolean")
+        _integer(page.extracted_chars, "extracted characters")
+        for label, ratio in (
+            ("unmapped ratio", page.unmapped_ratio),
+            ("image area ratio", page.image_area_ratio),
+        ):
+            if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+                raise ValueError(f"page {label} must be numeric")
+            if not 0.0 <= float(ratio) <= 1.0:
+                raise ValueError(f"page {label} must be between 0 and 1")
+        if page.classification not in (
+            "extracted",
+            "suspect",
+            "image-only",
+            "unreadable",
+            "blank",
+        ):
+            raise ValueError("page classification is not a known state")
+        if page.extracted_chars > 0 and not page.text_drawn:
+            raise ValueError("decoded characters require drawn text")
+        if page.classification == "extracted" and page.extracted_chars == 0:
+            raise ValueError("an extracted page has decoded text")
+        if page.classification == "blank" and (
+            page.text_drawn or page.extracted_chars or page.image_area_ratio
+        ):
+            raise ValueError("a blank page has no content operations")
+        if page.classification == "unreadable" and not page.text_drawn:
+            raise ValueError("an unreadable page has drawn text that did not decode")
+        validate_utc_timestamp(page.created_at)
+    if len({visual.id for visual in visuals}) != len(visuals):
+        raise ValueError("visual identities must be unique within an extraction")
+    seen: set[tuple[int, int]] = set()
+    for visual in visuals:
+        validate_id(visual.id)
+        if (
+            visual.source_id != extraction.source_id
+            or visual.source_version_id != extraction.source_version_id
+            or visual.extraction_version_id != extraction.id
+        ):
+            raise ValueError("visual location ownership does not match its extraction")
+        _integer(visual.page_number, "visual page number", minimum=1)
+        _integer(visual.ordinal, "visual position")
+        if (visual.page_number, visual.ordinal) in seen:
+            raise ValueError("visual positions must be unique within a page")
+        seen.add((visual.page_number, visual.ordinal))
+        if visual.kind not in ("image", "figure"):
+            raise ValueError("visual location kind is not a known kind")
+        encode_json(visual.bbox)
+        validate_utc_timestamp(visual.created_at)
+
+
+def _save_extraction_result(
+    connection: sqlite3.Connection,
+    extraction: ExtractionVersion,
+    passages: Sequence[Passage],
+    pages: Sequence[ExtractionPage],
+    visuals: Sequence[VisualLocation],
+    outcome: ExtractionOutcome,
+    review: ExtractionReview | None,
+) -> None:
+    _validate_extraction_result(extraction, passages, pages, visuals, outcome, review)
+    _save_extraction(connection, extraction, passages)
+    existing = _fetchone(
+        connection,
+        "SELECT outcome FROM extraction_outcomes WHERE extraction_version_id=?",
+        (extraction.id,),
+    )
+    if existing is not None:
+        _verify_saved_result_matches(connection, extraction.id, pages, visuals, outcome, review)
+        return
+    connection.execute(
+        """INSERT INTO extraction_outcomes(
+               extraction_version_id,source_id,source_version_id,outcome,created_at
+           ) VALUES(?,?,?,?,?)""",
+        (
+            outcome.extraction_version_id,
+            outcome.source_id,
+            outcome.source_version_id,
+            outcome.outcome,
+            outcome.created_at,
+        ),
+    )
+    for page in pages:
+        connection.execute(
+            """INSERT INTO extraction_pages(
+                   id,source_id,source_version_id,extraction_version_id,page_number,
+                   text_drawn,extracted_chars,unmapped_ratio,image_area_ratio,
+                   classification,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                page.id,
+                page.source_id,
+                page.source_version_id,
+                page.extraction_version_id,
+                page.page_number,
+                int(page.text_drawn),
+                page.extracted_chars,
+                page.unmapped_ratio,
+                page.image_area_ratio,
+                page.classification,
+                page.created_at,
+            ),
+        )
+    for visual in visuals:
+        connection.execute(
+            """INSERT INTO extraction_visuals(
+                   id,source_id,source_version_id,extraction_version_id,page_number,
+                   ordinal,kind,bbox_json,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                visual.id,
+                visual.source_id,
+                visual.source_version_id,
+                visual.extraction_version_id,
+                visual.page_number,
+                visual.ordinal,
+                visual.kind,
+                encode_json(visual.bbox),
+                visual.created_at,
+            ),
+        )
+    if review is not None:
+        connection.execute(
+            """INSERT INTO extraction_reviews(
+                   extraction_version_id,source_id,source_version_id,state,generation,
+                   decided_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?)""",
+            (
+                review.extraction_version_id,
+                review.source_id,
+                review.source_version_id,
+                review.state,
+                review.generation,
+                review.decided_at,
+                review.updated_at,
+            ),
+        )
+
+
+def _verify_saved_result_matches(
+    connection: sqlite3.Connection,
+    extraction_id: str,
+    pages: Sequence[ExtractionPage],
+    visuals: Sequence[VisualLocation],
+    outcome: ExtractionOutcome,
+    review: ExtractionReview | None,
+) -> None:
+    """Retry discipline: a re-saved result must match the committed records exactly."""
+    existing_outcome = _fetchone(
+        connection,
+        "SELECT * FROM extraction_outcomes WHERE extraction_version_id=?",
+        (extraction_id,),
+    )
+    if existing_outcome is None or existing_outcome["outcome"] != outcome.outcome:
+        raise ConflictingWriteError("extraction retry contains a different outcome")
+    existing_pages = {
+        row["id"]
+        for row in connection.execute(
+            "SELECT id FROM extraction_pages WHERE extraction_version_id=?",
+            (extraction_id,),
+        )
+    }
+    if existing_pages != {page.id for page in pages}:
+        raise ConflictingWriteError("extraction retry contains a different page set")
+    existing_visuals = {
+        row["id"]
+        for row in connection.execute(
+            "SELECT id FROM extraction_visuals WHERE extraction_version_id=?",
+            (extraction_id,),
+        )
+    }
+    if existing_visuals != {visual.id for visual in visuals}:
+        raise ConflictingWriteError("extraction retry contains a different visual set")
+    existing_review = _fetchone(
+        connection,
+        "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+        (extraction_id,),
+    )
+    if (existing_review is None) != (review is None):
+        raise ConflictingWriteError("extraction retry contains a different review state")
+
+
+def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionReview) -> None:
+    """Confirm only against the candidate the user actually reviewed.
+
+    The recheck mirrors readiness publication: the extraction's source version must still be
+    the source's current version (otherwise it was superseded), and neither the source nor its
+    current import may be trashed. A cancelled import never produced a current version, so the
+    currency check covers it as well.
+    """
+    current_row = connection.execute(
+        """SELECT id FROM source_versions WHERE source_id=?
+           ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+        (review.source_id,),
+    ).fetchone()
+    if current_row is None or current_row[0] != review.source_version_id:
+        raise ConflictingWriteError(
+            "extraction source version is not current; confirmation rejected"
+        )
+    trash_row = _fetchone(
+        connection, "SELECT 1 FROM source_trash WHERE source_id=?", (review.source_id,)
+    )
+    if trash_row is not None:
+        raise ConflictingWriteError("source is trashed; confirmation rejected")
+    import_trash = _fetchone(
+        connection,
+        """SELECT 1 FROM pdf_import_trash
+           WHERE source_id=? AND import_id=(
+               SELECT current_import_id FROM source_pdf_state WHERE source_id=?
+           )""",
+        (review.source_id, review.source_id),
+    )
+    if import_trash is not None:
+        raise ConflictingWriteError("candidate import is trashed; confirmation rejected")
+
+
 def _save_extraction(
     connection: sqlite3.Connection,
     extraction: ExtractionVersion,
@@ -3501,6 +3928,99 @@ def _load_extraction(
         )
     )
     return ExtractionGraph(extraction, passages)
+
+
+def _extraction_page(row: sqlite3.Row) -> ExtractionPage:
+    return ExtractionPage(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["page_number"],
+        bool(row["text_drawn"]),
+        row["extracted_chars"],
+        row["unmapped_ratio"],
+        row["image_area_ratio"],
+        row["classification"],
+        row["created_at"],
+    )
+
+
+def _visual_location(row: sqlite3.Row) -> VisualLocation:
+    return VisualLocation(
+        row["id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["extraction_version_id"],
+        row["page_number"],
+        row["ordinal"],
+        row["kind"],
+        decode_json(row["bbox_json"]),
+        row["created_at"],
+    )
+
+
+def _extraction_outcome(row: sqlite3.Row) -> ExtractionOutcome:
+    return ExtractionOutcome(
+        row["extraction_version_id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["outcome"],
+        row["created_at"],
+    )
+
+
+def _extraction_review(row: sqlite3.Row) -> ExtractionReview:
+    return ExtractionReview(
+        row["extraction_version_id"],
+        row["source_id"],
+        row["source_version_id"],
+        row["state"],
+        row["generation"],
+        row["decided_at"],
+        row["updated_at"],
+    )
+
+
+def _load_extraction_report(
+    connection: sqlite3.Connection,
+    extraction_id: str,
+) -> ExtractionReport:
+    graph = _load_extraction(connection, extraction_id)
+    pages = tuple(
+        _extraction_page(item)
+        for item in connection.execute(
+            """SELECT * FROM extraction_pages
+               WHERE extraction_version_id=? ORDER BY page_number,id""",
+            (extraction_id,),
+        )
+    )
+    visuals = tuple(
+        _visual_location(item)
+        for item in connection.execute(
+            """SELECT * FROM extraction_visuals
+               WHERE extraction_version_id=? ORDER BY page_number,ordinal,id""",
+            (extraction_id,),
+        )
+    )
+    outcome_row = _fetchone(
+        connection,
+        "SELECT * FROM extraction_outcomes WHERE extraction_version_id=?",
+        (extraction_id,),
+    )
+    review_row = _fetchone(
+        connection,
+        "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+        (extraction_id,),
+    )
+    return ExtractionReport(
+        graph.extraction,
+        graph.passages,
+        pages,
+        visuals,
+        None if outcome_row is None else _extraction_outcome(outcome_row),
+        None if review_row is None else _extraction_review(review_row),
+    )
 
 
 def _load_index(connection: sqlite3.Connection, index_id: str) -> IndexGraph:

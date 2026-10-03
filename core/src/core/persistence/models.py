@@ -150,6 +150,64 @@ class Passage:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractionPage:
+    id: str
+    source_id: str
+    source_version_id: str
+    extraction_version_id: str
+    page_number: int
+    text_drawn: bool
+    extracted_chars: int
+    unmapped_ratio: float
+    image_area_ratio: float
+    classification: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class VisualLocation:
+    id: str
+    source_id: str
+    source_version_id: str
+    extraction_version_id: str
+    page_number: int
+    ordinal: int
+    kind: str
+    bbox: JSONValue
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionOutcome:
+    extraction_version_id: str
+    source_id: str
+    source_version_id: str
+    outcome: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionReview:
+    extraction_version_id: str
+    source_id: str
+    source_version_id: str
+    state: str
+    generation: int
+    decided_at: str | None
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionReport:
+    extraction: ExtractionVersion
+    passages: tuple[Passage, ...]
+    pages: tuple[ExtractionPage, ...]
+    visuals: tuple[VisualLocation, ...]
+    outcome: ExtractionOutcome | None
+    review: ExtractionReview | None
+
+
+@dataclass(frozen=True, slots=True)
 class IndexVersion:
     id: str
     source_id: str
