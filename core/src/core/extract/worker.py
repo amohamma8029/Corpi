@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "type": "page",
                         "page_number": result.page_number,
+                        "frame": {
+                            "cropbox": list(result.frame.cropbox),
+                            "mediabox": list(result.frame.mediabox),
+                            "rotation": result.frame.rotation,
+                        },
                         "blocks": [
                             {
                                 "text": block.text,
@@ -44,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
                             }
                             for block in result.blocks
                         ],
+                        "image_boxes": [list(box) for box in result.image_boxes],
                         "metrics": {
                             "text_drawn": result.metrics.text_drawn,
                             "extracted_chars": result.metrics.extracted_chars,

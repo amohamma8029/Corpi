@@ -2011,10 +2011,24 @@ class PersistenceStore:
         *,
         guard: AttemptGuard,
         inputs_sha256: str | None = None,
+        pages: Sequence[ExtractionPage] = (),
+        visuals: Sequence[VisualLocation] = (),
+        outcome: ExtractionOutcome | None = None,
+        review: ExtractionReview | None = None,
     ) -> JobStep:
+        """Commit the extraction step output in one guarded transaction.
+
+        With an outcome record the full M1.5 result — passages, per-page quality records,
+        visual metadata, and the review state — commits together with the step completion.
+        """
         with self._transaction() as connection:
             _verify_attempt_current(connection, job_id, step_key, guard)
-            _save_extraction(connection, extraction, passages)
+            if outcome is not None:
+                _save_extraction_result(
+                    connection, extraction, passages, pages, visuals, outcome, review
+                )
+            else:
+                _save_extraction(connection, extraction, passages)
             _save_job_step(
                 connection,
                 job_id,
@@ -2084,6 +2098,30 @@ class PersistenceStore:
                 inputs_sha256,
             )
             return _load_job_step(connection, job_id, step_key)
+
+    def load_source_version(self, source_version_id: str) -> SourceVersion:
+        validate_id(source_version_id)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM source_versions WHERE id=?",
+                (source_version_id,),
+            )
+            if row is None:
+                raise PersistenceError("source version does not exist")
+            return _source_version(row)
+
+    def load_managed_file(self, managed_file_id: str) -> ManagedFile:
+        validate_id(managed_file_id)
+        with self.database.connect() as connection:
+            row = _fetchone(
+                connection,
+                "SELECT * FROM managed_files WHERE id=?",
+                (managed_file_id,),
+            )
+            if row is None:
+                raise PersistenceError("managed file does not exist")
+            return _managed_file(row)
 
     def load_job_by_id(self, job_id: str) -> Job:
         validate_id(job_id)

@@ -14,7 +14,7 @@ from pdfminer.layout import LTTextContainer as _LTTextContainer
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 
-from core.extract.types import ExtractedBlock, PageExtraction, PageMetrics
+from core.extract.types import ExtractedBlock, PageExtraction, PageFrame, PageMetrics
 
 UNMAPPED_TOKEN_PREFIX = "(cid:"
 
@@ -130,4 +130,10 @@ class ExtractionAdapter:
             unmapped_ratio=0.0 if glyph_runs == 0 else unmapped / glyph_runs,
             image_area_ratio=min(1.0, image_area_ratio),
         )
-        return PageExtraction(page_number, tuple(blocks), metrics)
+        media_x0, media_y0, media_x1, media_y1 = (float(v) for v in page.mediabox)
+        frame = PageFrame(
+            cropbox=(crop_x0, crop_y0, crop_x1, crop_y1),
+            mediabox=(media_x0, media_y0, media_x1, media_y1),
+            rotation=page.rotate % 360,
+        )
+        return PageExtraction(page_number, tuple(blocks), metrics, frame, tuple(image_boxes))

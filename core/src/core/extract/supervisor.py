@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from core.extract.types import ExtractedBlock, PageExtraction, PageMetrics
+from core.extract.types import ExtractedBlock, PageExtraction, PageFrame, PageMetrics
 
 TERMINATE_GRACE_S = 5.0
 POLL_SLICE_S = 0.1
@@ -59,10 +59,17 @@ def _stop_and_reap(process: subprocess.Popen[str], grace_s: float = TERMINATE_GR
 
 def _page_from_payload(payload: dict[str, Any]) -> PageExtraction:
     metrics: dict[str, Any] = payload["metrics"]
+    frame: dict[str, Any] = payload.get("frame", {})
     blocks = []
     for raw in payload["blocks"]:
         x0, y0, x1, y1 = raw["bbox"]
         blocks.append(ExtractedBlock(raw["text"], (x0, y0, x1, y1), raw["reading_order"]))
+    image_boxes = []
+    for raw in payload.get("image_boxes", []):
+        x0, y0, x1, y1 = raw
+        image_boxes.append((x0, y0, x1, y1))
+    cx0, cy0, cx1, cy1 = frame.get("cropbox", (0.0, 0.0, 0.0, 0.0))
+    mx0, my0, mx1, my1 = frame.get("mediabox", (0.0, 0.0, 0.0, 0.0))
     return PageExtraction(
         page_number=payload["page_number"],
         blocks=tuple(blocks),
@@ -72,6 +79,12 @@ def _page_from_payload(payload: dict[str, Any]) -> PageExtraction:
             metrics["unmapped_ratio"],
             metrics["image_area_ratio"],
         ),
+        frame=PageFrame(
+            cropbox=(float(cx0), float(cy0), float(cx1), float(cy1)),
+            mediabox=(float(mx0), float(my0), float(mx1), float(my1)),
+            rotation=int(frame.get("rotation", 0)),
+        ),
+        image_boxes=tuple(image_boxes),
     )
 
 
