@@ -399,6 +399,26 @@ def test_reuse_lookup_matches_full_identity_only(store: PersistenceStore) -> Non
     )
 
 
+def test_blank_page_may_carry_decorative_image(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    sparse = make_page(
+        extraction,
+        text_drawn=False,
+        extracted_chars=0,
+        image_area_ratio=0.1,
+        classification="blank",
+    )
+    report = store.save_extraction_result(
+        extraction,
+        (),
+        (sparse,),
+        (),
+        make_outcome(extraction, "complete"),
+    )
+    assert report.pages[0].classification == "blank"
+
+
 def test_conflicting_retry_rejected_identical_retry_reuses(store: PersistenceStore) -> None:
     source_id, source_version = seed_source(store)
     extraction = make_extraction(source_id, source_version)
