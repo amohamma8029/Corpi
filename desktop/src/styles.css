@@ -167,7 +167,21 @@ main.app-shell {
 .source-list li button {
   display: grid;
   width: 100%;
+  min-width: 0;
   text-align: left;
+}
+
+.source-list span,
+.source-heading h2,
+.import-list strong,
+.acquisition-status h3 {
+  overflow-wrap: anywhere;
+}
+
+.source-heading > div,
+.import-list li > div {
+  min-width: 0;
+  flex: 1;
 }
 
 .source-list__selected {
