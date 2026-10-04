@@ -196,7 +196,9 @@ export function App() {
     if (!connection || !selectedSourceId || !(processingActive || uploading)) return;
     const timer = window.setInterval(() => {
       void listPdfImports(connection, selectedSourceId)
-        .then((items) => setImports(items))
+        .then((items) => {
+          if (selectionSourceRef.current === selectedSourceId) setImports(items);
+        })
         .catch(() => undefined);
       void getExtraction(connection, selectedSourceId)
         .then((report) => {
@@ -389,12 +391,15 @@ export function App() {
   }
 
   async function removeEarlierImport(item: PdfImport) {
-    if (!connection || !selectedSourceId || item.is_current || item.is_pending || item.trashed) return;
+    const sourceId = selectedSourceId;
+    if (!connection || !sourceId || item.is_current || item.is_pending || item.trashed) return;
     try {
-      await trashPdfImport(connection, selectedSourceId, item.id);
-      setImports(await listPdfImports(connection, selectedSourceId));
-      refreshExtractionFor(selectedSourceId);
+      await trashPdfImport(connection, sourceId, item.id);
+      const items = await listPdfImports(connection, sourceId);
       setStorage(await storageReport(connection));
+      if (selectionSourceRef.current !== sourceId) return;
+      setImports(items);
+      refreshExtractionFor(sourceId);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
@@ -403,10 +408,13 @@ export function App() {
 
   async function retryProcessing(item: PdfImport) {
     if (!connection) return;
+    const sourceId = item.source_id;
     try {
-      await retryPdfProcessing(connection, item.source_id, item.id);
-      setImports(await listPdfImports(connection, item.source_id));
-      refreshExtractionFor(item.source_id);
+      await retryPdfProcessing(connection, sourceId, item.id);
+      const items = await listPdfImports(connection, sourceId);
+      if (selectionSourceRef.current !== sourceId) return;
+      setImports(items);
+      refreshExtractionFor(sourceId);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
@@ -415,10 +423,13 @@ export function App() {
 
   async function cancelProcessing(item: PdfImport) {
     if (!connection) return;
+    const sourceId = item.source_id;
     try {
-      await cancelPdfProcessing(connection, item.source_id, item.id);
-      setImports(await listPdfImports(connection, item.source_id));
-      refreshExtractionFor(item.source_id);
+      await cancelPdfProcessing(connection, sourceId, item.id);
+      const items = await listPdfImports(connection, sourceId);
+      if (selectionSourceRef.current !== sourceId) return;
+      setImports(items);
+      refreshExtractionFor(sourceId);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));

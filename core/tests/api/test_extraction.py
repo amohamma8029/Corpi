@@ -272,3 +272,95 @@ def test_unknown_decision_is_rejected(tmp_path: Path) -> None:
         json={"decision": "maybe", "generation": 1},
     )
     assert response.status_code == 400
+
+
+def test_real_import_extraction_confirm_flow(tmp_path: Path) -> None:
+    """A real import stays `pending` through extraction and must still be confirmable."""
+    import asyncio
+    import threading
+
+    from pdf_fixtures import (
+        PageSpec,
+        build_pdf,
+        image_draw_stream,
+        native_text_stream,
+        page_number_stream,
+    )
+
+    from core.ingest.service import PdfIngestService
+    from core.jobs.runner import JobRunner
+    from core.jobs.steps import build_pdf_extract_steps
+
+    origin = "http://tauri.localhost"
+    database = Database(DatabaseConfig(tmp_path / "data"))
+    database.initialize()
+    store = PersistenceStore(database)
+    ingest = PdfIngestService(store, "core-test")
+    app = create_app(TOKEN, allowed_origins=(origin,), store=store, pdf_ingest=ingest)
+    headers = {"Authorization": f"Bearer {TOKEN}", "Origin": origin}
+    pdf = build_pdf(
+        [
+            PageSpec(native_text_stream("Readable body text for the first page"), helvetica=True),
+            PageSpec(
+                image_draw_stream() + b"\n" + page_number_stream(2),
+                helvetica=True,
+                image=True,
+            ),
+        ]
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        notebook_id = new_id()
+        store.create_notebook(notebook_id, "Real flow")
+        created = client.post(
+            f"/notebooks/{notebook_id}/pdf-acquisitions",
+            headers=headers,
+            json={"retry_key": "real-flow", "filename": "real.pdf"},
+        )
+        assert created.status_code == 201, created.text
+        uploaded = client.put(
+            f"/pdf-acquisitions/{created.json()['id']}/content",
+            headers={**headers, "Content-Type": "application/pdf"},
+            content=pdf,
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        outcome = uploaded.json()
+        source_id = outcome["source_id"]
+        import_id = outcome["import_id"]
+        assert source_id is not None and import_id is not None
+        assert store.load_pdf_import(import_id).state == "pending"
+
+        runner = JobRunner(store, {"pdf-extract": build_pdf_extract_steps(store)})
+        loop = asyncio.new_event_loop()
+        started = threading.Event()
+
+        def main() -> None:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(runner.start())
+            started.set()
+            loop.run_forever()
+
+        thread = threading.Thread(target=main, daemon=True)
+        thread.start()
+        assert started.wait(5)
+        try:
+            runner.notify()
+            deadline = time.monotonic() + 30
+            report = None
+            while time.monotonic() < deadline:
+                report = client.get(f"/sources/{source_id}/extraction", headers=headers).json()
+                if report.get("outcome"):
+                    break
+                time.sleep(0.05)
+            assert report is not None and report["outcome"] == "partial"
+            assert store.load_pdf_import(import_id).state == "pending"
+            decided = client.post(
+                f"/extractions/{report['extraction_id']}/review",
+                headers=headers,
+                json={"decision": "confirmed", "generation": 1},
+            )
+            assert decided.status_code == 200, decided.text
+            assert decided.json()["state"] == "confirmed"
+        finally:
+            asyncio.run_coroutine_threadsafe(runner.stop(), loop).result(10)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(10)
