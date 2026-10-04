@@ -151,30 +151,30 @@ def run_extraction(
                 if on_page is not None:
                     on_page(page.page_number)
             elif kind == "done":
+                # The result is complete the moment `done` arrives: stop reading so a
+                # lingering child (or a deadline crossing EOF) can never discard it.
                 result = ExtractionRun(
                     tuple(pages),
                     payload["parser_name"],
                     payload["parser_version"],
                 )
+                break
             elif kind == "error":
                 stop = ExtractionChildError(str(payload.get("message", "child failed")))
                 break
     finally:
-        if result is not None and stop is None:
-            process.wait()
-        else:
-            _stop_and_reap(process)
+        _stop_and_reap(process)
         if process.stderr is not None:
             stderr_tail = process.stderr.read()[-2000:]
             process.stderr.close()
         else:
             stderr_tail = ""
 
+    if result is not None:
+        return result
     if stop is not None:
         if stderr_tail and isinstance(stop, ExtractionChildError):
             raise ExtractionChildError(f"{stop.args[0]}\nchild stderr:\n{stderr_tail}") from stop
         raise stop
-    if result is None:
-        detail = f"\nchild stderr:\n{stderr_tail}" if stderr_tail else ""
-        raise ExtractionChildError("child ended without a completion record" + detail)
-    return result
+    detail = f"\nchild stderr:\n{stderr_tail}" if stderr_tail else ""
+    raise ExtractionChildError("child ended without a completion record" + detail)

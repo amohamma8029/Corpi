@@ -119,6 +119,11 @@ def test_block_kinds_are_conservative() -> None:
     assert classify_block_kind("3") == "text"
 
 
+def test_structure_is_classified_from_raw_layout_text() -> None:
+    raw = "A paragraph that wraps\nacross two layout lines"
+    assert classify_block_kind(raw) == "paragraph"
+
+
 def test_rotation_must_be_a_quarter_turn() -> None:
     assert display_translation((0, 0, 10, 10), (0, 0, 10, 10), 450) == (0, 0)
     with pytest.raises(ValueError, match="multiple of 90"):

@@ -234,6 +234,13 @@ export function App() {
     }
   }
 
+  function refreshExtractionFor(sourceId: string) {
+    if (!connection) return;
+    void getExtraction(connection, sourceId)
+      .then((report) => setExtraction(report))
+      .catch(() => setExtraction(null));
+  }
+
   async function decideReview(decision: "confirmed" | "declined") {
     if (!connection || !extraction?.extraction_id || !extraction.review) return;
     try {
@@ -352,6 +359,7 @@ export function App() {
     try {
       await trashPdfImport(connection, selectedSourceId, item.id);
       setImports(await listPdfImports(connection, selectedSourceId));
+      refreshExtractionFor(selectedSourceId);
       setStorage(await storageReport(connection));
       setError(null);
     } catch (cause) {
@@ -364,6 +372,7 @@ export function App() {
     try {
       await retryPdfProcessing(connection, item.source_id, item.id);
       setImports(await listPdfImports(connection, item.source_id));
+      refreshExtractionFor(item.source_id);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
@@ -375,6 +384,7 @@ export function App() {
     try {
       await cancelPdfProcessing(connection, item.source_id, item.id);
       setImports(await listPdfImports(connection, item.source_id));
+      refreshExtractionFor(item.source_id);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));

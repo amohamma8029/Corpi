@@ -183,3 +183,55 @@ def two_column_pdf(left: str, right: str) -> bytes:
         native_text_stream(left, x=72, y=600) + b"\n" + native_text_stream(right, x=350, y=600)
     )
     return build_pdf([PageSpec(content, helvetica=True)])
+
+
+def form_text_pdf(text: str = "Wrapped figure text") -> bytes:
+    """A page whose only text lives inside a Form XObject (a figure-wrapped placement)."""
+    objects: dict[int, bytes] = {}
+    next_id = 3
+
+    def add(body: bytes) -> int:
+        nonlocal next_id
+        objects[next_id] = body
+        next_id += 1
+        return next_id - 1
+
+    helvetica = add(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    form_body = f"BT /F1 24 Tf 20 20 Td ({text}) Tj ET".encode("ascii")
+    form = add(
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 100] "
+        b"/Resources << /Font << /F1 "
+        + f"{helvetica} 0 R".encode()
+        + b" >> >> /Length "
+        + str(len(form_body)).encode()
+        + b" >>\nstream\n"
+        + form_body
+        + b"\nendstream"
+    )
+    content = b"q /Fm1 Do Q"
+    stream = add(
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream"
+    )
+    page = add(
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents "
+        + f"{stream} 0 R".encode()
+        + b" /Resources << /XObject << /Fm1 "
+        + f"{form} 0 R".encode()
+        + b" >> >> >>"
+    )
+    objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objects[2] = b"<< /Type /Pages /Kids [" + f"{page} 0 R".encode() + b"] /Count 1 >>"
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for object_id in sorted(objects):
+        offsets[object_id] = len(out)
+        out += f"{object_id} 0 obj\n".encode() + objects[object_id] + b"\nendobj\n"
+    size = max(objects) + 1
+    xref_at = len(out)
+    out += f"xref\n0 {size}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for object_id in range(1, size):
+        out += f"{offsets[object_id]:010d} 00000 n \n".encode()
+    out += b"trailer\n<< /Root 1 0 R /Size " + str(size).encode() + b" >>\n"
+    out += b"startxref\n" + str(xref_at).encode() + b"\n%%EOF\n"
+    return bytes(out)

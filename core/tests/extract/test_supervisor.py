@@ -99,3 +99,22 @@ def test_a_retry_after_a_timeout_can_start_a_fresh_child(tmp_path: Path) -> None
         run_extraction(path, timeout_s=0.2, worker_command=SLOW_WORKER)
     run = run_extraction(path, timeout_s=60)
     assert run.pages[0].metrics.extracted_chars == len("Retryme")
+
+
+def test_completed_result_survives_a_lingering_child(tmp_path: Path) -> None:
+    """A `done` result must win even if the child holds stdout open past the deadline."""
+    script = (
+        "import json,sys,time;"
+        "sys.stdout.write(json.dumps({'type':'done','page_count':1,"
+        "'parser_name':'fake','parser_version':'9'})+'\\n');"
+        "sys.stdout.flush();"
+        "time.sleep(30)"
+    )
+    started = time.monotonic()
+    run = run_extraction(
+        tmp_path / "ignored.pdf",
+        timeout_s=0.5,
+        worker_command=[sys.executable, "-c", script],
+    )
+    assert run.parser_version == "9"
+    assert time.monotonic() - started < 10
