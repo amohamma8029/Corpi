@@ -64,6 +64,7 @@ export function App() {
   const [uploading, setUploading] = useState(false);
   const [viewerImport, setViewerImport] = useState<PdfImport | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectionSourceRef = useRef("");
   const nextIntentRef = useRef<{ intent: ImportIntent; sourceId?: string; acquisitionId?: string }>({ intent: "add" });
   const uploadControllerRef = useRef<AbortController | null>(null);
   const acquisitionIdRef = useRef("");
@@ -170,23 +171,41 @@ export function App() {
   }, [acquisition?.id, connection, uploading]);
 
   useEffect(() => {
-    if (!connection || !selectedSourceId) {
+    if (selectionSourceRef.current !== selectedSourceId) {
+      selectionSourceRef.current = selectedSourceId;
       setExtraction(null);
+    }
+    if (!connection || !selectedSourceId) {
       return;
     }
     let cancelled = false;
     void getExtraction(connection, selectedSourceId)
       .then((report) => {
-        if (!cancelled) setExtraction(report);
+        if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(report);
       })
       .catch(() => {
-        if (!cancelled) setExtraction(null);
+        if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(null);
       });
     return () => {
       cancelled = true;
     };
-  }, [connection, selectedSourceId]);
+  }, [connection, selectedSourceId, imports]);
 
+  const processingActive = imports.some((item) => !item.trashed && item.state === "pending");
+  useEffect(() => {
+    if (!connection || !selectedSourceId || !(processingActive || uploading)) return;
+    const timer = window.setInterval(() => {
+      void listPdfImports(connection, selectedSourceId)
+        .then((items) => setImports(items))
+        .catch(() => undefined);
+      void getExtraction(connection, selectedSourceId)
+        .then((report) => {
+          if (selectionSourceRef.current === selectedSourceId) setExtraction(report);
+        })
+        .catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [connection, selectedSourceId, processingActive, uploading]);
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? null;
   const visibleAcquisitions = [
     ...savedAcquisitions.filter((item) => item.id !== acquisition?.id),
@@ -209,14 +228,23 @@ export function App() {
       listPdfAcquisitions(connection, notebookId),
     ]);
     setSources(sourceItems);
-    setSelectedSourceId((selected) => {
-      if (preferredSourceId && sourceItems.some((item) => item.id === preferredSourceId)) {
-        return preferredSourceId;
-      }
-      return sourceItems.some((item) => item.id === selected) ? selected : sourceItems[0]?.id || "";
-    });
+    const nextSelected =
+      preferredSourceId && sourceItems.some((item) => item.id === preferredSourceId)
+        ? preferredSourceId
+        : sourceItems.some((item) => item.id === selectedSourceId)
+          ? selectedSourceId
+          : sourceItems[0]?.id || "";
+    setSelectedSourceId(nextSelected);
     setStorage(report);
     setSavedAcquisitions(attempts);
+    if (nextSelected) {
+      void listPdfImports(connection, nextSelected)
+        .then((items) => {
+          if (selectionSourceRef.current === nextSelected) setImports(items);
+        })
+        .catch(() => undefined);
+      refreshExtractionFor(nextSelected);
+    }
   }
 
   async function submitNotebook(event: React.FormEvent<HTMLFormElement>) {
@@ -237,19 +265,25 @@ export function App() {
   function refreshExtractionFor(sourceId: string) {
     if (!connection) return;
     void getExtraction(connection, sourceId)
-      .then((report) => setExtraction(report))
-      .catch(() => setExtraction(null));
+      .then((report) => {
+        if (selectionSourceRef.current === sourceId) setExtraction(report);
+      })
+      .catch(() => {
+        if (selectionSourceRef.current === sourceId) setExtraction(null);
+      });
   }
 
   async function decideReview(decision: "confirmed" | "declined") {
     if (!connection || !extraction?.extraction_id || !extraction.review) return;
+    const targetId = extraction.extraction_id;
     try {
-      const review: ExtractionReview = await decideExtractionReview(
-        connection,
-        extraction.extraction_id,
-        { decision, generation: extraction.review.generation },
+      const review: ExtractionReview = await decideExtractionReview(connection, targetId, {
+        decision,
+        generation: extraction.review.generation,
+      });
+      setExtraction((current) =>
+        current?.extraction_id === targetId ? { ...current, review } : current,
       );
-      setExtraction((current) => (current ? { ...current, review } : current));
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
@@ -258,12 +292,12 @@ export function App() {
 
   async function reviewAgain() {
     if (!connection || !extraction?.extraction_id) return;
+    const targetId = extraction.extraction_id;
     try {
-      const review: ExtractionReview = await reopenExtractionReview(
-        connection,
-        extraction.extraction_id,
+      const review: ExtractionReview = await reopenExtractionReview(connection, targetId);
+      setExtraction((current) =>
+        current?.extraction_id === targetId ? { ...current, review } : current,
       );
-      setExtraction((current) => (current ? { ...current, review } : current));
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));

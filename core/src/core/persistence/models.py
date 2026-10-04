@@ -285,6 +285,7 @@ class JobStatus:
     superseded_by_job_id: str | None
     policy: JSONValue
     updated_at: str
+    failure_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

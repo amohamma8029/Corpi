@@ -34,7 +34,15 @@ class ExtractionCancelled(Exception):
 
 
 class ExtractionChildError(Exception):
-    """The child failed and reported an error instead of a completion record."""
+    """The child failed and reported an error instead of a completion record.
+
+    ``code`` carries the child's machine-readable failure code (for example
+    ``page_limit_exceeded``) when it reported one.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +168,10 @@ def run_extraction(
                 )
                 break
             elif kind == "error":
-                stop = ExtractionChildError(str(payload.get("message", "child failed")))
+                stop = ExtractionChildError(
+                    str(payload.get("message", "child failed")),
+                    code=str(payload["code"]) if payload.get("code") else None,
+                )
                 break
     finally:
         _stop_and_reap(process)

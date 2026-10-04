@@ -52,6 +52,16 @@ def display_translation(
     return (cx0 - mx0, cy0 - my0)
 
 
+def display_size(cropbox: tuple[float, float, float, float], rotation: int) -> tuple[float, float]:
+    """Displayed page size of a CropBox after quarter-turn rotation."""
+    rotation = rotation % 360
+    if rotation not in (0, 90, 180, 270):
+        raise ValueError("page rotation must be a multiple of 90 degrees")
+    width = cropbox[2] - cropbox[0]
+    height = cropbox[3] - cropbox[1]
+    return (width, height) if rotation in (0, 180) else (height, width)
+
+
 def layout_bbox_to_display(
     bbox: tuple[float, float, float, float],
     *,

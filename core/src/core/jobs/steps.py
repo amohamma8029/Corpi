@@ -18,9 +18,7 @@ from core.extract.classify import (
     MAX_EXTRACTION_PAGES,
     SHORT_PAGE_CHARS,
     UNMAPPED_RATIO_LIMIT,
-    check_page_limit,
     classify_page,
-    count_pages,
     decide_document_outcome,
 )
 from core.extract.locations import (
@@ -32,6 +30,7 @@ from core.extract.locations import (
 from core.extract.normalize import normalize_text
 from core.extract.supervisor import (
     ExtractionCancelled,
+    ExtractionChildError,
     ExtractionRun,
     ExtractionTimeout,
     run_extraction,
@@ -386,13 +385,6 @@ def build_pdf_extract_steps(
             )
         managed = store.load_managed_file(source_version.managed_file_id)
         pdf_path = store.database.config.data_dir / managed.relative_path
-        page_total = count_pages(pdf_path.read_bytes(), stop_after=MAX_EXTRACTION_PAGES + 1)
-        limit_code = check_page_limit(page_total)
-        if limit_code is not None:
-            raise PermanentStepFailure(
-                f"{limit_code}: document proves at least {page_total} pages, "
-                f"above the {MAX_EXTRACTION_PAGES}-page extraction limit"
-            )
 
         cancel = threading.Event()
 
@@ -413,6 +405,10 @@ def build_pdf_extract_steps(
             raise TimeoutError(f"extraction stopped at its deadline: {error}") from error
         except ExtractionTimeout as error:
             raise TimeoutError(f"extraction child stopped: {error}") from error
+        except ExtractionChildError as error:
+            if error.code is not None:
+                raise PermanentStepFailure(str(error), code=error.code) from error
+            raise
         finally:
             cancel.set()
             watcher.join(timeout=1.0)
@@ -425,7 +421,8 @@ def build_pdf_extract_steps(
         decision = decide_document_outcome(classifications)
         if decision.outcome == "failed":
             raise PermanentStepFailure(
-                f"{decision.failure_code}: the document has no usable text to extract"
+                f"{decision.failure_code}: the document has no usable text to extract",
+                code=decision.failure_code,
             )
         raw_review = (
             None
@@ -463,7 +460,7 @@ def build_pdf_extract_steps(
                 "created_at": created_at,
             },
             "review": raw_review,
-            "page_count": page_total,
+            "page_count": len(result.pages),
         }
         return StepOutcome(CHECKPOINT_FORMAT_VERSION, payload)
 

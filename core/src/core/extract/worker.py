@@ -1,11 +1,14 @@
 """Child-process entrypoint for M1.5 extraction: streams page results as NDJSON on stdout.
 
-One line per page result, then a completion record. The parent supervises this process and
-kills it on timeout or cancellation; the child never touches the database.
+One line per page result, then a completion record. Page counting and the page-limit check
+run here too, inside the supervised process, so a parser stuck anywhere — including the
+page-tree walk — can be stopped and reaped. The parent supervises this process and kills it
+on timeout or cancellation; the child never touches the database.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 from importlib.metadata import version
@@ -14,6 +17,12 @@ from pathlib import Path
 from pdfminer.pdfpage import PDFPage
 
 from core.extract.adapter import PARSER_NAME, ExtractionAdapter
+from core.extract.classify import (
+    MAX_EXTRACTION_PAGES,
+    PAGE_LIMIT_EXCEEDED,
+    check_page_limit,
+    count_pages,
+)
 
 
 def _emit(payload: dict[str, object]) -> None:
@@ -24,41 +33,54 @@ def _emit(payload: dict[str, object]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
-        _emit({"type": "error", "message": "expected exactly one PDF path argument"})
+        _emit({"type": "error", "code": None, "message": "expected exactly one PDF path argument"})
         return 2
     try:
+        data = Path(args[0]).read_bytes()
+        page_total = count_pages(data, stop_after=MAX_EXTRACTION_PAGES + 1)
+        if check_page_limit(page_total) is not None:
+            _emit(
+                {
+                    "type": "error",
+                    "code": PAGE_LIMIT_EXCEEDED,
+                    "message": (
+                        f"{PAGE_LIMIT_EXCEEDED}: document proves at least {page_total} pages, "
+                        f"above the {MAX_EXTRACTION_PAGES}-page extraction limit"
+                    ),
+                }
+            )
+            return 1
         adapter = ExtractionAdapter()
         count = 0
-        with Path(args[0]).open("rb") as handle:
-            for number, page in enumerate(PDFPage.get_pages(handle), start=1):
-                result = adapter.extract_page(page, number)
-                _emit(
-                    {
-                        "type": "page",
-                        "page_number": result.page_number,
-                        "frame": {
-                            "cropbox": list(result.frame.cropbox),
-                            "mediabox": list(result.frame.mediabox),
-                            "rotation": result.frame.rotation,
-                        },
-                        "blocks": [
-                            {
-                                "text": block.text,
-                                "bbox": list(block.bbox),
-                                "reading_order": block.reading_order,
-                            }
-                            for block in result.blocks
-                        ],
-                        "image_boxes": [list(box) for box in result.image_boxes],
-                        "metrics": {
-                            "text_drawn": result.metrics.text_drawn,
-                            "extracted_chars": result.metrics.extracted_chars,
-                            "unmapped_ratio": result.metrics.unmapped_ratio,
-                            "image_area_ratio": result.metrics.image_area_ratio,
-                        },
-                    }
-                )
-                count = number
+        for number, page in enumerate(PDFPage.get_pages(io.BytesIO(data)), start=1):
+            result = adapter.extract_page(page, number)
+            _emit(
+                {
+                    "type": "page",
+                    "page_number": result.page_number,
+                    "frame": {
+                        "cropbox": list(result.frame.cropbox),
+                        "mediabox": list(result.frame.mediabox),
+                        "rotation": result.frame.rotation,
+                    },
+                    "blocks": [
+                        {
+                            "text": block.text,
+                            "bbox": list(block.bbox),
+                            "reading_order": block.reading_order,
+                        }
+                        for block in result.blocks
+                    ],
+                    "image_boxes": [list(box) for box in result.image_boxes],
+                    "metrics": {
+                        "text_drawn": result.metrics.text_drawn,
+                        "extracted_chars": result.metrics.extracted_chars,
+                        "unmapped_ratio": result.metrics.unmapped_ratio,
+                        "image_area_ratio": result.metrics.image_area_ratio,
+                    },
+                }
+            )
+            count = number
         _emit(
             {
                 "type": "done",
@@ -69,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except Exception as error:
-        _emit({"type": "error", "message": f"{type(error).__name__}: {error}"})
+        _emit({"type": "error", "code": None, "message": f"{type(error).__name__}: {error}"})
         return 1
 
 

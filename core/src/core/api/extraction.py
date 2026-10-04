@@ -19,8 +19,6 @@ from core.persistence.store import PersistenceStore
 
 router = APIRouter()
 
-KNOWN_FAILURE_CODES = ("no_usable_text", "page_limit_exceeded")
-
 
 class ExtractionPagePayload(BaseModel):
     page_number: int
@@ -63,24 +61,18 @@ def _store(request: Request) -> PersistenceStore:
     return store
 
 
-def _failure_code(reason: str | None) -> str | None:
-    if not reason:
-        return None
-    head = reason.split(":", 1)[0].strip()
-    return head if head in KNOWN_FAILURE_CODES else None
-
-
 def _report_payload(
     source_id: str,
     report: ExtractionReport | None,
     failure_reason: str | None,
+    failure_code: str | None,
 ) -> ExtractionReportPayload:
     if report is None or report.outcome is None:
         return ExtractionReportPayload(
             source_id=source_id,
             extraction_id=None if report is None else report.extraction.id,
             outcome=None,
-            failure_code=_failure_code(failure_reason),
+            failure_code=failure_code,
             failure_detail=failure_reason,
             parser_name=None,
             parser_version=None,
@@ -142,7 +134,12 @@ def get_extraction(source_id: str, request: Request) -> ExtractionReportPayload:
     _require_source(store, source_id)
     report = store.load_extraction_report_for_source(source_id)
     status = store.load_latest_extraction_job_status(source_id)
-    return _report_payload(source_id, report, None if status is None else status.failure_reason)
+    return _report_payload(
+        source_id,
+        report,
+        None if status is None else status.failure_reason,
+        None if status is None else status.failure_code,
+    )
 
 
 @router.post("/extractions/{extraction_id}/review", response_model=ExtractionReviewPayload)

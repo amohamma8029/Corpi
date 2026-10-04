@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -43,6 +44,20 @@ def seed_source(store: PersistenceStore, name: str = "report.pdf") -> tuple[str,
     store.create_source(source_id, notebook_id, name)
     managed = ManagedFile(new_id(), f"originals/{name}", 17, "a" * 64, utc_timestamp())
     store.save_managed_file(managed)
+    version = store.create_source_version(source_id, "a" * 64, managed.id)
+    return source_id, version.id
+
+
+def seed_source_with_pdf(store: PersistenceStore, name: str, pdf: bytes) -> tuple[str, str]:
+    notebook_id = new_id()
+    store.create_notebook(notebook_id, f"Notebook {name}")
+    source_id = new_id()
+    store.create_source(source_id, notebook_id, name)
+    managed = ManagedFile(new_id(), f"originals/{name}", len(pdf), "a" * 64, utc_timestamp())
+    store.save_managed_file(managed)
+    path = store.database.config.data_dir / managed.relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(pdf)
     version = store.create_source_version(source_id, "a" * 64, managed.id)
     return source_id, version.id
 
@@ -120,11 +135,72 @@ def test_failed_extraction_surfaces_the_failure_code(tmp_path: Path) -> None:
     source_id, version_id = seed_source(store)
     job = store.create_job("extract:fail", "pdf-extract", source_id, source_version_id=version_id)
     store.create_job_status(job.id)
-    store.finish_job(job.id, "failed", "no_usable_text: the document has no usable text")
+    store.finish_job(
+        job.id,
+        "failed",
+        "step extract-text failed permanently: no_usable_text: the document has no usable text",
+        failure_code="no_usable_text",
+    )
     payload = make_client(store).get(f"/sources/{source_id}/extraction", headers=AUTH).json()
     assert payload["extraction_id"] is None
     assert payload["failure_code"] == "no_usable_text"
     assert "no usable text" in payload["failure_detail"]
+
+
+def test_failure_codes_reach_the_report_endpoint_through_the_runner(tmp_path: Path) -> None:
+    import asyncio
+    import threading
+
+    from pdf_fixtures import PageSpec, blank_pdf, build_pdf, native_text_stream
+
+    from core.jobs.runner import JobRunner
+    from core.jobs.steps import build_pdf_extract_steps
+
+    store = make_store(tmp_path)
+    client = make_client(store)
+    runner = JobRunner(store, {"pdf-extract": build_pdf_extract_steps(store)})
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def main() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(runner.start())
+        started.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=main, daemon=True)
+    thread.start()
+    assert started.wait(5)
+    try:
+        over_limit = build_pdf(
+            [PageSpec(native_text_stream(f"page {i}"), helvetica=True) for i in range(201)]
+        )
+        for name, pdf, code in (
+            ("blank.pdf", blank_pdf(), "no_usable_text"),
+            ("over.pdf", over_limit, "page_limit_exceeded"),
+        ):
+            source_id, version_id = seed_source_with_pdf(store, name, pdf)
+            job = store.create_job(
+                f"extract:api:{name}", "pdf-extract", source_id, source_version_id=version_id
+            )
+            store.create_job_status(job.id)
+            runner.notify()
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                status = store.load_job_status(job.id)
+                if status is not None and status.status == "failed":
+                    break
+                time.sleep(0.02)
+            status = store.load_job_status(job.id)
+            assert status is not None and status.status == "failed"
+            assert status.failure_code == code
+            payload = client.get(f"/sources/{source_id}/extraction", headers=AUTH).json()
+            assert payload["failure_code"] == code
+            assert code in payload["failure_detail"]
+    finally:
+        asyncio.run_coroutine_threadsafe(runner.stop(), loop).result(10)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(10)
 
 
 def test_source_without_extraction_reports_empty(tmp_path: Path) -> None:

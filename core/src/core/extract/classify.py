@@ -61,14 +61,14 @@ class DocumentDecision:
 def decide_document_outcome(page_classes: Sequence[str]) -> DocumentDecision:
     """Apply decision 4's outcomes in order: no usable text first, then partial, then complete.
 
-    Usable text means search-eligible readable text (`extracted`) or questionable text kept
-    for inspection (`suspect`) — page numbers on unread scans do not make a document usable.
+    Usable text means search-eligible readable text (`extracted`). Questionable `suspect`
+    text stays out of search, so a document with no `extracted` page offers no eligible
+    evidence and fails `no_usable_text` — confirmation can never approve an empty hand.
     """
     for classification in page_classes:
         if classification not in PAGE_CLASSES:
             raise ValueError("page classification is not a known state")
-    usable = any(classification in ("extracted", "suspect") for classification in page_classes)
-    if not usable:
+    if not any(classification == "extracted" for classification in page_classes):
         return DocumentDecision("failed", NO_USABLE_TEXT)
     if any(classification in UNRELIABLE_CLASSES for classification in page_classes):
         return DocumentDecision("partial", None)
