@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from pdf_fixtures import (
     PageSpec,
@@ -21,6 +22,7 @@ from core.jobs.runner import (
     JobRunner,
     StepContext,
     StepDefinition,
+    StepOutcome,
     StepPolicy,
 )
 from core.jobs.steps import (
@@ -308,6 +310,42 @@ def test_stuck_child_keeps_status_responsive_and_frees_the_runner(
     assert observed_cancel.is_set()
     stuck_status = store.load_job_status(stuck_job)
     assert stuck_status is not None and stuck_status.status == "failed"
+
+
+def test_interrupted_rerun_matches_an_uninterrupted_control(store: PersistenceStore) -> None:
+    source_id, version_id = seed_extraction_source(
+        store, "e1-control.pdf", native_text_pdf("Control body text", "Second page body")
+    )
+    step = build_pdf_extract_steps(store)[0]
+    control_job = enqueue_extract(store, "pdf-extract:e1:control", source_id, version_id)
+    rerun_job = enqueue_extract(store, "pdf-extract:e1:rerun", source_id, version_id)
+
+    def run_once(job_id: str, attempt: int) -> StepOutcome:
+        return step.run(
+            StepContext(
+                job_id=job_id,
+                step_key=PDF_EXTRACT_STEP_KEY,
+                attempt_number=attempt,
+                is_cancelled=lambda: False,
+                should_stop=lambda: False,
+            )
+        )
+
+    def digest(outcome: StepOutcome) -> dict[str, object]:
+        payload: Any = outcome.checkpoint
+        return {
+            "passages": [(item["text"], item["location"]) for item in payload["passages"]],
+            "pages": [
+                (item["page_number"], item["classification"], item["extracted_chars"])
+                for item in payload["pages"]
+            ],
+        }
+
+    control = digest(run_once(control_job, 1))
+    discarded = digest(run_once(rerun_job, 1))
+    rerun = digest(run_once(rerun_job, 2))
+    assert rerun == control
+    assert discarded == control
 
 
 def test_inputs_fingerprint_includes_rule_versions_and_settings(store: PersistenceStore) -> None:

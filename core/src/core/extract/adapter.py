@@ -69,12 +69,86 @@ def _collect(
     if isinstance(element, LTChar):
         chars.append(element.get_text())
         return
-    if isinstance(element, (LTImage, LTFigure)):
+    if isinstance(element, LTImage):
         x0, y0, x1, y1 = element.bbox
         image_boxes.append((float(x0), float(y0), float(x1), float(y1)))
         return
+    if isinstance(element, LTFigure):
+        # A figure is an image-like placement, but it can wrap drawn text (Form
+        # XObjects) — record the box and keep walking so wrapped text is never lost.
+        x0, y0, x1, y1 = element.bbox
+        image_boxes.append((float(x0), float(y0), float(x1), float(y1)))
     for child in getattr(element, "_objs", []) or []:
         _collect(child, chars, image_boxes)
+
+
+def _has_text_container(descendants: list[object]) -> bool:
+    for child in descendants:
+        if isinstance(child, _LTTextContainer):
+            return True
+        if _has_text_container(getattr(child, "_objs", []) or []):
+            return True
+    return False
+
+
+def _collect_blocks(
+    element: object,
+    blocks: list[ExtractedBlock],
+) -> None:
+    """Collect text blocks at any depth.
+
+    Layout analysis puts page text in containers; figure-wrapped text (Form XObjects)
+    can be a flat glyph run with no container at all, so a container-less subtree that
+    draws glyphs is kept as one raw block instead of being dropped.
+    """
+    if isinstance(element, _LTTextContainer):
+        text = element.get_text()
+        if text.strip():
+            x0, y0, x1, y1 = element.bbox
+            blocks.append(
+                ExtractedBlock(
+                    text,
+                    (float(x0), float(y0), float(x1), float(y1)),
+                    len(blocks),
+                )
+            )
+        return
+    children = getattr(element, "_objs", []) or []
+    if children and not _has_text_container(children):
+        chars: list[str] = []
+        boxes: list[tuple[float, float, float, float]] = []
+        _gather_glyphs(element, chars, boxes)
+        if any(char.strip() for char in chars):
+            x0 = min(box[0] for box in boxes)
+            y0 = min(box[1] for box in boxes)
+            x1 = max(box[2] for box in boxes)
+            y1 = max(box[3] for box in boxes)
+            blocks.append(
+                ExtractedBlock(
+                    "".join(chars),
+                    (float(x0), float(y0), float(x1), float(y1)),
+                    len(blocks),
+                )
+            )
+        return
+    for child in children:
+        _collect_blocks(child, blocks)
+
+
+def _gather_glyphs(
+    element: object,
+    chars: list[str],
+    boxes: list[tuple[float, float, float, float]],
+) -> None:
+    from pdfminer.layout import LTChar
+
+    if isinstance(element, LTChar):
+        chars.append(element.get_text())
+        bx0, by0, bx1, by1 = element.bbox
+        boxes.append((float(bx0), float(by0), float(bx1), float(by1)))
+        return
+    for child in getattr(element, "_objs", []) or []:
+        _gather_glyphs(child, chars, boxes)
 
 
 class ExtractionAdapter:
@@ -93,17 +167,7 @@ class ExtractionAdapter:
         image_boxes: list[tuple[float, float, float, float]] = []
         blocks: list[ExtractedBlock] = []
         for element in layout:
-            if isinstance(element, _LTTextContainer):
-                text = element.get_text()
-                if text.strip():
-                    x0, y0, x1, y1 = element.bbox
-                    blocks.append(
-                        ExtractedBlock(
-                            text,
-                            (float(x0), float(y0), float(x1), float(y1)),
-                            len(blocks),
-                        )
-                    )
+            _collect_blocks(element, blocks)
             _collect(element, chars, image_boxes)
 
         glyph_runs = len(chars)

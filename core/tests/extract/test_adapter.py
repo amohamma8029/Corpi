@@ -8,6 +8,7 @@ from pdf_fixtures import (
     PageSpec,
     blank_pdf,
     build_pdf,
+    form_text_pdf,
     image_draw_stream,
     image_only_pdf,
     native_text_pdf,
@@ -95,6 +96,15 @@ def test_blocks_carry_layout_boxes_in_points() -> None:
     assert x0 == 72.0
     assert 700 < y0 < 792
     assert x1 > x0 and y1 > y0
+
+
+def test_figure_wrapped_text_is_counted_not_lost() -> None:
+    page = extract_all(form_text_pdf())[0]
+    metrics = page.metrics
+    assert metrics.text_drawn is True
+    assert metrics.extracted_chars == len("Wrappedfiguretext")
+    assert metrics.image_area_ratio > 0
+    assert any("Wrapped figure text" in block.text for block in page.blocks)
 
 
 def test_fixture_bytes_are_deterministic() -> None:

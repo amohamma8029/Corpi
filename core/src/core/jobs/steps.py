@@ -138,7 +138,7 @@ def _page_records(
                     "location_format_version": LOCATION_FORMAT_VERSION,
                     "location": location_json(
                         page_number=page.page_number,
-                        kind=classify_block_kind(text),
+                        kind=classify_block_kind(block.text),
                         bbox=bbox,
                         reading_order=block.reading_order,
                     ),
@@ -390,7 +390,7 @@ def build_pdf_extract_steps(
         limit_code = check_page_limit(page_total)
         if limit_code is not None:
             raise PermanentStepFailure(
-                f"{limit_code}: document proves {page_total} pages, "
+                f"{limit_code}: document proves at least {page_total} pages, "
                 f"above the {MAX_EXTRACTION_PAGES}-page extraction limit"
             )
 

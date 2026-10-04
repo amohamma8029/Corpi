@@ -16,6 +16,7 @@ import {
   listPdfImports,
   reopenExtractionReview,
   retryPdfAcquisition,
+  retryPdfProcessing,
   uploadPdf,
   type ExtractionReport,
   type PdfAcquisition,
@@ -36,6 +37,7 @@ vi.mock("./api/client", async (loadActual) => {
     listPdfAcquisitions: vi.fn(),
     listPdfImports: vi.fn(),
     retryPdfAcquisition: vi.fn(),
+    retryPdfProcessing: vi.fn(),
     cancelPdfAcquisition: vi.fn(),
     getPdfAcquisition: vi.fn(),
     createPdfAcquisition: vi.fn(),
@@ -308,4 +310,24 @@ it("surfaces extraction failure codes instead of a generic label", async () => {
   });
   render(<App />);
   expect(await screen.findByText(/no usable text could be read/)).toBeTruthy();
+});
+
+it("refetches the extraction report after processing actions", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue(emptyExtraction);
+  const failedImport = {
+    id: "import-1", source_id: source.id, source_version_id: "version-1",
+    filename: "failed.pdf", state: "failed", failure_code: null,
+    size_bytes: 10, sha256: "a".repeat(64), created_at: notebook.created_at,
+    trashed: false, is_current: true, is_pending: false,
+  };
+  vi.mocked(listPdfImports).mockResolvedValue([failedImport]);
+  vi.mocked(retryPdfProcessing).mockResolvedValue({ job_id: "job-1", status: "queued" });
+  render(<App />);
+  const retry = await screen.findByRole("button", { name: "Retry processing" });
+  await waitFor(() => expect(getExtraction).toHaveBeenCalled());
+  const before = vi.mocked(getExtraction).mock.calls.length;
+  fireEvent.click(retry);
+  await waitFor(() => expect(getExtraction).toHaveBeenCalledTimes(before + 1));
+  expect(getExtraction).toHaveBeenLastCalledWith(connection, source.id);
 });
