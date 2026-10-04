@@ -312,6 +312,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sources/{source_id}/extraction": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Extraction */
+        get: operations["get_extraction_sources__source_id__extraction_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extractions/{extraction_id}/review": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Decide Review
+         * @description Confirm or Decline the exact extraction the user reviewed (currency rechecked).
+         */
+        post: operations["decide_review_extractions__extraction_id__review_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/extractions/{extraction_id}/review/reopen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reopen Review
+         * @description Review Again: reopen the decision and supersede older open dialogs.
+         */
+        post: operations["reopen_review_extractions__extraction_id__review_reopen_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -372,6 +429,54 @@ export interface components {
             can_cancel: boolean;
             /** Requires Upload */
             requires_upload: boolean;
+        };
+        /** ExtractionPagePayload */
+        ExtractionPagePayload: {
+            /** Page Number */
+            page_number: number;
+            /** Classification */
+            classification: string;
+            /** Text Drawn */
+            text_drawn: boolean;
+            /** Extracted Chars */
+            extracted_chars: number;
+            /** Unmapped Ratio */
+            unmapped_ratio: number;
+            /** Image Area Ratio */
+            image_area_ratio: number;
+        };
+        /** ExtractionReportPayload */
+        ExtractionReportPayload: {
+            /** Source Id */
+            source_id: string;
+            /** Extraction Id */
+            extraction_id: string | null;
+            /** Outcome */
+            outcome: string | null;
+            /** Failure Code */
+            failure_code: string | null;
+            /** Failure Detail */
+            failure_detail: string | null;
+            /** Parser Name */
+            parser_name: string | null;
+            /** Parser Version */
+            parser_version: string | null;
+            /** Normalization Version */
+            normalization_version: string | null;
+            /** Passage Count */
+            passage_count: number;
+            /** Pages */
+            pages: components["schemas"]["ExtractionPagePayload"][];
+            review: components["schemas"]["ExtractionReviewPayload"] | null;
+        };
+        /** ExtractionReviewPayload */
+        ExtractionReviewPayload: {
+            /** State */
+            state: string;
+            /** Generation */
+            generation: number;
+            /** Decided At */
+            decided_at: string | null;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -478,6 +583,13 @@ export interface components {
             job_id: string;
             /** Status */
             status: string;
+        };
+        /** ReviewDecisionRequest */
+        ReviewDecisionRequest: {
+            /** Decision */
+            decision: string;
+            /** Generation */
+            generation: number;
         };
         /** SourcePayload */
         SourcePayload: {
@@ -1131,6 +1243,103 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StoragePayload"];
+                };
+            };
+        };
+    };
+    get_extraction_sources__source_id__extraction_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractionReportPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    decide_review_extractions__extraction_id__review_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                extraction_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewDecisionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractionReviewPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reopen_review_extractions__extraction_id__review_reopen_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                extraction_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExtractionReviewPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

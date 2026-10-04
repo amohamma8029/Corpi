@@ -30,6 +30,9 @@ export type PdfImport = components["schemas"]["ImportPayload"];
 export type StorageReport = components["schemas"]["StoragePayload"];
 export type PdfImportTrash = components["schemas"]["TrashPayload"];
 export type ProcessingAction = components["schemas"]["ProcessingActionPayload"];
+export type ExtractionPageReport = components["schemas"]["ExtractionPagePayload"];
+export type ExtractionReview = components["schemas"]["ExtractionReviewPayload"];
+export type ExtractionReport = components["schemas"]["ExtractionReportPayload"];
 export type CoreHealth = paths["/health"]["get"]["responses"][200]["content"]["application/json"];
 
 export async function coreRequest<T>(
@@ -242,4 +245,33 @@ export async function coreHealthWithRetry(
     }
   }
   throw lastError;
+}
+
+export function getExtraction(
+  connection: CoreConnection,
+  sourceId: string,
+): Promise<ExtractionReport> {
+  return coreRequest(connection, `/sources/${encodeURIComponent(sourceId)}/extraction`);
+}
+
+export function decideExtractionReview(
+  connection: CoreConnection,
+  extractionId: string,
+  payload: { decision: "confirmed" | "declined"; generation: number },
+): Promise<ExtractionReview> {
+  return coreRequest(connection, `/extractions/${encodeURIComponent(extractionId)}/review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function reopenExtractionReview(
+  connection: CoreConnection,
+  extractionId: string,
+): Promise<ExtractionReview> {
+  return coreRequest(connection, `/extractions/${encodeURIComponent(extractionId)}/review/reopen`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
 }

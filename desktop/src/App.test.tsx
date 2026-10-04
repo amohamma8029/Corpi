@@ -7,13 +7,17 @@ import {
   createNotebook,
   cancelPdfAcquisition,
   createPdfAcquisition,
+  decideExtractionReview,
+  getExtraction,
   getPdfAcquisition,
   listNotebooks,
   listNotebookSources,
   listPdfAcquisitions,
   listPdfImports,
+  reopenExtractionReview,
   retryPdfAcquisition,
   uploadPdf,
+  type ExtractionReport,
   type PdfAcquisition,
   storageReport,
 } from "./api/client";
@@ -36,6 +40,9 @@ vi.mock("./api/client", async (loadActual) => {
     getPdfAcquisition: vi.fn(),
     createPdfAcquisition: vi.fn(),
     uploadPdf: vi.fn(),
+    getExtraction: vi.fn(),
+    decideExtractionReview: vi.fn(),
+    reopenExtractionReview: vi.fn(),
   };
 });
 
@@ -53,6 +60,43 @@ const savedAttempt: PdfAcquisition = {
   can_retry: true, can_cancel: true, requires_upload: false,
 };
 
+const source = {
+  id: "source-1", notebook_id: notebook.id, display_name: "Field report",
+  created_at: notebook.created_at, updated_at: notebook.updated_at,
+  current_import_id: "import-1", pending_import_id: null,
+};
+
+const emptyExtraction: ExtractionReport = {
+  source_id: source.id,
+  extraction_id: null,
+  outcome: null,
+  failure_code: null,
+  failure_detail: null,
+  parser_name: null,
+  parser_version: null,
+  normalization_version: null,
+  passage_count: 0,
+  pages: [],
+  review: null,
+};
+
+const partialExtraction: ExtractionReport = {
+  source_id: source.id,
+  extraction_id: "extraction-1",
+  outcome: "partial",
+  failure_code: null,
+  failure_detail: null,
+  parser_name: "pdfminer.six",
+  parser_version: "20260107",
+  normalization_version: "faithfully-normalized-text-v1",
+  passage_count: 1,
+  pages: [
+    { page_number: 1, classification: "extracted", text_drawn: true, extracted_chars: 120, unmapped_ratio: 0, image_area_ratio: 0 },
+    { page_number: 2, classification: "image-only", text_drawn: true, extracted_chars: 1, unmapped_ratio: 0, image_area_ratio: 0.62 },
+  ],
+  review: { state: "pending", generation: 1, decided_at: null },
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(invoke).mockResolvedValue(connection);
@@ -61,6 +105,7 @@ beforeEach(() => {
   vi.mocked(listNotebookSources).mockResolvedValue([]);
   vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
   vi.mocked(listPdfImports).mockResolvedValue([]);
+  vi.mocked(getExtraction).mockResolvedValue(emptyExtraction);
   vi.mocked(storageReport).mockResolvedValue({
     original_file_count: 0, original_bytes: 0, bytes_pending_removal: 0, retained_staging_bytes: 200,
     max_upload_bytes: 25_000_000, rendered_page_pixel_limit: 20_000_000,
@@ -210,4 +255,57 @@ it("reselects partial input for the existing attempt instead of creating a secon
   await waitFor(() => expect(uploadPdf).toHaveBeenCalledWith(connection, partial.id, file, expect.any(AbortSignal)));
   expect(createPdfAcquisition).not.toHaveBeenCalled();
   await waitFor(() => expect(screen.queryByRole("button", { name: "Select PDF again" })).toBeNull());
+});
+
+it("shows the page report with Confirm and Decline for a partial extraction", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue(partialExtraction);
+  render(<App />);
+  const report = await screen.findByRole("region", { name: "Text extraction" });
+  expect(report.textContent).toContain("Outcome: partial");
+  expect(report.textContent).toContain("Page 2 — image-only");
+  expect(report.textContent).toContain("62% images");
+  expect(within(report).getByRole("button", { name: "Confirm" })).toBeTruthy();
+  expect(within(report).getByRole("button", { name: "Decline" })).toBeTruthy();
+});
+
+it("confirms the reviewed extraction with its generation and offers Review Again", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue(partialExtraction);
+  vi.mocked(decideExtractionReview).mockResolvedValue({
+    state: "confirmed", generation: 1, decided_at: "2026-10-03T00:00:00.000000Z",
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Confirm" }));
+  await waitFor(() =>
+    expect(decideExtractionReview).toHaveBeenCalledWith(connection, "extraction-1", {
+      decision: "confirmed", generation: 1,
+    }),
+  );
+  expect(await screen.findByText("Review: confirmed")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Review Again" })).toBeTruthy();
+});
+
+it("reopens the decision through Review Again", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue({
+    ...partialExtraction,
+    review: { state: "declined", generation: 1, decided_at: "2026-10-03T00:00:00.000000Z" },
+  });
+  vi.mocked(reopenExtractionReview).mockResolvedValue({ state: "pending", generation: 2, decided_at: null });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Review Again" }));
+  await waitFor(() => expect(reopenExtractionReview).toHaveBeenCalledWith(connection, "extraction-1"));
+  expect(await screen.findByRole("button", { name: "Confirm" })).toBeTruthy();
+});
+
+it("surfaces extraction failure codes instead of a generic label", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue({
+    ...emptyExtraction,
+    failure_code: "no_usable_text",
+    failure_detail: "no_usable_text: the document has no usable text to extract",
+  });
+  render(<App />);
+  expect(await screen.findByText(/no usable text could be read/)).toBeTruthy();
 });
