@@ -9,6 +9,10 @@ import {
   CoreHealth,
   createNotebook,
   createPdfAcquisition,
+  decideExtractionReview,
+  ExtractionReport,
+  ExtractionReview,
+  getExtraction,
   getPdfAcquisition,
   listNotebookSources,
   listNotebooks,
@@ -18,6 +22,7 @@ import {
   NotebookSource,
   PdfAcquisition,
   PdfImport,
+  reopenExtractionReview,
   retryPdfAcquisition,
   retryPdfProcessing,
   StorageReport,
@@ -55,6 +60,7 @@ export function App() {
   const [storage, setStorage] = useState<StorageReport | null>(null);
   const [acquisition, setAcquisition] = useState<PdfAcquisition | null>(null);
   const [savedAcquisitions, setSavedAcquisitions] = useState<PdfAcquisition[]>([]);
+  const [extraction, setExtraction] = useState<ExtractionReport | null>(null);
   const [uploading, setUploading] = useState(false);
   const [viewerImport, setViewerImport] = useState<PdfImport | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -163,6 +169,24 @@ export function App() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [acquisition?.id, connection, uploading]);
 
+  useEffect(() => {
+    if (!connection || !selectedSourceId) {
+      setExtraction(null);
+      return;
+    }
+    let cancelled = false;
+    void getExtraction(connection, selectedSourceId)
+      .then((report) => {
+        if (!cancelled) setExtraction(report);
+      })
+      .catch(() => {
+        if (!cancelled) setExtraction(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connection, selectedSourceId]);
+
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? null;
   const visibleAcquisitions = [
     ...savedAcquisitions.filter((item) => item.id !== acquisition?.id),
@@ -204,6 +228,35 @@ export function App() {
       setNotebooks(items);
       setSelectedNotebookId(created.id);
       setNotebookTitle("");
+      setError(null);
+    } catch (cause) {
+      setError(messageFor(cause));
+    }
+  }
+
+  async function decideReview(decision: "confirmed" | "declined") {
+    if (!connection || !extraction?.extraction_id || !extraction.review) return;
+    try {
+      const review: ExtractionReview = await decideExtractionReview(
+        connection,
+        extraction.extraction_id,
+        { decision, generation: extraction.review.generation },
+      );
+      setExtraction((current) => (current ? { ...current, review } : current));
+      setError(null);
+    } catch (cause) {
+      setError(messageFor(cause));
+    }
+  }
+
+  async function reviewAgain() {
+    if (!connection || !extraction?.extraction_id) return;
+    try {
+      const review: ExtractionReview = await reopenExtractionReview(
+        connection,
+        extraction.extraction_id,
+      );
+      setExtraction((current) => (current ? { ...current, review } : current));
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
@@ -483,6 +536,54 @@ export function App() {
                     ))}
                   </ul>
                 ) : <p>No PDFs imported yet.</p>}
+                {extraction ? (
+                  <section className="extraction-report" aria-label="Text extraction">
+                    <h3>Text extraction</h3>
+                    {extraction.failure_code ? (
+                      <p role="alert">
+                        {extraction.failure_code === "no_usable_text"
+                          ? "Extraction failed: no usable text could be read from this PDF."
+                          : extraction.failure_code === "page_limit_exceeded"
+                            ? "Extraction failed: the document is over the page limit."
+                            : `Extraction failed: ${extraction.failure_code}`}
+                      </p>
+                    ) : null}
+                    {extraction.outcome ? <p>Outcome: {extraction.outcome}</p> : null}
+                    {extraction.pages.length ? (
+                      <ul className="page-report" aria-label="Page report">
+                        {extraction.pages.map((page) => (
+                          <li key={page.page_number}>
+                            Page {page.page_number} — {page.classification} (
+                            {page.extracted_chars} chars
+                            {page.image_area_ratio > 0
+                              ? `, ${Math.round(page.image_area_ratio * 100)}% images`
+                              : ""}
+                            )
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    {extraction.review && extraction.extraction_id ? (
+                      extraction.review.state === "pending" ? (
+                        <div>
+                          <button type="button" onClick={() => void decideReview("confirmed")}>
+                            Confirm
+                          </button>
+                          <button type="button" onClick={() => void decideReview("declined")}>
+                            Decline
+                          </button>
+                        </div>
+                      ) : (
+                        <div>
+                          <p>Review: {extraction.review.state}</p>
+                          <button type="button" onClick={() => void reviewAgain()}>
+                            Review Again
+                          </button>
+                        </div>
+                      )
+                    ) : null}
+                  </section>
+                ) : null}
               </>
             ) : (
               <div className="empty-state">
