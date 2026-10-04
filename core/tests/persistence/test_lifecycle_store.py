@@ -18,6 +18,7 @@ from core.persistence.migrations import load_migrations
 from core.persistence.models import (
     AttemptGuard,
     ChunkPassage,
+    ExtractionOutcome,
     ExtractionVersion,
     IndexVersion,
     ManagedFile,
@@ -161,7 +162,19 @@ def seed_graph(
 ) -> tuple[str, SourceVersion, tuple[IndexVersion, ...], str]:
     source_id, source_version = seed_source(store, name)
     extraction, passages = make_extraction(source_id, source_version)
-    store.save_extraction(extraction, passages)
+    store.save_extraction_result(
+        extraction,
+        passages,
+        (),
+        (),
+        ExtractionOutcome(
+            extraction.id,
+            extraction.source_id,
+            extraction.source_version_id,
+            "complete",
+            utc_timestamp(),
+        ),
+    )
     job = store.create_job(
         f"extract:{source_version.id}",
         "extract",

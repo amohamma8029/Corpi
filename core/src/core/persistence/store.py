@@ -3660,8 +3660,9 @@ def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionRe
     Mirrors readiness publication plus the candidate's own import and processing state:
     the extraction's source version must still be current (otherwise it was superseded),
     neither the source nor the candidate import may be trashed, the candidate import must
-    still be ready (cancelled or failed processing leaves it `failed`), and the candidate's
-    processing job must not have been cancelled.
+    not have failed (cancelled processing lands as `failed` too), and the candidate's
+    processing job must not have been cancelled. A `pending` import is legitimate — it
+    stays pending until the confirmed extraction reaches readiness.
     """
     current_row = connection.execute(
         """SELECT id FROM source_versions WHERE source_id=?
@@ -3683,10 +3684,8 @@ def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionRe
         (review.source_version_id,),
     )
     if import_row is not None:
-        if import_row["state"] != "ready":
-            raise ConflictingWriteError(
-                f"candidate import is not ready ({import_row['state']}); confirmation rejected"
-            )
+        if import_row["state"] == "failed":
+            raise ConflictingWriteError("candidate import failed; confirmation rejected")
         import_trash = _fetchone(
             connection, "SELECT 1 FROM pdf_import_trash WHERE import_id=?", (import_row["id"],)
         )
@@ -3709,10 +3708,11 @@ def _verify_extraction_decision(
 ) -> None:
     """Publication verifies the decision of the exact extraction the indexes came from.
 
-    Each published index resolves to its extraction; when that extraction carries a
-    decision record it must be `complete` or confirmed. An older complete extraction can
-    never bless a newer unconfirmed partial one. Extractions without a decision record are
-    pre-M1.5 records (1.2's shape, used by synthetic fixtures) and have nothing to enforce.
+    Each published index resolves to its extraction; that extraction must carry a recorded
+    decision and it must be `complete` or confirmed. An older complete extraction can never
+    bless a newer unconfirmed partial one, and an extraction without outcome metadata is
+    rejected: without it the core cannot establish whether the extraction was complete or
+    needed confirmation.
     """
     if not index_version_ids:
         return
@@ -3731,7 +3731,7 @@ def _verify_extraction_decision(
             (extraction_id,),
         )
         if outcome is None:
-            continue
+            raise ConflictingWriteError("extraction decision is missing; publication rejected")
         if outcome["outcome"] == "complete":
             continue
         review_row = _fetchone(

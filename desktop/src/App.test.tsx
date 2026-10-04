@@ -399,3 +399,28 @@ it("ignores a report that arrives after switching sources", async () => {
   await waitFor(() => expect(screen.queryByText("Outcome: partial")).toBeNull());
   expect(screen.getByText("Outcome: complete")).toBeTruthy();
 });
+
+it("ignores a file list that arrives after switching sources", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source, sourceB]);
+  let resolveStale!: (items: typeof failedImport[]) => void;
+  vi.mocked(listPdfImports)
+    .mockResolvedValueOnce([failedImport])
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveStale = resolve;
+        }),
+    )
+    .mockResolvedValue([{ ...failedImport, id: "import-2", source_id: sourceB.id, filename: "b.pdf" }]);
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Retry processing" }));
+  await waitFor(() => expect(retryPdfProcessing).toHaveBeenCalled());
+  fireEvent.click(screen.getByRole("button", { name: "Second source" }));
+  expect(await screen.findByText(/b\.pdf/)).toBeTruthy();
+  resolveStale([{ ...failedImport, filename: "a.pdf" }]);
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(screen.queryByText(/a\.pdf/)).toBeNull();
+  expect(screen.getByText(/b\.pdf/)).toBeTruthy();
+});

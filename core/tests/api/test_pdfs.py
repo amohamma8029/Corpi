@@ -24,6 +24,7 @@ from core.persistence.errors import PersistenceError
 from core.persistence.models import (
     AttemptGuard,
     ChunkPassage,
+    ExtractionOutcome,
     ExtractionVersion,
     IndexVersion,
     ManagedFile,
@@ -195,6 +196,9 @@ def publish_pdf_import(store: PersistenceStore, source_id: str, import_id: str) 
         1,
         {"pages": 1},
         guard=extract_guard,
+        outcome=ExtractionOutcome(
+            extraction_id, source_id, item.source_version_id, "complete", timestamp
+        ),
     )
     store.finish_step_attempt(extract_job_id, "extract-text", extract_attempt.attempt_number)
     store.finish_job(extract_job_id, "completed")

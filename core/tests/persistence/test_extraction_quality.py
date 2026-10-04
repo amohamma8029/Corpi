@@ -502,6 +502,23 @@ def test_publication_rejects_an_unconfirmed_indexed_extraction(store: Persistenc
     assert ready.published_by_job_id == job.id
 
 
+def test_publication_rejects_an_extraction_without_an_outcome(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction(extraction, (make_passage(extraction),))
+    job = store.create_job(
+        "guard:missing",
+        "index-build",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=extraction.id,
+    )
+    index = make_index(extraction)
+    guard = commit_index(store, job.id, index)
+    with pytest.raises(ConflictingWriteError, match="extraction decision is missing"):
+        store.publish_readiness(job.id, source_id, source_version.id, [index.id], guard=guard)
+
+
 def test_publication_keys_to_the_indexed_extraction_not_an_older_complete_one(
     store: PersistenceStore,
 ) -> None:
@@ -628,7 +645,7 @@ def test_confirm_rejects_a_failed_candidate_import(store: PersistenceStore) -> N
         make_review(extraction),
     )
     attach_import(store, source_id, source_version.id, state="failed")
-    with pytest.raises(ConflictingWriteError, match="not ready"):
+    with pytest.raises(ConflictingWriteError, match="candidate import failed"):
         store.record_review_decision(extraction.id, "confirmed", 1)
 
 
