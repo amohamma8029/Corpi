@@ -52,7 +52,15 @@ WAITING_FOR_IMPLEMENTATION = {
 
 
 class PermanentStepFailure(Exception):
-    """A step failure that must not be retried (invalid input, unsupported data)."""
+    """A step failure that must not be retried (invalid input, unsupported data).
+
+    ``code`` is an optional machine-readable failure code (for example
+    ``no_usable_text``) carried through persistence to the API alongside the message.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class PaidCallOutcomeUnknown(Exception):
@@ -614,10 +622,13 @@ class JobRunner:
                     f"PermanentStepFailure: {error}",
                 )
                 await self._db(
-                    self._store.finish_job,
-                    job.id,
-                    "failed",
-                    f"step {step.step_key} failed permanently: {error}",
+                    partial(
+                        self._store.finish_job,
+                        job.id,
+                        "failed",
+                        f"step {step.step_key} failed permanently: {error}",
+                        failure_code=error.code,
+                    )
                 )
                 return False
             except Exception as error:  # noqa: BLE001 - failures are recorded, not raised

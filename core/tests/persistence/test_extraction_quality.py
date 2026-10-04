@@ -12,6 +12,7 @@ from core.persistence.models import (
     ExtractionPage,
     ExtractionReview,
     ExtractionVersion,
+    IndexVersion,
     JSONValue,
     ManagedFile,
     Passage,
@@ -132,6 +133,58 @@ def make_review(extraction: ExtractionVersion) -> ExtractionReview:
         None,
         utc_timestamp(),
     )
+
+
+def make_index(extraction: ExtractionVersion) -> IndexVersion:
+    return IndexVersion(
+        new_id(),
+        extraction.source_id,
+        extraction.source_version_id,
+        extraction.id,
+        "keyword-v1",
+        "chunker-1",
+        1,
+        {"k": 60},
+        None,
+        None,
+        utc_timestamp(),
+    )
+
+
+def commit_index(store: PersistenceStore, job_id: str, index: IndexVersion) -> AttemptGuard:
+    if store.load_job_status(job_id) is None:
+        store.create_job_status(job_id)
+    store.claim_job(job_id, "guard-tests")
+    attempt = store.start_step_attempt(job_id, "build-index")
+    guard = AttemptGuard("guard-tests", "build-index", attempt.attempt_number)
+    store.commit_index_step(job_id, "build-index", index, (), (), 1, {"index": 1}, guard=guard)
+    return guard
+
+
+def attach_import(
+    store: PersistenceStore, source_id: str, version_id: str, state: str = "ready"
+) -> str:
+    """Register the import row and source state a real processing flow would leave behind."""
+    import_id = new_id()
+    now = utc_timestamp()
+    with store.database.connect() as connection:
+        connection.execute(
+            """INSERT INTO pdf_imports(id, source_id, source_version_id, acquisition_id,
+                   display_filename, state, created_at, updated_at)
+               VALUES(?,?,?,NULL,?,?,?,?)""",
+            (import_id, source_id, version_id, "import.pdf", state, now, now),
+        )
+        connection.execute(
+            """INSERT INTO source_pdf_state(
+                   source_id,current_import_id,pending_import_id,revision,updated_at
+               ) VALUES(?,?,NULL,1,?)
+               ON CONFLICT(source_id) DO UPDATE SET
+                   current_import_id=excluded.current_import_id,
+                   revision=source_pdf_state.revision+1,
+                   updated_at=excluded.updated_at""",
+            (source_id, import_id, now),
+        )
+    return import_id
 
 
 def test_result_commits_pages_visuals_outcome_and_review_together(store: PersistenceStore) -> None:
@@ -420,7 +473,7 @@ def test_blank_page_may_carry_decorative_image(store: PersistenceStore) -> None:
     assert report.pages[0].classification == "blank"
 
 
-def test_publication_rejects_unconfirmed_extraction_decision(store: PersistenceStore) -> None:
+def test_publication_rejects_an_unconfirmed_indexed_extraction(store: PersistenceStore) -> None:
     source_id, source_version = seed_source(store)
     extraction = make_extraction(source_id, source_version)
     store.save_extraction_result(
@@ -432,27 +485,67 @@ def test_publication_rejects_unconfirmed_extraction_decision(store: PersistenceS
         make_review(extraction),
     )
     job = store.create_job(
-        "guard:publish", "index-build", source_id, source_version_id=source_version.id
+        "guard:publish",
+        "index-build",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=extraction.id,
     )
-    store.create_job_status(job.id)
-    store.claim_job(job.id, "guard-tests")
-    attempt = store.start_step_attempt(job.id, "build-index")
-    guard = AttemptGuard("guard-tests", "build-index", attempt.attempt_number)
-    unconfirmed_index = new_id()
+    index = make_index(extraction)
+    guard = commit_index(store, job.id, index)
 
     with pytest.raises(ConflictingWriteError, match="extraction decision"):
-        store.publish_readiness(
-            job.id, source_id, source_version.id, [unconfirmed_index], guard=guard
-        )
+        store.publish_readiness(job.id, source_id, source_version.id, [index.id], guard=guard)
 
     store.record_review_decision(extraction.id, "confirmed", 1)
-    with pytest.raises(ConflictingWriteError, match="not committed"):
-        store.publish_readiness(
-            job.id, source_id, source_version.id, [unconfirmed_index], guard=guard
-        )
+    ready = store.publish_readiness(job.id, source_id, source_version.id, [index.id], guard=guard)
+    assert ready.published_by_job_id == job.id
 
 
-def test_publication_allows_a_complete_extraction_decision(store: PersistenceStore) -> None:
+def test_publication_keys_to_the_indexed_extraction_not_an_older_complete_one(
+    store: PersistenceStore,
+) -> None:
+    source_id, source_version = seed_source(store)
+    older = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        older,
+        (make_passage(older),),
+        (make_page(older),),
+        (),
+        make_outcome(older, "complete"),
+    )
+    newer = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        newer,
+        (make_passage(newer),),
+        (
+            make_page(
+                newer,
+                text_drawn=True,
+                extracted_chars=1,
+                image_area_ratio=0.9,
+                classification="image-only",
+            ),
+        ),
+        (),
+        make_outcome(newer, "partial"),
+        make_review(newer),
+    )
+    job = store.create_job(
+        "guard:keyed",
+        "index-build",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=newer.id,
+    )
+    index = make_index(newer)
+    guard = commit_index(store, job.id, index)
+
+    with pytest.raises(ConflictingWriteError, match="extraction decision"):
+        store.publish_readiness(job.id, source_id, source_version.id, [index.id], guard=guard)
+
+
+def test_publication_allows_a_complete_indexed_extraction(store: PersistenceStore) -> None:
     source_id, source_version = seed_source(store)
     extraction = make_extraction(source_id, source_version)
     store.save_extraction_result(
@@ -463,14 +556,127 @@ def test_publication_allows_a_complete_extraction_decision(store: PersistenceSto
         make_outcome(extraction, "complete"),
     )
     job = store.create_job(
-        "guard:complete", "index-build", source_id, source_version_id=source_version.id
+        "guard:complete",
+        "index-build",
+        source_id,
+        source_version_id=source_version.id,
+        extraction_version_id=extraction.id,
+    )
+    index = make_index(extraction)
+    guard = commit_index(store, job.id, index)
+    ready = store.publish_readiness(job.id, source_id, source_version.id, [index.id], guard=guard)
+    assert ready.published_by_job_id == job.id
+
+
+def test_reuse_preserves_decided_review_states(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    passage = make_passage(extraction)
+    page = make_page(extraction)
+    outcome = make_outcome(extraction, "partial")
+    review = make_review(extraction)
+    store.save_extraction_result(extraction, (passage,), (page,), (), outcome, review)
+
+    confirmed = store.record_review_decision(extraction.id, "confirmed", 1)
+    again = store.save_extraction_result(extraction, (passage,), (page,), (), outcome, confirmed)
+    assert again.review is not None and again.review.state == "confirmed"
+
+    reopened = store.reopen_review(extraction.id)
+    assert (reopened.state, reopened.generation) == ("pending", 2)
+    after_reopen = store.save_extraction_result(
+        extraction, (passage,), (page,), (), outcome, reopened
+    )
+    assert after_reopen.review is not None and after_reopen.review.generation == 2
+
+    declined = store.record_review_decision(extraction.id, "declined", 2)
+    after_decline = store.save_extraction_result(
+        extraction, (passage,), (page,), (), outcome, declined
+    )
+    assert after_decline.review is not None and after_decline.review.state == "declined"
+
+
+def test_confirm_rejects_a_cancelled_candidate(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        extraction,
+        (make_passage(extraction),),
+        (make_page(extraction),),
+        (),
+        make_outcome(extraction, "partial"),
+        make_review(extraction),
+    )
+    job = store.create_job(
+        "guard:cancelled", "pdf-extract", source_id, source_version_id=source_version.id
     )
     store.create_job_status(job.id)
-    store.claim_job(job.id, "guard-tests")
-    attempt = store.start_step_attempt(job.id, "build-index")
-    guard = AttemptGuard("guard-tests", "build-index", attempt.attempt_number)
-    with pytest.raises(ConflictingWriteError, match="not committed"):
-        store.publish_readiness(job.id, source_id, source_version.id, [new_id()], guard=guard)
+    store.finish_job(job.id, "cancelled", "cancelled by the user")
+    with pytest.raises(ConflictingWriteError, match="cancelled"):
+        store.record_review_decision(extraction.id, "confirmed", 1)
+    assert store.record_review_decision(extraction.id, "declined", 1).state == "declined"
+
+
+def test_confirm_rejects_a_failed_candidate_import(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        extraction,
+        (make_passage(extraction),),
+        (make_page(extraction),),
+        (),
+        make_outcome(extraction, "partial"),
+        make_review(extraction),
+    )
+    attach_import(store, source_id, source_version.id, state="failed")
+    with pytest.raises(ConflictingWriteError, match="not ready"):
+        store.record_review_decision(extraction.id, "confirmed", 1)
+
+
+def test_purge_removes_extraction_records_for_an_expired_source(store: PersistenceStore) -> None:
+    source_id, source_version = seed_source(store)
+    extraction = make_extraction(source_id, source_version)
+    store.save_extraction_result(
+        extraction,
+        (make_passage(extraction),),
+        (make_page(extraction),),
+        (make_visual(extraction),),
+        make_outcome(extraction, "partial"),
+        make_review(extraction),
+    )
+    store.trash_source(source_id, utc_timestamp())
+    store.remove_trashed_records(source_id)
+    with pytest.raises(PersistenceError, match="does not exist"):
+        store.load_extraction_report(extraction.id)
+
+
+def test_purge_removes_extraction_records_for_an_older_import(store: PersistenceStore) -> None:
+    source_id, old_version = seed_source(store)
+    older = make_extraction(source_id, old_version)
+    store.save_extraction_result(
+        older,
+        (make_passage(older),),
+        (make_page(older),),
+        (make_visual(older),),
+        make_outcome(older, "partial"),
+        make_review(older),
+    )
+    old_import_id = attach_import(store, source_id, old_version.id)
+
+    managed = ManagedFile(new_id(), "originals/newer.pdf", 17, HASH_B, utc_timestamp())
+    store.save_managed_file(managed)
+    new_version = store.create_source_version(source_id, HASH_B, managed.id)
+    attach_import(store, source_id, new_version.id)
+
+    store.trash_pdf_import(old_import_id, utc_timestamp())
+    with store.database.connect() as connection:
+        connection.execute(
+            """UPDATE pdf_import_trash SET file_removed_at=?, snapshots_removed_at=?
+               WHERE import_id=?""",
+            (utc_timestamp(), utc_timestamp(), old_import_id),
+        )
+    store.remove_trashed_pdf_import_records(old_import_id)
+    with pytest.raises(PersistenceError, match="does not exist"):
+        store.load_extraction_report(older.id)
 
 
 def test_conflicting_retry_rejected_identical_retry_reuses(store: PersistenceStore) -> None:

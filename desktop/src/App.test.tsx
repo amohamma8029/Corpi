@@ -99,6 +99,15 @@ const partialExtraction: ExtractionReport = {
   review: { state: "pending", generation: 1, decided_at: null },
 };
 
+const sourceB = { ...source, id: "source-2", display_name: "Second source" };
+
+const failedImport = {
+  id: "import-1", source_id: source.id, source_version_id: "version-1",
+  filename: "failed.pdf", state: "failed", failure_code: null,
+  size_bytes: 10, sha256: "a".repeat(64), created_at: notebook.created_at,
+  trashed: false, is_current: true, is_pending: false,
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(invoke).mockResolvedValue(connection);
@@ -315,12 +324,6 @@ it("surfaces extraction failure codes instead of a generic label", async () => {
 it("refetches the extraction report after processing actions", async () => {
   vi.mocked(listNotebookSources).mockResolvedValue([source]);
   vi.mocked(getExtraction).mockResolvedValue(emptyExtraction);
-  const failedImport = {
-    id: "import-1", source_id: source.id, source_version_id: "version-1",
-    filename: "failed.pdf", state: "failed", failure_code: null,
-    size_bytes: 10, sha256: "a".repeat(64), created_at: notebook.created_at,
-    trashed: false, is_current: true, is_pending: false,
-  };
   vi.mocked(listPdfImports).mockResolvedValue([failedImport]);
   vi.mocked(retryPdfProcessing).mockResolvedValue({ job_id: "job-1", status: "queued" });
   render(<App />);
@@ -330,4 +333,69 @@ it("refetches the extraction report after processing actions", async () => {
   fireEvent.click(retry);
   await waitFor(() => expect(getExtraction).toHaveBeenCalledTimes(before + 1));
   expect(getExtraction).toHaveBeenLastCalledWith(connection, source.id);
+});
+
+it("refreshes the report when background processing completes", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    vi.mocked(listNotebookSources).mockResolvedValue([source]);
+    vi.mocked(listPdfImports).mockResolvedValue([{ ...failedImport, state: "pending" }]);
+    vi.mocked(getExtraction)
+      .mockResolvedValueOnce(emptyExtraction)
+      .mockResolvedValue(partialExtraction);
+    render(<App />);
+    await screen.findByRole("button", { name: "Cancel processing" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+    expect(await screen.findByRole("region", { name: "Text extraction" })).toBeTruthy();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("refreshes the report after a replacement keeps the same source selected", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([savedAttempt]);
+  vi.mocked(getExtraction)
+    .mockResolvedValueOnce(emptyExtraction)
+    .mockResolvedValue(partialExtraction);
+  render(<App />);
+  const retry = await screen.findByRole("button", { name: "Retry from saved PDF" });
+  await waitFor(() => expect(getExtraction).toHaveBeenCalled());
+  const before = vi.mocked(getExtraction).mock.calls.length;
+  vi.mocked(retryPdfAcquisition).mockResolvedValue({
+    ...savedAttempt, state: "completed", requires_upload: false, can_retry: false, can_cancel: false,
+  });
+  vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
+  fireEvent.click(retry);
+  await waitFor(() => expect(getExtraction).toHaveBeenCalledTimes(before + 1));
+  expect(getExtraction).toHaveBeenLastCalledWith(connection, source.id);
+  expect(await screen.findByRole("region", { name: "Text extraction" })).toBeTruthy();
+});
+
+it("ignores a report that arrives after switching sources", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source, sourceB]);
+  let resolveFirst!: (report: ExtractionReport) => void;
+  vi.mocked(getExtraction).mockImplementation((_connection, sourceId) =>
+    sourceId === source.id
+      ? new Promise((resolve) => {
+          resolveFirst = resolve;
+        })
+      : Promise.resolve({
+          ...partialExtraction,
+          source_id: sourceB.id,
+          extraction_id: "extraction-b",
+          outcome: "complete",
+          review: null,
+          pages: [],
+        }),
+  );
+  render(<App />);
+  await screen.findByRole("button", { name: "Second source" });
+  fireEvent.click(screen.getByRole("button", { name: "Second source" }));
+  expect(await screen.findByText("Outcome: complete")).toBeTruthy();
+  resolveFirst({ ...partialExtraction, source_id: source.id, extraction_id: "extraction-a" });
+  await waitFor(() => expect(screen.queryByText("Outcome: partial")).toBeNull());
+  expect(screen.getByText("Outcome: complete")).toBeTruthy();
 });

@@ -987,6 +987,22 @@ class PersistenceStore:
                 (item["source_version_id"],),
             )
             connection.execute(
+                "DELETE FROM extraction_reviews WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM extraction_outcomes WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM extraction_visuals WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
+                "DELETE FROM extraction_pages WHERE source_version_id=?",
+                (item["source_version_id"],),
+            )
+            connection.execute(
                 "DELETE FROM extraction_versions WHERE source_version_id=?",
                 (item["source_version_id"],),
             )
@@ -2363,15 +2379,19 @@ class PersistenceStore:
         job_id: str,
         status: str,
         failure_reason: str | None = None,
+        *,
+        failure_code: str | None = None,
     ) -> JobStatus:
         if status not in ("completed", "failed", "cancelled"):
             raise ValueError("job can only finish as completed, failed, or cancelled")
+        if failure_code is not None:
+            failure_code = _required_text(failure_code, "failure code")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
             cursor = connection.execute(
-                """UPDATE job_status SET status=?, failure_reason=?, updated_at=?
+                """UPDATE job_status SET status=?, failure_reason=?, failure_code=?, updated_at=?
                    WHERE job_id=? AND status IN ('queued','running')""",
-                (status, failure_reason, timestamp, job_id),
+                (status, failure_reason, failure_code, timestamp, job_id),
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not active; finish rejected")
@@ -2381,7 +2401,10 @@ class PersistenceStore:
                 )
                 if job is not None and job["source_version_id"] is not None:
                     _mark_pdf_import_failed(
-                        connection, job["source_version_id"], "processing_failed", timestamp
+                        connection,
+                        job["source_version_id"],
+                        failure_code or "processing_failed",
+                        timestamp,
                     )
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
@@ -2564,7 +2587,7 @@ class PersistenceStore:
             )
             if trash_row is not None:
                 raise ConflictingWriteError("source is deleted; publication rejected")
-            _verify_extraction_decision(connection, source_id, source_version_id)
+            _verify_extraction_decision(connection, cleaned_indexes)
             committed_outputs = {
                 row[0]
                 for row in connection.execute(
@@ -2867,6 +2890,10 @@ class PersistenceStore:
             )
             connection.execute("DELETE FROM jobs WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM index_versions WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM extraction_reviews WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM extraction_outcomes WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM extraction_visuals WHERE source_id=?", (source_id,))
+            connection.execute("DELETE FROM extraction_pages WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM extraction_versions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM source_versions WHERE source_id=?", (source_id,))
             connection.execute(
@@ -3385,6 +3412,8 @@ def _validate_extraction_result(
     visuals: Sequence[VisualLocation],
     outcome: ExtractionOutcome,
     review: ExtractionReview | None,
+    *,
+    is_reuse: bool = False,
 ) -> None:
     _validate_extraction(extraction, passages)
     if (
@@ -3407,13 +3436,21 @@ def _validate_extraction_result(
             or review.source_version_id != extraction.source_version_id
         ):
             raise ValueError("extraction review ownership does not match its extraction")
-        if review.state != "pending":
-            raise ValueError("a new extraction's review starts pending")
+        if review.state not in ("pending", "confirmed", "declined"):
+            raise ValueError("review state is not a known state")
         _integer(review.generation, "review generation", minimum=1)
-        if review.generation != 1:
-            raise ValueError("a new extraction's review starts at generation 1")
+        if not is_reuse:
+            # A NEW extraction starts with a pending review at generation 1. A reused
+            # extraction carries its saved decision unchanged (confirmed, declined, or a
+            # reopened generation) and must never be rejected for it.
+            if review.state != "pending":
+                raise ValueError("a new extraction's review starts pending")
+            if review.generation != 1:
+                raise ValueError("a new extraction's review starts at generation 1")
+            if review.decided_at is not None:
+                raise ValueError("a pending review has no decision time")
         if review.decided_at is not None:
-            raise ValueError("a pending review has no decision time")
+            validate_utc_timestamp(review.decided_at)
         validate_utc_timestamp(review.updated_at)
     if len({page.id for page in pages}) != len(pages):
         raise ValueError("page identities must be unique within an extraction")
@@ -3487,13 +3524,21 @@ def _save_extraction_result(
     outcome: ExtractionOutcome,
     review: ExtractionReview | None,
 ) -> None:
-    _validate_extraction_result(extraction, passages, pages, visuals, outcome, review)
-    _save_extraction(connection, extraction, passages)
     existing = _fetchone(
         connection,
         "SELECT outcome FROM extraction_outcomes WHERE extraction_version_id=?",
         (extraction.id,),
     )
+    _validate_extraction_result(
+        extraction,
+        passages,
+        pages,
+        visuals,
+        outcome,
+        review,
+        is_reuse=existing is not None,
+    )
+    _save_extraction(connection, extraction, passages)
     if existing is not None:
         _verify_saved_result_matches(connection, extraction.id, pages, visuals, outcome, review)
         return
@@ -3612,10 +3657,11 @@ def _verify_saved_result_matches(
 def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionReview) -> None:
     """Confirm only against the candidate the user actually reviewed.
 
-    The recheck mirrors readiness publication: the extraction's source version must still be
-    the source's current version (otherwise it was superseded), and neither the source nor its
-    current import may be trashed. A cancelled import never produced a current version, so the
-    currency check covers it as well.
+    Mirrors readiness publication plus the candidate's own import and processing state:
+    the extraction's source version must still be current (otherwise it was superseded),
+    neither the source nor the candidate import may be trashed, the candidate import must
+    still be ready (cancelled or failed processing leaves it `failed`), and the candidate's
+    processing job must not have been cancelled.
     """
     current_row = connection.execute(
         """SELECT id FROM source_versions WHERE source_id=?
@@ -3631,44 +3677,72 @@ def _verify_review_currency(connection: sqlite3.Connection, review: ExtractionRe
     )
     if trash_row is not None:
         raise ConflictingWriteError("source is trashed; confirmation rejected")
-    import_trash = _fetchone(
+    import_row = _fetchone(
         connection,
-        """SELECT 1 FROM pdf_import_trash
-           WHERE source_id=? AND import_id=(
-               SELECT current_import_id FROM source_pdf_state WHERE source_id=?
-           )""",
-        (review.source_id, review.source_id),
+        "SELECT id, state FROM pdf_imports WHERE source_version_id=?",
+        (review.source_version_id,),
     )
-    if import_trash is not None:
-        raise ConflictingWriteError("candidate import is trashed; confirmation rejected")
+    if import_row is not None:
+        if import_row["state"] != "ready":
+            raise ConflictingWriteError(
+                f"candidate import is not ready ({import_row['state']}); confirmation rejected"
+            )
+        import_trash = _fetchone(
+            connection, "SELECT 1 FROM pdf_import_trash WHERE import_id=?", (import_row["id"],)
+        )
+        if import_trash is not None:
+            raise ConflictingWriteError("candidate import is trashed; confirmation rejected")
+    job_row = _fetchone(
+        connection,
+        """SELECT job_status.status AS state FROM job_status
+           JOIN jobs ON jobs.id = job_status.job_id
+           WHERE jobs.source_version_id=? AND jobs.kind='pdf-extract'
+           ORDER BY jobs.created_at DESC, jobs.rowid DESC LIMIT 1""",
+        (review.source_version_id,),
+    )
+    if job_row is not None and job_row["state"] == "cancelled":
+        raise ConflictingWriteError("candidate processing was cancelled; confirmation rejected")
 
 
 def _verify_extraction_decision(
-    connection: sqlite3.Connection, source_id: str, source_version_id: str
+    connection: sqlite3.Connection, index_version_ids: Sequence[str]
 ) -> None:
-    """Reject publication when an extraction decision is missing or not confirmed.
+    """Publication verifies the decision of the exact extraction the indexes came from.
 
-    Sources with no extraction keep 1.3's publication behaviour (1.6's steps refuse
-    extraction-less work). A committed extraction must be `complete` or carry a confirmed
-    review decision before readiness can publish.
+    Each published index resolves to its extraction; when that extraction carries a
+    decision record it must be `complete` or confirmed. An older complete extraction can
+    never bless a newer unconfirmed partial one. Extractions without a decision record are
+    pre-M1.5 records (1.2's shape, used by synthetic fixtures) and have nothing to enforce.
     """
-    extraction_row = _fetchone(
-        connection,
-        """SELECT extraction_version_id, outcome FROM extraction_outcomes
-           WHERE source_id=? AND source_version_id=?""",
-        (source_id, source_version_id),
-    )
-    if extraction_row is None or extraction_row["outcome"] == "complete":
+    if not index_version_ids:
         return
-    review_row = _fetchone(
-        connection,
-        "SELECT state FROM extraction_reviews WHERE extraction_version_id=?",
-        (extraction_row["extraction_version_id"],),
-    )
-    if review_row is None or review_row["state"] != "confirmed":
-        raise ConflictingWriteError(
-            "extraction decision is missing or declined; publication rejected"
+    extraction_ids = {
+        row[0]
+        for row in connection.execute(
+            f"""SELECT extraction_version_id FROM index_versions
+                WHERE id IN ({",".join("?" for _ in index_version_ids)})""",
+            tuple(index_version_ids),
+        ).fetchall()
+    }
+    for extraction_id in extraction_ids:
+        outcome = _fetchone(
+            connection,
+            "SELECT outcome FROM extraction_outcomes WHERE extraction_version_id=?",
+            (extraction_id,),
         )
+        if outcome is None:
+            continue
+        if outcome["outcome"] == "complete":
+            continue
+        review_row = _fetchone(
+            connection,
+            "SELECT state FROM extraction_reviews WHERE extraction_version_id=?",
+            (extraction_id,),
+        )
+        if review_row is None or review_row["state"] != "confirmed":
+            raise ConflictingWriteError(
+                "extraction decision is missing or declined; publication rejected"
+            )
 
 
 def _save_extraction(
@@ -4400,6 +4474,7 @@ def _job_status(row: sqlite3.Row) -> JobStatus:
         row["superseded_by_job_id"],
         None if policy_json is None else decode_json(policy_json),
         row["updated_at"],
+        row["failure_code"],
     )
 
 

@@ -107,6 +107,43 @@ def test_figure_wrapped_text_is_counted_not_lost() -> None:
     assert any("Wrapped figure text" in block.text for block in page.blocks)
 
 
+def test_image_coverage_is_rotation_invariant() -> None:
+    """The same scanned page reports the same coverage at every quarter turn."""
+    from pdf_fixtures import image_draw_stream, page_number_stream
+
+    ratios = []
+    for rotation in (0, 90, 180, 270):
+        content = image_draw_stream() + b"\n" + page_number_stream(3)
+        pages = extract_all(
+            build_pdf([PageSpec(content, helvetica=True, image=True, rotate=rotation)])
+        )
+        ratios.append(pages[0].metrics.image_area_ratio)
+        assert pages[0].metrics.extracted_chars == 1
+    assert max(ratios) - min(ratios) < 1e-6
+    assert all(abs(ratio - STANDARD_IMAGE_RATIO) < 1e-6 for ratio in ratios)
+
+
+def test_image_coverage_clips_in_the_displayed_frame() -> None:
+    """An offset crop clips coverage in the displayed frame, not raw page coordinates."""
+    from pdf_fixtures import image_draw_stream
+
+    # Crop (100,100,500,700) shows a 400x600 page; the image occupies (50,300)-(250,600)
+    # in page coordinates, so only x 100..250 is inside the crop: 150*300 / (400*600).
+    content = image_draw_stream(x=50, y=300, width=200, height=300)
+    pages = extract_all(
+        build_pdf(
+            [
+                PageSpec(
+                    content,
+                    image=True,
+                    cropbox=(100, 100, 500, 700),
+                )
+            ]
+        )
+    )
+    assert pages[0].metrics.image_area_ratio == 0.1875
+
+
 def test_fixture_bytes_are_deterministic() -> None:
     assert native_text_stream("Same") == native_text_stream("Same")
     assert undecodable_stream() == undecodable_stream()

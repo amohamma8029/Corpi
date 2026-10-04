@@ -109,8 +109,15 @@ def test_outcome_order_fails_no_usable_text_before_partial_or_complete() -> None
 
 def test_partial_needs_review_while_complete_does_not() -> None:
     assert decide_document_outcome(["extracted", "image-only"]) == DocumentDecision("partial", None)
-    assert decide_document_outcome(["suspect"]) == DocumentDecision("partial", None)
+    assert decide_document_outcome(["extracted", "suspect"]) == DocumentDecision("partial", None)
     assert decide_document_outcome(["extracted", "blank"]) == DocumentDecision("complete", None)
+
+
+def test_suspect_only_offers_no_eligible_evidence() -> None:
+    assert decide_document_outcome(["suspect"]) == DocumentDecision("failed", NO_USABLE_TEXT)
+    assert decide_document_outcome(["suspect", "blank"]) == DocumentDecision(
+        "failed", NO_USABLE_TEXT
+    )
 
 
 def test_unknown_page_classifications_are_rejected() -> None:

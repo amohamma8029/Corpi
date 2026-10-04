@@ -14,6 +14,7 @@ from pdfminer.layout import LTTextContainer as _LTTextContainer
 from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 
+from core.extract.locations import display_size, display_translation
 from core.extract.types import ExtractedBlock, PageExtraction, PageFrame, PageMetrics
 
 UNMAPPED_TOKEN_PREFIX = "(cid:"
@@ -175,15 +176,23 @@ class ExtractionAdapter:
         extracted_chars = sum(1 for text in chars if _is_mapped_printable(text))
 
         crop_x0, crop_y0, crop_x1, crop_y1 = (float(v) for v in page.cropbox)
-        crop_width = max(0.0, crop_x1 - crop_x0)
-        crop_height = max(0.0, crop_y1 - crop_y0)
-        page_area = crop_width * crop_height
+        cropbox = (crop_x0, crop_y0, crop_x1, crop_y1)
+        media_x0, media_y0, media_x1, media_y1 = (float(v) for v in page.mediabox)
+        mediabox = (media_x0, media_y0, media_x1, media_y1)
+        rotation = page.rotate % 360
+        # Coverage is computed in one consistent frame: the displayed CropBox frame the
+        # image placements are translated into. Clipping rotated MediaBox-relative boxes
+        # against raw CropBox coordinates would misstate coverage on rotated and offset
+        # pages and misclassify scanned content.
+        tx, ty = display_translation(cropbox, mediabox, rotation)
+        display_w, display_h = display_size(cropbox, rotation)
+        page_area = display_w * display_h
         clipped = []
         for x0, y0, x1, y1 in image_boxes:
-            cx0 = max(x0, crop_x0)
-            cy0 = max(y0, crop_y0)
-            cx1 = min(x1, crop_x1)
-            cy1 = min(y1, crop_y1)
+            cx0 = max(x0 - tx, 0.0)
+            cy0 = max(y0 - ty, 0.0)
+            cx1 = min(x1 - tx, display_w)
+            cy1 = min(y1 - ty, display_h)
             if cx1 > cx0 and cy1 > cy0:
                 clipped.append((cx0, cy0, cx1, cy1))
         image_area_ratio = 0.0 if page_area <= 0 else _union_area(clipped) / page_area
@@ -194,10 +203,5 @@ class ExtractionAdapter:
             unmapped_ratio=0.0 if glyph_runs == 0 else unmapped / glyph_runs,
             image_area_ratio=min(1.0, image_area_ratio),
         )
-        media_x0, media_y0, media_x1, media_y1 = (float(v) for v in page.mediabox)
-        frame = PageFrame(
-            cropbox=(crop_x0, crop_y0, crop_x1, crop_y1),
-            mediabox=(media_x0, media_y0, media_x1, media_y1),
-            rotation=page.rotate % 360,
-        )
+        frame = PageFrame(cropbox=cropbox, mediabox=mediabox, rotation=rotation)
         return PageExtraction(page_number, tuple(blocks), metrics, frame, tuple(image_boxes))

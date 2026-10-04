@@ -1,6 +1,7 @@
 """M1.5 `pdf-extract` steps on the 1.3 runner: records, reuse, failure codes, stuck child."""
 
 import asyncio
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -184,6 +185,7 @@ def test_no_usable_text_fails_the_job_with_the_code(store: PersistenceStore) -> 
     assert status is not None
     assert status.failure_reason is not None
     assert "no_usable_text" in status.failure_reason
+    assert status.failure_code == "no_usable_text"
     assert store.load_job_steps(job_id) == ()
 
 
@@ -205,6 +207,7 @@ def test_page_limit_fails_with_the_code_without_committing(store: PersistenceSto
     assert status is not None
     assert status.failure_reason is not None
     assert "page_limit_exceeded" in status.failure_reason
+    assert status.failure_code == "page_limit_exceeded"
     assert store.load_job_steps(job_id) == ()
 
 
@@ -346,6 +349,63 @@ def test_interrupted_rerun_matches_an_uninterrupted_control(store: PersistenceSt
     rerun = digest(run_once(rerun_job, 2))
     assert rerun == control
     assert discarded == control
+
+
+def test_cross_job_reuse_preserves_decided_reviews(store: PersistenceStore) -> None:
+    source_id, version_id = seed_extraction_source(store, "decided.pdf", partial_pdf())
+    register_pdf_extract_steps(store)
+    runner = RunnerHarness(store, {"pdf-extract": build_pdf_extract_steps(store)})
+    first_job = enqueue_extract(store, "pdf-extract:decided:1", source_id, version_id)
+    runner.start()
+    try:
+        runner.enqueue_and_notify(first_job)
+        assert wait_until(lambda: job_status(store, first_job) == "completed")
+        first_extraction = store.load_job_steps(first_job)[0].output_extraction_version_id
+        assert first_extraction is not None
+        store.record_review_decision(first_extraction, "confirmed", 1)
+        second_job = enqueue_extract(store, "pdf-extract:decided:2", source_id, version_id)
+        runner.enqueue_and_notify(second_job)
+        assert wait_until(lambda: job_status(store, second_job) == "completed")
+    finally:
+        runner.stop()
+    report = store.load_extraction_report(first_extraction)
+    assert report.review is not None and report.review.state == "confirmed"
+    assert store.load_job_steps(second_job)[0].output_extraction_version_id == first_extraction
+
+
+def test_stuck_page_counting_stops_and_frees_the_runner(store: PersistenceStore) -> None:
+    """A child stuck in the page-counting stage is stopped and reaped; the runner moves on."""
+    source_id, version_id = seed_extraction_source(
+        store, "stuckcount.pdf", native_text_pdf("Stuck counting body")
+    )
+    second_source, second_version = seed_extraction_source(
+        store, "aftercount.pdf", native_text_pdf("Queued counting body")
+    )
+    slow_worker = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    def gated_extract(pdf_path: Path, *, timeout_s: float, cancel=None, **kwargs):
+        if "stuckcount" in pdf_path.name:
+            return run_extraction(
+                pdf_path, timeout_s=timeout_s, cancel=cancel, worker_command=slow_worker
+            )
+        return run_extraction(pdf_path, timeout_s=timeout_s, cancel=cancel)
+
+    register_pdf_extract_steps(store)
+    runner = RunnerHarness(
+        store,
+        {"pdf-extract": build_pdf_extract_steps(store, extract=gated_extract)},
+        policies={"extract": FAST_POLICY},
+    )
+    stuck_job = enqueue_extract(store, "pdf-extract:stuckcount", source_id, version_id)
+    queued_job = enqueue_extract(store, "pdf-extract:aftercount", second_source, second_version)
+    runner.start()
+    try:
+        runner.enqueue_and_notify(stuck_job)
+        runner.enqueue_and_notify(queued_job)
+        assert wait_until(lambda: job_status(store, stuck_job) == "failed", timeout=30)
+        assert wait_until(lambda: job_status(store, queued_job) == "completed", timeout=30)
+    finally:
+        runner.stop()
 
 
 def test_inputs_fingerprint_includes_rule_versions_and_settings(store: PersistenceStore) -> None:
