@@ -194,19 +194,23 @@ export function App() {
   const processingActive = imports.some((item) => !item.trashed && item.state === "pending");
   useEffect(() => {
     if (!connection || !selectedSourceId || !(processingActive || uploading)) return;
+    let cancelled = false;
     const timer = window.setInterval(() => {
       void listPdfImports(connection, selectedSourceId)
         .then((items) => {
-          if (selectionSourceRef.current === selectedSourceId) setImports(items);
+          if (!cancelled && selectionSourceRef.current === selectedSourceId) setImports(items);
         })
         .catch(() => undefined);
       void getExtraction(connection, selectedSourceId)
         .then((report) => {
-          if (selectionSourceRef.current === selectedSourceId) setExtraction(report);
+          if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(report);
         })
         .catch(() => undefined);
     }, 2000);
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [connection, selectedSourceId, processingActive, uploading]);
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? null;
   const visibleAcquisitions = [
