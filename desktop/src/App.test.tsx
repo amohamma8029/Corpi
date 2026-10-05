@@ -424,3 +424,69 @@ it("ignores a file list that arrives after switching sources", async () => {
   expect(screen.queryByText(/a\.pdf/)).toBeNull();
   expect(screen.getByText(/b\.pdf/)).toBeTruthy();
 });
+
+it("drops polling responses that outlive their effect across a source round-trip", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    vi.mocked(listNotebookSources).mockResolvedValue([source, sourceB]);
+    let resolveStaleImports!: (items: typeof failedImport[]) => void;
+    let resolveStaleReport!: (report: ExtractionReport) => void;
+    const staleImport = { ...failedImport, id: "stale-import", filename: "stale.pdf", state: "pending" };
+    const freshImport = { ...failedImport, id: "fresh-import", filename: "a.pdf", state: "pending" };
+    let importsCalls = 0;
+    vi.mocked(listPdfImports).mockImplementation(() => {
+      importsCalls += 1;
+      if (importsCalls === 1) return Promise.resolve([staleImport]);
+      if (importsCalls === 2)
+        return new Promise((resolve) => {
+          resolveStaleImports = resolve;
+        });
+      if (importsCalls === 3)
+        return Promise.resolve([{ ...freshImport, id: "import-b", source_id: sourceB.id, filename: "b.pdf" }]);
+      return Promise.resolve([freshImport]);
+    });
+    let reportCalls = 0;
+    vi.mocked(getExtraction).mockImplementation((_connection, sourceId) => {
+      reportCalls += 1;
+      if (reportCalls === 1) return Promise.resolve(emptyExtraction);
+      if (reportCalls === 2)
+        return new Promise((resolve) => {
+          resolveStaleReport = resolve;
+        });
+      if (sourceId === sourceB.id) return Promise.resolve({ ...emptyExtraction, source_id: sourceB.id });
+      return Promise.resolve(partialExtraction);
+    });
+
+    render(<App />);
+    await screen.findByText(/stale\.pdf/);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2500);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Second source" }));
+    await screen.findByText(/b\.pdf/);
+    fireEvent.click(screen.getByRole("button", { name: "Field report" }));
+    await screen.findByText(/a\.pdf/);
+    expect(await screen.findByText("Outcome: partial")).toBeTruthy();
+
+    resolveStaleImports([{ ...staleImport, filename: "stale.pdf" }]);
+    resolveStaleReport({
+      ...partialExtraction,
+      extraction_id: "stale-report",
+      outcome: "complete",
+      review: null,
+      pages: [],
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(/a\.pdf/)).toBeTruthy();
+    expect(screen.queryByText(/stale\.pdf/)).toBeNull();
+    expect(screen.getByText("Outcome: partial")).toBeTruthy();
+    expect(screen.queryByText("Outcome: complete")).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
