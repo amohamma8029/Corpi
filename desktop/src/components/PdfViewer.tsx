@@ -15,6 +15,7 @@ interface PdfViewerProps {
   importId: string;
   filename: string;
   renderedPagePixelLimit: number;
+  initialPage?: number;
   onClose: () => void;
 }
 
@@ -24,6 +25,7 @@ export function PdfViewer({
   importId,
   filename,
   renderedPagePixelLimit,
+  initialPage = 1,
   onClose,
 }: PdfViewerProps) {
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
@@ -87,7 +89,13 @@ export function PdfViewer({
           useWorkerFetch: true,
         });
         const loaded = await loadingTask.promise;
-        if (current) setDocument(loaded);
+        if (current) {
+          if (!Number.isInteger(initialPage) || initialPage < 1 || initialPage > loaded.numPages) {
+            throw new Error("The saved citation page is outside this PDF.");
+          }
+          setPageNumber(initialPage);
+          setDocument(loaded);
+        }
       } catch (cause) {
         await loadingTask?.destroy().catch(() => undefined);
         pdfWorker?.destroy();
@@ -116,7 +124,7 @@ export function PdfViewer({
         nativeWorker?.terminate();
       })();
     };
-  }, [connection, filename, importId, sourceId]);
+  }, [connection, filename, importId, initialPage, sourceId]);
 
   useEffect(() => {
     if (!document) return;
