@@ -204,9 +204,9 @@ def seed_graph(
     return source_id, source_version, tuple(indexes), job.id
 
 
-def test_populated_upgrade_to_revision_seven_preserves_records(data_dir: Path) -> None:
+def test_populated_upgrade_to_revision_fourteen_preserves_records(data_dir: Path) -> None:
     migrations = load_migrations()
-    assert [migration.revision for migration in migrations] == [1, 2, 3, 4, 5, 6, 7]
+    assert [migration.revision for migration in migrations] == list(range(1, 15))
 
     legacy = Database(DatabaseConfig(data_dir), migrations=migrations[:1])
     legacy.initialize()
@@ -221,7 +221,7 @@ def test_populated_upgrade_to_revision_seven_preserves_records(data_dir: Path) -
     legacy_import = store.load_pdf_import(state.current_import_id)
     assert legacy_import.display_filename == "Earlier PDF (filename unknown)"
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
 
 
 @pytest.mark.parametrize("legacy_revision", [1, 4])

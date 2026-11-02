@@ -18,7 +18,11 @@ from starlette.requests import ClientDisconnect
 from core.ingest.config import PdfIngestLimits
 from core.ingest.files import ManagedFileIntegrityError, ManagedFilePathError, ManagedPdfFiles
 from core.ingest.locks import FingerprintLockCoordinator
-from core.persistence.errors import ConflictingWriteError, PersistenceError
+from core.persistence.errors import (
+    ConflictingWriteError,
+    DeletedPdfAcquisitionError,
+    PersistenceError,
+)
 from core.persistence.models import ManagedFile, PdfAcquisition, new_id, utc_timestamp
 from core.persistence.store import PersistenceStore
 
@@ -93,6 +97,8 @@ class PdfIngestService:
                 self.owner_instance_id,
                 target_source_id,
             )
+        except DeletedPdfAcquisitionError as error:
+            raise PdfImportError(error.code, 409, str(error)) from error
         except PersistenceError as error:
             raise PdfImportError("invalid_acquisition", 409, str(error)) from error
 
