@@ -60,3 +60,27 @@ it("keeps the canvas usable after a page error and clears the error when another
   expect(screen.queryByRole("alert")).toBeNull();
   expect(document.querySelector("canvas")).toBe(canvas);
 });
+
+it("opens the exact initial citation page rather than page one", async () => {
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } },
+    close: { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } },
+  });
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+  render(<PdfViewer connection={{ base_url: "http://127.0.0.1:9", token: "test-token" }}
+    sourceId="source" importId="original-import" filename="two-pages.pdf" initialPage={2}
+    renderedPagePixelLimit={20_000_000} onClose={() => {}} />);
+  await waitFor(() => expect((screen.getByRole("spinbutton", { name: "Page number" }) as HTMLInputElement).value).toBe("2"));
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("rejects a citation outside the saved PDF instead of silently opening another page", async () => {
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } },
+    close: { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } },
+  });
+  render(<PdfViewer connection={{ base_url: "http://127.0.0.1:9", token: "test-token" }}
+    sourceId="source" importId="original-import" filename="two-pages.pdf" initialPage={3}
+    renderedPagePixelLimit={20_000_000} onClose={() => {}} />);
+  expect((await screen.findByRole("alert")).textContent).toContain("outside this PDF");
+});
