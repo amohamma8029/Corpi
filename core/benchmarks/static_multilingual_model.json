@@ -1,0 +1,50 @@
+{
+  "id": "potion-multilingual-static",
+  "model": "minishlab/potion-multilingual-128M",
+  "repository": "minishlab/potion-multilingual-128M",
+  "revision": "73908c3438cf03b6a01bcb9611d62b23d0726f08",
+  "license": "mit",
+  "pooling": "static-mean",
+  "dimensions": 256,
+  "input_tokens": 512,
+  "chunk_tokens": 384,
+  "overlap_tokens": 64,
+  "query_prefix": "",
+  "passage_prefix": "",
+  "model_file": "model.safetensors",
+  "runtime": "benchmark-static-f32-mmap-v1",
+  "vector_format": "normalized-float32-le",
+  "separator": "\n\n",
+  "files": [
+    {
+      "path": "config.json",
+      "bytes": 271,
+      "sha256": "595e4cab2093732efd5dbe084fd5c1826b5eea693b73b4c1fd971672867d2e54",
+      "url": "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08/config.json"
+    },
+    {
+      "path": "model.safetensors",
+      "bytes": 512361560,
+      "sha256": "14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397",
+      "url": "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08/model.safetensors"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "bytes": 167,
+      "sha256": "d05497f1da52c5e09554c0cd874037a083e1dc1b9cfd48034d1c717f1afc07a7",
+      "url": "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08/special_tokens_map.json"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 18616131,
+      "sha256": "19f1909063da3cfe3bd83a782381f040dccea475f4816de11116444a73e1b6a1",
+      "url": "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08/tokenizer.json"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 1898,
+      "sha256": "bd0e8c3a56aeac5078a6445e6b04425cd17b41bcc8d382ae925b5dbca287f8eb",
+      "url": "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/73908c3438cf03b6a01bcb9611d62b23d0726f08/tokenizer_config.json"
+    }
+  ]
+}
