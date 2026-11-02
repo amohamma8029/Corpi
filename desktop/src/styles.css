@@ -141,6 +141,35 @@ main.app-shell {
   margin: 1rem 0;
 }
 
+.model-settings {
+  margin: 1rem 0;
+  padding-top: 0.8rem;
+  border-top: 1px solid #e0e3e8;
+  font-size: 0.85rem;
+}
+
+.model-settings h3 { margin: 0 0 0.5rem; }
+.model-settings p { overflow-wrap: anywhere; margin: 0.4rem 0; }
+.model-settings ul { list-style: none; padding: 0; }
+.model-settings li { margin: 0.9rem 0; }
+.model-settings progress { width: 100%; }
+
+.notebook-search {
+  padding-bottom: 1.2rem;
+  margin-bottom: 1.4rem;
+  border-bottom: 1px solid #e0e3e8;
+}
+.notebook-search h2 { margin: 0 0 0.5rem; }
+.notebook-search > p { color: #596273; }
+.notebook-search form > label { display: block; margin-bottom: 0.4rem; font-weight: 600; }
+.notebook-search__controls { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.notebook-search__controls input { min-width: 0; flex: 1 1 12rem; }
+.search-results { margin: 1rem 0 0; padding-inline-start: 1.5rem; max-height: 32rem; overflow: auto; }
+.search-results li { padding: 0.8rem 0; border-top: 1px solid #e9ebef; }
+.search-results h3 { font-size: 1rem; overflow-wrap: anywhere; }
+.search-result__text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14rem; overflow: auto; }
+.search-result__citations { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+
 .primary-action {
   width: 100%;
   margin: 0.35rem 0 0.8rem;

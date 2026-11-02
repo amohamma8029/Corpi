@@ -11,6 +11,8 @@ import {
   getExtraction,
   getPdfAcquisition,
   listNotebooks,
+  listModels,
+  getNotebookModel,
   listNotebookSources,
   listPdfAcquisitions,
   listPdfImports,
@@ -21,16 +23,25 @@ import {
   type ExtractionReport,
   type PdfAcquisition,
   storageReport,
+  searchNotebook,
+  type NotebookSearchResult,
 } from "./api/client";
 import { App } from "./App";
+import { PdfViewer } from "./components/PdfViewer";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("./components/PdfViewer", () => ({
+  PdfViewer: vi.fn(({ importId, initialPage }: { importId: string; initialPage?: number }) =>
+    <div role="dialog">{importId} page {initialPage}</div>),
+}));
 vi.mock("./api/client", async (loadActual) => {
   const actual = await loadActual<typeof import("./api/client")>();
   return {
     ...actual,
     coreHealthWithRetry: vi.fn(),
     listNotebooks: vi.fn(),
+    listModels: vi.fn(),
+    getNotebookModel: vi.fn(),
     storageReport: vi.fn(),
     createNotebook: vi.fn(),
     listNotebookSources: vi.fn(),
@@ -45,6 +56,7 @@ vi.mock("./api/client", async (loadActual) => {
     getExtraction: vi.fn(),
     decideExtractionReview: vi.fn(),
     reopenExtractionReview: vi.fn(),
+    searchNotebook: vi.fn(),
   };
 });
 
@@ -108,14 +120,28 @@ const failedImport = {
   trashed: false, is_current: true, is_pending: false,
 };
 
+const searchResult: NotebookSearchResult = {
+  source_id: source.id, source_version_id: "old-version", index_version_id: "index",
+  chunk_id: "chunk", manifest_id: "model", source_name: source.display_name,
+  text: "Canonical rainfall evidence", score: 0.1, import_id: "original-import", filename: "old.pdf",
+  citations: [{ passage_id: "passage", ordinal: 0, start_offset: null, end_offset: null, page_number: 2 }],
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(invoke).mockResolvedValue(connection);
   vi.mocked(coreHealthWithRetry).mockResolvedValue({ app: "corpi-core", version: "0.1.0", status: "ok" });
   vi.mocked(listNotebooks).mockResolvedValue([notebook]);
+  vi.mocked(listModels).mockResolvedValue([]);
+  vi.mocked(getNotebookModel).mockResolvedValue({
+    notebook_id: notebook.id, active_profile_id: "minilm-en", pending_profile_id: null,
+    generation: 0, ready_sources: 0, rebuilt_sources: 0, failed_sources: 0, cancelled_sources: 0,
+  });
   vi.mocked(listNotebookSources).mockResolvedValue([]);
   vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
   vi.mocked(listPdfImports).mockResolvedValue([]);
+  // Polling always receives an async API result, including while a test holds an upload.
+  vi.mocked(getPdfAcquisition).mockRejectedValue(new Error("Acquisition not configured by this test"));
   vi.mocked(getExtraction).mockResolvedValue(emptyExtraction);
   vi.mocked(storageReport).mockResolvedValue({
     original_file_count: 0, original_bytes: 0, bytes_pending_removal: 0, retained_staging_bytes: 200,
@@ -350,6 +376,65 @@ it("refreshes the report when background processing completes", async () => {
     });
     expect(await screen.findByRole("region", { name: "Text extraction" })).toBeTruthy();
   } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("opens a search result's saved import and exact page, not the currently selected PDF", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(listPdfImports).mockResolvedValue([{ ...failedImport, id: "original-import", filename: "old.pdf", source_version_id: "old-version", state: "ready", is_current: false }]);
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", ready_sources: 1, results: [searchResult] });
+  render(<App />);
+  const input = await screen.findByRole("searchbox", { name: "Find a passage" });
+  fireEvent.change(input, { target: { value: "rainfall" } });
+  fireEvent.submit(input.closest("form")!);
+  fireEvent.click(await screen.findByRole("button", { name: "Open old.pdf, page 2" }));
+  expect((await screen.findByRole("dialog")).textContent).toBe("original-import page 2");
+  expect(vi.mocked(PdfViewer).mock.calls.at(-1)?.[0]).toMatchObject({ sourceId: source.id, importId: "original-import", initialPage: 2 });
+});
+
+it("does not let an older PDF lookup replace a later result opening", async () => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source, sourceB]);
+  const second = { ...searchResult, source_id: sourceB.id, chunk_id: "second", import_id: "second-import", filename: "second.pdf" };
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", ready_sources: 2, results: [searchResult, second] });
+  render(<App />);
+  const input = await screen.findByRole("searchbox", { name: "Find a passage" });
+  await waitFor(() => expect(listPdfImports).toHaveBeenCalledWith(connection, source.id));
+  fireEvent.change(input, { target: { value: "rainfall" } });
+  fireEvent.submit(input.closest("form")!);
+  const firstButton = await screen.findByRole("button", { name: "Open old.pdf, page 2" });
+  let finish!: (value: Awaited<ReturnType<typeof listPdfImports>>) => void;
+  vi.mocked(listPdfImports).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }))
+    .mockResolvedValueOnce([{ ...failedImport, id: "second-import", source_id: sourceB.id, source_version_id: "old-version", state: "ready" }]);
+  fireEvent.click(firstButton);
+  fireEvent.click(screen.getByRole("button", { name: "Open second.pdf, page 2" }));
+  expect((await screen.findByRole("dialog")).textContent).toBe("second-import page 2");
+  await act(async () => finish([{ ...failedImport, id: "original-import", source_version_id: "old-version", state: "ready" }]));
+  expect(screen.getByRole("dialog").textContent).toBe("second-import page 2");
+});
+
+it("does not stack slow extraction polls or refetch for unchanged import lists", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const pending: Array<(report: ExtractionReport) => void> = [];
+  try {
+    vi.mocked(listNotebookSources).mockResolvedValue([source]);
+    vi.mocked(listPdfImports).mockResolvedValue([{ ...failedImport, state: "pending" }]);
+    vi.mocked(getExtraction).mockResolvedValue(emptyExtraction);
+    render(<App />);
+    await screen.findByRole("button", { name: "Cancel processing" });
+    await screen.findByRole("region", { name: "Text extraction" });
+    await act(async () => { await Promise.resolve(); });
+    const before = vi.mocked(getExtraction).mock.calls.length;
+    vi.mocked(getExtraction).mockImplementation(() => new Promise((resolve) => { pending.push(resolve); }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(6500); });
+    expect(vi.mocked(getExtraction).mock.calls.length - before).toBe(1);
+    expect(pending).toHaveLength(1);
+    await act(async () => { pending[0](partialExtraction); await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2200); });
+    expect(pending).toHaveLength(2);
+    expect(screen.getByText("Outcome: partial")).toBeTruthy();
+  } finally {
+    await act(async () => { for (const resolve of pending) resolve(partialExtraction); });
     vi.useRealTimers();
   }
 });
