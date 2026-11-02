@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
+import threading
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import sqlite_vec
 
 from core.persistence.errors import (
     DatabaseBusyError,
@@ -92,6 +98,62 @@ class DatabaseConfig:
         return self.data_dir / "migration-snapshots"
 
 
+class _ScopedConnection(sqlite3.Connection):
+    """Attempt-local connection; borrowed cursors cannot keep locks between calls."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.borrowed = True
+        self.owner = (os.getpid(), threading.get_ident())
+        self.cursors: weakref.WeakSet[sqlite3.Cursor] = weakref.WeakSet()
+
+    def _check_borrow(self) -> None:
+        if not self.borrowed or self.owner != (os.getpid(), threading.get_ident()):
+            raise PersistenceError("scoped connection is not borrowed by its owner")
+
+    def cursor(self, factory: Any = sqlite3.Cursor):
+        self._check_borrow()
+        cursor = super().cursor(factory)
+        self.cursors.add(cursor)
+        return cursor
+
+    def execute(self, sql, parameters=(), /):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        return self.cursor().executemany(sql, parameters)
+
+    def executescript(self, sql, /):
+        return self.cursor().executescript(sql)
+
+    def commit(self) -> None:
+        self._check_borrow()
+        super().commit()
+
+    def rollback(self) -> None:
+        self._check_borrow()
+        super().rollback()
+
+    def blobopen(self, *args, **kwargs):
+        raise PersistenceError("incremental blobs are not supported by a connection scope")
+
+    def release_cursors(self) -> None:
+        for cursor in tuple(self.cursors):
+            cursor.close()
+        self.cursors.clear()
+
+
+@dataclass
+class _ConnectionScope:
+    owner: tuple[int, int]
+    config: DatabaseConfig
+    file_identity: tuple[int, int]
+    resolved_path: str
+    connection: _ScopedConnection | None = None
+    borrowed: bool = False
+    failed: bool = False
+
+
 class Database:
     """An initialized database and the connection factory used by its store."""
 
@@ -103,12 +165,15 @@ class Database:
         self.config = config
         selected_migrations = migrations if migrations is not None else load_migrations()
         self.migrations = validate_migrations(selected_migrations)
+        self._connections = threading.local()
 
     @property
     def path(self) -> Path:
         return self.config.database_path
 
     def initialize(self) -> None:
+        if getattr(self._connections, "scope", None) is not None:
+            raise PersistenceError("cannot initialize inside a connection scope")
         self._verify_runtime()
         self._ensure_data_directory()
         target = self.path
@@ -147,6 +212,11 @@ class Database:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         """Open a configured read/write connection without implicitly creating a file."""
+        scope = getattr(self._connections, "scope", None)
+        if scope is not None:
+            with self._borrow_connection(scope) as connection:
+                yield connection
+            return
         connection = self._connect(read_only=False)
         try:
             self._verify_connection_settings(connection)
@@ -156,6 +226,108 @@ class Database:
             raise translated from error
         finally:
             connection.close()
+
+    @contextmanager
+    def connection_scope(self) -> Iterator[None]:
+        """Reuse only in this thread/attempt; callers still own separate transactions.
+
+        Every borrow checks policy and file identity, and closes all its cursors.
+        Policy failure invalidates the scope; application errors discard its connection.
+        No lock or borrowed handle is allowed between calls, including inference.
+        Other threads and callers outside this opt-in retain fresh connections.
+        """
+        if getattr(self._connections, "scope", None) is not None:
+            raise PersistenceError("nested connection scopes are not supported")
+        self._verify_runtime()
+        scope = _ConnectionScope(
+            (os.getpid(), threading.get_ident()),
+            self.config,
+            self._file_identity(),
+            str(self.path.resolve()),
+        )
+        self._connections.scope = scope
+        try:
+            yield
+        finally:
+            if scope.connection is not None:
+                scope.connection.close()
+            del self._connections.scope
+
+    def _file_identity(self) -> tuple[int, int]:
+        try:
+            info = self.path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise PersistenceError("scoped database file is missing or redirected")
+            return info.st_dev, info.st_ino
+        except OSError as error:
+            raise PersistenceError("scoped database file is unavailable") from error
+
+    @contextmanager
+    def _borrow_connection(self, scope: _ConnectionScope) -> Iterator[sqlite3.Connection]:
+        if scope.owner != (os.getpid(), threading.get_ident()) or scope.failed:
+            raise PersistenceError("connection scope owner changed or scope is invalid")
+        if scope.borrowed:
+            raise PersistenceError("nested connection borrows are not supported")
+        scope.borrowed = True
+        inside_body = False
+        try:
+            if self.config != scope.config or self._file_identity() != scope.file_identity:
+                raise PersistenceError("scoped database identity or configuration changed")
+            if scope.connection is None:
+                connection = self._connect(read_only=False)
+                assert isinstance(connection, _ScopedConnection)
+                scope.connection = connection
+                self._verify_connection_settings(connection)
+            connection = scope.connection
+            connection.borrowed = True
+            self._verify_scoped_settings(connection, scope)
+            inside_body = True
+            yield connection
+            inside_body = False
+            connection.release_cursors()
+            self._verify_scoped_settings(connection, scope)
+        except BaseException as error:
+            scope.failed = not inside_body
+            if scope.connection is not None:
+                scope.connection.close()
+                scope.connection = None
+            if isinstance(error, sqlite3.Error):
+                raise translate_sqlite_error(error) from error
+            raise
+        finally:
+            if scope.connection is not None:
+                scope.connection.release_cursors()
+                scope.connection.borrowed = False
+            scope.borrowed = False
+
+    def _verify_scoped_settings(
+        self, connection: _ScopedConnection, scope: _ConnectionScope
+    ) -> None:
+        self._verify_runtime()
+        if self.config != scope.config or self._file_identity() != scope.file_identity:
+            raise PersistenceError("scoped database identity or configuration changed")
+        if (
+            connection.in_transaction
+            or connection.isolation_level is not None
+            or connection.row_factory is not sqlite3.Row
+            or connection.getconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION)
+        ):
+            raise PersistenceError("scoped connection has unsafe transaction or runtime state")
+        row = connection.execute(
+            "SELECT * FROM pragma_busy_timeout, pragma_foreign_keys, pragma_synchronous,"
+            " pragma_journal_mode, pragma_application_id, pragma_user_version"
+        ).fetchone()
+        if (
+            tuple(row)
+            != (self.config.lock_wait_ms, 1, 2, "wal", CORPI_APPLICATION_ID, len(self.migrations))
+            or connection.execute("SELECT vec_version()").fetchone()[0] != "v0.1.9"
+        ):
+            raise MigrationError("scoped connection policy or database identity changed")
+        databases = connection.execute("PRAGMA database_list").fetchall()
+        # The pathname is fixed for this scope. File identity and config are still
+        # checked on every borrow; resolving the same path again adds no new proof.
+        if [(row[1], row[2]) for row in databases] != [("main", scope.resolved_path)]:
+            raise PersistenceError("scoped connection has unexpected attached databases")
 
     def _verify_runtime(self) -> None:
         verify_sqlite_runtime()
@@ -236,6 +408,11 @@ class Database:
             raise
 
     def _connect(self, read_only: bool) -> sqlite3.Connection:
+        factory = (
+            _ScopedConnection
+            if getattr(self._connections, "scope", None) is not None
+            else sqlite3.Connection
+        )
         try:
             if read_only:
                 uri = f"{self.path.as_uri()}?mode=ro"
@@ -244,6 +421,7 @@ class Database:
                     uri=True,
                     timeout=self.config.lock_wait_ms / 1000,
                     isolation_level=None,
+                    factory=factory,
                 )
             else:
                 uri = f"{self.path.as_uri()}?mode=rw"
@@ -252,6 +430,7 @@ class Database:
                     uri=True,
                     timeout=self.config.lock_wait_ms / 1000,
                     isolation_level=None,
+                    factory=factory,
                 )
         except sqlite3.Error as error:
             if read_only:
@@ -261,9 +440,20 @@ class Database:
                 raise translated from error
             raise MigrationError("database could not be opened") from error
         connection.row_factory = sqlite3.Row
+        try:
+            try:
+                connection.enable_load_extension(True)
+                sqlite_vec.load(connection)
+            finally:
+                connection.enable_load_extension(False)
+        except (sqlite3.Error, AttributeError, OSError) as error:
+            connection.close()
+            raise MigrationError("required sqlite-vec runtime could not be loaded") from error
         return connection
 
     def _configure_connection(self, connection: sqlite3.Connection) -> None:
+        if connection.execute("SELECT vec_version()").fetchone()[0] != "v0.1.9":
+            raise MigrationError("required sqlite-vec runtime is unavailable")
         connection.execute(f"PRAGMA busy_timeout = {self.config.lock_wait_ms}")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
