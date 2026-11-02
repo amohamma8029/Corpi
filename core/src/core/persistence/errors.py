@@ -41,6 +41,13 @@ class ConflictingWriteError(PersistenceError):
     code = "migration_failed"
 
 
+class DeletedPdfAcquisitionError(PersistenceError):
+    code = "source_deleted"
+
+    def __init__(self) -> None:
+        super().__init__("This PDF request expired with its deleted source and cannot be resumed.")
+
+
 def translate_sqlite_error(error: sqlite3.Error) -> PersistenceError:
     """Return a stable error without copying SQLite's SQL-bearing message."""
     if isinstance(error, sqlite3.IntegrityError):

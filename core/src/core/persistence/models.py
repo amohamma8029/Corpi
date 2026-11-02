@@ -208,6 +208,17 @@ class ExtractionReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractionSummary:
+    """Page/review status without decoding research text, geometry or visuals."""
+
+    extraction: ExtractionVersion
+    passage_count: int
+    pages: tuple[ExtractionPage, ...]
+    outcome: ExtractionOutcome | None
+    review: ExtractionReview | None
+
+
+@dataclass(frozen=True, slots=True)
 class IndexVersion:
     id: str
     source_id: str
