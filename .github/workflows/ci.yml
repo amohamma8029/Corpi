@@ -75,6 +75,21 @@ jobs:
           uv run ruff format --check .
           uv run pyright
 
+      - name: Managed search model setup (both supported profiles)
+        working-directory: core
+        timeout-minutes: 25
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpi-search-evidence"
+          uv run pytest tests/search/test_live_model_setup.py --model-setup-export-directory "$RUNNER_TEMP/corpi-search-models" --junitxml "$RUNNER_TEMP/corpi-search-evidence/setup.xml" -q
+
+      - name: Offline inference and automatic PDF readiness/model switch
+        working-directory: core
+        timeout-minutes: 10
+        run: |
+          uv run pytest 'tests/search/test_runtime.py::test_real_installed_inference_is_offline_and_does_not_truncate[minilm-en]' 'tests/search/test_runtime.py::test_real_installed_inference_is_offline_and_does_not_truncate[multilingual-e5]' tests/search/test_automatic_import.py --models-directory "$RUNNER_TEMP/corpi-search-models" --junitxml "$RUNNER_TEMP/corpi-search-evidence/integration.xml" -q
+
       - name: UI setup
         run: pnpm --dir desktop install --frozen-lockfile
 
@@ -108,12 +123,16 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo install tauri-driver --version 2.1.0 --locked
 
-      - name: Native viewer E2E (Linux / WebKitGTK)
+      - name: Native viewer and search setup E2E (Linux / WebKitGTK)
         if: runner.os == 'Linux'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: xvfb-run -a --server-args="-screen 0 1280x1024x24" dbus-run-session -- pnpm --dir desktop run test:e2e
 
-      - name: Native viewer E2E (macOS / WKWebView)
+      - name: Native viewer and search setup E2E (macOS / WKWebView)
         if: runner.os == 'macOS'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: pnpm --dir desktop run test:e2e
 
       - name: Upload native viewer evidence
@@ -122,5 +141,16 @@ jobs:
         with:
           name: native-viewer-${{ matrix.os }}-${{ github.sha }}
           path: desktop/e2e-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload search model/platform evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: search-platform-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/corpi-search-evidence/
+            ${{ runner.temp }}/corpi-search-models/*-setup.json
           if-no-files-found: warn
           retention-days: 14
