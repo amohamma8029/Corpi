@@ -15,6 +15,9 @@ from pathlib import Path
 
 @cache
 def _windows_api():
+    if sys.platform != "win32":
+        raise OSError("process_memory_platform_unsupported")
+
     # ctypes permanently caches pointer types: create this pair once, not per sample.
     from ctypes import wintypes
 
