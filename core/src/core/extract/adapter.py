@@ -15,11 +15,28 @@ from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
 from pdfminer.pdfpage import PDFPage
 
 from core.extract.locations import display_size, display_translation
+from core.extract.reading_order import GlyphText, logical_line_text
 from core.extract.types import ExtractedBlock, PageExtraction, PageFrame, PageMetrics
 
 UNMAPPED_TOKEN_PREFIX = "(cid:"
 
 PARSER_NAME = "pdfminer.six"
+
+
+def _container_text(element: object) -> str:
+    from pdfminer.layout import LTChar, LTTextLineHorizontal
+
+    if isinstance(element, LTTextLineHorizontal):
+        return logical_line_text(
+            [
+                GlyphText(child.get_text(), child.x0 if isinstance(child, LTChar) else None)
+                for child in element
+            ]
+        )
+    children = getattr(element, "_objs", [])
+    if not children:
+        return getattr(element, "get_text", lambda: "")()
+    return "".join(_container_text(child) for child in children)
 
 
 def _is_unmapped_token(text: str) -> bool:
@@ -103,7 +120,7 @@ def _collect_blocks(
     draws glyphs is kept as one raw block instead of being dropped.
     """
     if isinstance(element, _LTTextContainer):
-        text = element.get_text()
+        text = _container_text(element)
         if text.strip():
             x0, y0, x1, y1 = element.bbox
             blocks.append(

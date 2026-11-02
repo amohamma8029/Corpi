@@ -63,7 +63,8 @@ STEP_SETS: dict[str, tuple[StepDefinition, ...]] = {}
 PDF_EXTRACT_STEP_KEY = "extract-text"
 PDF_EXTRACT_POLICY_CLASS = "extract"
 CHECKPOINT_FORMAT_VERSION = 1
-NORMALIZATION_VERSION = "faithfully-normalized-text-v1"
+# RTL glyph-order recovery changes new passage text; do not reuse v1 outputs.
+NORMALIZATION_VERSION = "faithfully-normalized-text-v2"
 SETTINGS_FORMAT_VERSION = 1
 EXTRACTION_SETTINGS: JSONValue = {
     "rules_version": "corpi-rules-1",
