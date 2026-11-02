@@ -1,0 +1,74 @@
+{
+  "id": "bekko-a8m-openvino",
+  "model": "hotchpotch/bekko-embedding-v1-a8m",
+  "repository": "hotchpotch/bekko-embedding-v1-a8m",
+  "revision": "c721113d59a1d91b447450324f51c4b3332c924a",
+  "license": "mit",
+  "pooling": "masked-mean",
+  "dimensions": 384,
+  "input_tokens": 8192,
+  "chunk_tokens": 384,
+  "overlap_tokens": 64,
+  "query_prefix": "",
+  "passage_prefix": "",
+  "model_file": "openvino/openvino_model.xml",
+  "runtime": "benchmark-openvino-2026.4.1-native-ir-f32-v1",
+  "vector_format": "normalized-float32-le",
+  "separator": "\n\n",
+  "files": [
+    {
+      "path": "1_Pooling/config.json",
+      "bytes": 312,
+      "sha256": "029891eaab443d10165e66e6f3d5d9008a16b712481f71ae7c938234e8fdeca1",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/1_Pooling/config.json"
+    },
+    {
+      "path": "config.json",
+      "bytes": 1207,
+      "sha256": "950f344b034bb96a6ac3da045b1cd5ba037c08d8e4978471d407324622f8878e",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/config.json"
+    },
+    {
+      "path": "modules.json",
+      "bytes": 229,
+      "sha256": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/modules.json"
+    },
+    {
+      "path": "openvino/openvino_model.bin",
+      "bytes": 130013028,
+      "sha256": "03330e53ab0dd085ff7e24e0dceb9669177f06414657b76276c130eb9e40d53a",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/openvino/openvino_model.bin"
+    },
+    {
+      "path": "openvino/openvino_model.xml",
+      "bytes": 176731,
+      "sha256": "087070db9d3f9fbf00b61bd672aac28f046b316db5b073a4c25086ad1ce7d9e6",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/openvino/openvino_model.xml"
+    },
+    {
+      "path": "sentence_bert_config.json",
+      "bytes": 55,
+      "sha256": "23aa234ef6021d513cdf56947c07aaa6977000d85dcd1fd423f650b3382a39ca",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/sentence_bert_config.json"
+    },
+    {
+      "path": "special_tokens_map.json",
+      "bytes": 1051,
+      "sha256": "6e3204c5a4004719c185007a745d1940471a6fb02521cfa0a00306dbb6bc5903",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/special_tokens_map.json"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 34363442,
+      "sha256": "8bd47075711f75a143d1b78e01a41cc65c1c591b00d3cfeffc23db07adce1392",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/tokenizer.json"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 46634,
+      "sha256": "2ee40d1066ac855e1ea38ac422dbe1f3ddf84c9d415e79272adce569668f3de4",
+      "url": "https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m/resolve/c721113d59a1d91b447450324f51c4b3332c924a/tokenizer_config.json"
+    }
+  ]
+}
