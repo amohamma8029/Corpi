@@ -6,7 +6,9 @@ description = "Corpi local application core: API, ingestion, search, jobs, and p
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
+    "fastembed==0.8.1",
     "pdfminer-six>=20260107",
+    "sqlite-vec==0.1.9",
     "uvicorn>=0.30",
 ]
 
