@@ -1,10 +1,30 @@
 """Worker entrypoint behaviour (M1.5): the page limit is checked inside the child, pre-parse."""
 
 import json
+import os
+import subprocess
+import sys
 
 from pdf_fixtures import PageSpec, build_pdf, native_text_stream
 
 from core.extract import worker
+
+
+def test_worker_protocol_preserves_unicode_with_ascii_stdout() -> None:
+    environment = {**os.environ, "PYTHONIOENCODING": "ascii"}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from core.extract.worker import _emit; "
+            "_emit({'type':'page','text':'\\u2217 caf\\u00e9 \\u0627'})",
+        ],
+        env=environment,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    assert json.loads(result.stdout.decode("utf-8"))["text"] == "∗ café ا"
 
 
 def test_worker_rejects_over_limit_before_parsing(tmp_path, capsys) -> None:

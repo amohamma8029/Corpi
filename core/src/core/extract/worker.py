@@ -26,7 +26,9 @@ from core.extract.classify import (
 
 
 def _emit(payload: dict[str, object]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    # Pipes inherit the child's console encoding on Windows. ASCII-escaped
+    # JSON preserves every Unicode character without relying on that encoding.
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
