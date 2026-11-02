@@ -909,6 +909,447 @@
           }
         }
       }
+    },
+    "/sources/{source_id}/search/cancel": {
+      "post": {
+        "summary": "Cancel Search Preparation",
+        "operationId": "cancel_search_preparation_sources__source_id__search_cancel_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreparationAction"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreparationAction"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/search/resume": {
+      "post": {
+        "summary": "Resume Search Preparation",
+        "operationId": "resume_search_preparation_sources__source_id__search_resume_post",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumePreparation"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreparationAction"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sources/{source_id}/search-progress": {
+      "get": {
+        "summary": "Source Search Progress",
+        "operationId": "source_search_progress_sources__source_id__search_progress_get",
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Source Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceSearchProgress"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}/model": {
+      "get": {
+        "summary": "Get Notebook Model",
+        "operationId": "get_notebook_model_notebooks__notebook_id__model_get",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotebookModelPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Choose Notebook Model",
+        "operationId": "choose_notebook_model_notebooks__notebook_id__model_post",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotebookModelChoice"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotebookModelPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}/model/cancel": {
+      "post": {
+        "summary": "Cancel Notebook Model",
+        "operationId": "cancel_notebook_model_notebooks__notebook_id__model_cancel_post",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelGenerationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotebookModelPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "summary": "List Models",
+        "operationId": "list_models_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ModelSetupPayload"
+                  },
+                  "type": "array",
+                  "title": "Response List Models Models Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models/{profile_id}/setup": {
+      "post": {
+        "summary": "Setup Model",
+        "operationId": "setup_model_models__profile_id__setup_post",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelSetupRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelSetupPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/models/{profile_id}/setup/cancel": {
+      "post": {
+        "summary": "Cancel Model Setup",
+        "operationId": "cancel_model_setup_models__profile_id__setup_cancel_post",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Profile Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelGenerationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelSetupPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/notebooks/{notebook_id}/search": {
+      "post": {
+        "summary": "Search Notebook",
+        "operationId": "search_notebook_notebooks__notebook_id__search_post",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1552,6 +1993,116 @@
         "title": "JobStepPayload"
       },
       "JsonValue": {},
+      "ModelGenerationRequest": {
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Generation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "generation"
+        ],
+        "title": "ModelGenerationRequest"
+      },
+      "ModelSetupPayload": {
+        "properties": {
+          "profile_id": {
+            "type": "string",
+            "title": "Profile Id"
+          },
+          "manifest_id": {
+            "type": "string",
+            "title": "Manifest Id"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "language_scope": {
+            "type": "string",
+            "title": "Language Scope"
+          },
+          "is_default": {
+            "type": "boolean",
+            "title": "Is Default"
+          },
+          "download_bytes": {
+            "type": "integer",
+            "title": "Download Bytes"
+          },
+          "state": {
+            "type": "string",
+            "title": "State"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          },
+          "received_bytes": {
+            "type": "integer",
+            "title": "Received Bytes"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "can_cancel": {
+            "type": "boolean",
+            "title": "Can Cancel"
+          },
+          "can_retry": {
+            "type": "boolean",
+            "title": "Can Retry"
+          }
+        },
+        "type": "object",
+        "required": [
+          "profile_id",
+          "manifest_id",
+          "model",
+          "language_scope",
+          "is_default",
+          "download_bytes",
+          "state",
+          "generation",
+          "received_bytes",
+          "failure_code",
+          "can_cancel",
+          "can_retry"
+        ],
+        "title": "ModelSetupPayload"
+      },
+      "ModelSetupRequest": {
+        "properties": {
+          "request_key": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Request Key"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Generation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_key",
+          "generation"
+        ],
+        "title": "ModelSetupRequest"
+      },
       "NotebookCreate": {
         "properties": {
           "title": {
@@ -1577,6 +2128,89 @@
           "title"
         ],
         "title": "NotebookCreate"
+      },
+      "NotebookModelChoice": {
+        "properties": {
+          "request_key": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Request Key"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Generation"
+          },
+          "profile_id": {
+            "type": "string",
+            "title": "Profile Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_key",
+          "generation",
+          "profile_id"
+        ],
+        "title": "NotebookModelChoice"
+      },
+      "NotebookModelPayload": {
+        "properties": {
+          "notebook_id": {
+            "type": "string",
+            "title": "Notebook Id"
+          },
+          "active_profile_id": {
+            "type": "string",
+            "title": "Active Profile Id"
+          },
+          "pending_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Profile Id"
+          },
+          "generation": {
+            "type": "integer",
+            "title": "Generation"
+          },
+          "ready_sources": {
+            "type": "integer",
+            "title": "Ready Sources"
+          },
+          "rebuilt_sources": {
+            "type": "integer",
+            "title": "Rebuilt Sources"
+          },
+          "failed_sources": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Failed Sources",
+            "default": 0
+          },
+          "cancelled_sources": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Cancelled Sources",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "notebook_id",
+          "active_profile_id",
+          "pending_profile_id",
+          "generation",
+          "ready_sources",
+          "rebuilt_sources"
+        ],
+        "title": "NotebookModelPayload"
       },
       "NotebookPayload": {
         "properties": {
@@ -1606,6 +2240,19 @@
         ],
         "title": "NotebookPayload"
       },
+      "PreparationAction": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id"
+        ],
+        "title": "PreparationAction"
+      },
       "ProcessingActionPayload": {
         "properties": {
           "job_id": {
@@ -1624,6 +2271,26 @@
         ],
         "title": "ProcessingActionPayload"
       },
+      "ResumePreparation": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "request_key": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Request Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "request_key"
+        ],
+        "title": "ResumePreparation"
+      },
       "ReviewDecisionRequest": {
         "properties": {
           "decision": {
@@ -1641,6 +2308,206 @@
           "generation"
         ],
         "title": "ReviewDecisionRequest"
+      },
+      "SearchCitation": {
+        "properties": {
+          "passage_id": {
+            "type": "string",
+            "title": "Passage Id"
+          },
+          "ordinal": {
+            "type": "integer",
+            "title": "Ordinal"
+          },
+          "start_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Offset"
+          },
+          "end_offset": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Offset"
+          },
+          "page_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Number"
+          }
+        },
+        "type": "object",
+        "required": [
+          "passage_id",
+          "ordinal",
+          "start_offset",
+          "end_offset",
+          "page_number"
+        ],
+        "title": "SearchCitation"
+      },
+      "SearchRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Query"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "meaning",
+              "words"
+            ],
+            "title": "Mode",
+            "default": "meaning"
+          },
+          "limit": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "default": 10
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest"
+      },
+      "SearchResponse": {
+        "properties": {
+          "notebook_id": {
+            "type": "string",
+            "title": "Notebook Id"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "meaning",
+              "words"
+            ],
+            "title": "Mode"
+          },
+          "ready_sources": {
+            "type": "integer",
+            "title": "Ready Sources"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            },
+            "type": "array",
+            "title": "Results"
+          }
+        },
+        "type": "object",
+        "required": [
+          "notebook_id",
+          "mode",
+          "ready_sources",
+          "results"
+        ],
+        "title": "SearchResponse"
+      },
+      "SearchResult": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "source_version_id": {
+            "type": "string",
+            "title": "Source Version Id"
+          },
+          "index_version_id": {
+            "type": "string",
+            "title": "Index Version Id"
+          },
+          "chunk_id": {
+            "type": "string",
+            "title": "Chunk Id"
+          },
+          "manifest_id": {
+            "type": "string",
+            "title": "Manifest Id"
+          },
+          "source_name": {
+            "type": "string",
+            "title": "Source Name"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score"
+          },
+          "import_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Import Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "citations": {
+            "items": {
+              "$ref": "#/components/schemas/SearchCitation"
+            },
+            "type": "array",
+            "title": "Citations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id",
+          "source_version_id",
+          "index_version_id",
+          "chunk_id",
+          "manifest_id",
+          "source_name",
+          "text",
+          "score",
+          "import_id",
+          "filename",
+          "citations"
+        ],
+        "title": "SearchResult"
       },
       "SourcePayload": {
         "properties": {
@@ -1698,6 +2565,91 @@
           "pending_import_id"
         ],
         "title": "SourcePayload"
+      },
+      "SourceSearchProgress": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "title": "Source Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step"
+          },
+          "waiting_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Waiting Reason"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "completed_chunks": {
+            "type": "integer",
+            "title": "Completed Chunks"
+          },
+          "total_chunks": {
+            "type": "integer",
+            "title": "Total Chunks"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "can_cancel": {
+            "type": "boolean",
+            "title": "Can Cancel",
+            "default": false
+          },
+          "can_resume": {
+            "type": "boolean",
+            "title": "Can Resume",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id",
+          "status",
+          "step",
+          "waiting_reason",
+          "failure_code",
+          "completed_chunks",
+          "total_chunks"
+        ],
+        "title": "SourceSearchProgress"
       },
       "StoragePayload": {
         "properties": {
