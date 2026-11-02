@@ -13,8 +13,9 @@ running thread. Steps that need a guaranteed stop must run as terminable tools
 (a subprocess) when 1.4-1.6 add them; cooperative steps poll ``should_stop``,
 which reports cancellation, runner shutdown, and the attempt deadline.
 
-All database operations run on a dedicated single-thread executor so a busy
-database never blocks the event loop, API requests, or the processing workers.
+Runner bookkeeping runs on a dedicated single-thread executor so a busy database
+never blocks the event loop or API requests. Each processing step owns a verified
+cancellation reader on its worker thread, with no transaction between polls.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from functools import partial
 from hashlib import sha256
 from typing import Any
@@ -83,6 +84,8 @@ class StepPolicy:
     jitter: float = 0.25
 
 
+SEARCH_PREPARATION_SECONDS = 1200.0
+
 STEP_POLICIES: dict[str, StepPolicy] = {
     "model_call": StepPolicy(120.0, 3, 2.0),
     "ocr_page": StepPolicy(60.0, 2, 1.0, backoff_max_seconds=5.0),
@@ -90,6 +93,7 @@ STEP_POLICIES: dict[str, StepPolicy] = {
     "extract": StepPolicy(600.0, 2, 2.0),
     "embedding_batch": StepPolicy(120.0, 2, 2.0),
     "index_build": StepPolicy(300.0, 2, 2.0),
+    "search_prepare": StepPolicy(SEARCH_PREPARATION_SECONDS, 2, 2.0),
     "file_write": StepPolicy(60.0, 2, 1.0, backoff_max_seconds=10.0),
     "generic": StepPolicy(120.0, 2, 2.0),
 }
@@ -99,6 +103,9 @@ STEP_POLICIES: dict[str, StepPolicy] = {
 class StepOutcome:
     checkpoint_format_version: int
     checkpoint: JSONValue
+    # Runtime-only timing,never part of persisted output or its fingerprint.
+    completed_at: float | None = field(default=None, compare=False)
+    started_at: float | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +115,8 @@ class StepContext:
     attempt_number: int
     is_cancelled: Callable[[], bool]
     should_stop: Callable[[], bool]
+    guard: AttemptGuard | None = None
+    started_at: float | None = None
 
 
 StepRun = Callable[[StepContext], StepOutcome]
@@ -201,6 +210,8 @@ class JobRunner:
         policies: Mapping[str, StepPolicy] | None = None,
         poll_interval_seconds: float = 0.25,
         backoff_sleep: Callable[[float], Any] | None = None,
+        reconcile: Callable[[], None] | None = None,
+        claim_blocking_reason: Callable[[Job], str | None] | None = None,
     ) -> None:
         self._store = store
         self._step_sets = {kind: tuple(steps) for kind, steps in step_sets.items()}
@@ -209,6 +220,9 @@ class JobRunner:
         self._policies: dict[str, StepPolicy] = {**STEP_POLICIES, **dict(policies or {})}
         self._poll_interval = poll_interval_seconds
         self._backoff_sleep = backoff_sleep or asyncio.sleep
+        self._reconcile = reconcile
+        self._claim_blocking_reason = claim_blocking_reason
+        self._needs_reconcile = False
         self._executor = ThreadPoolExecutor(
             max_workers=self._pool_size, thread_name_prefix="corpi-job"
         )
@@ -225,6 +239,7 @@ class JobRunner:
         self._inflight_lock = threading.Lock()
         self._annotated_jobs: set[str] = set()
         self._pending_job_failures: list[tuple[str, str]] = []
+        self._step_completed_at = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -237,6 +252,8 @@ class JobRunner:
         # every job still marked running belongs to that dead instance and can
         # be requeued immediately — no heartbeat-age cutoff.
         await self._db(self._store.release_running_jobs)
+        if self._reconcile is not None:
+            await self._db(self._reconcile)
         self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self) -> None:
@@ -255,6 +272,7 @@ class JobRunner:
 
     def notify(self) -> None:
         """Wake the runner after new work is enqueued."""
+        self._needs_reconcile = True
         loop = self._loop
         wakeup = self._wakeup
         if loop is not None and wakeup is not None:
@@ -298,6 +316,9 @@ class JobRunner:
     async def _loop_once(self) -> None:
         assert self._wakeup is not None
         await self._drain_pending_failures()
+        if self._needs_reconcile and self._reconcile is not None:
+            self._needs_reconcile = False
+            await self._db(self._reconcile)
         stall_reason = self._stall_reason()
         if stall_reason is not None:
             await self._db(self._enter_stall, stall_reason)
@@ -321,6 +342,15 @@ class JobRunner:
             except Exception:  # noqa: BLE001 - unknown jobs are simply not claimable
                 continue
             waiting_reason = WAITING_FOR_IMPLEMENTATION.get(job.kind)
+            if self._claim_blocking_reason is not None:
+                blocker = await self._db(self._claim_blocking_reason, job)
+                if blocker is not None:
+                    if candidate.failure_reason != blocker:
+                        with contextlib.suppress(ConflictingWriteError):
+                            await self._db(
+                                self._store.annotate_queued_job, candidate.job_id, blocker
+                            )
+                    continue
             if waiting_reason is not None and job.kind not in self._step_sets:
                 # M1.4 can persist the saved original and queued handoff before
                 # M1.5 provides extraction. Keep this known kind visibly queued;
@@ -388,6 +418,7 @@ class JobRunner:
 
     async def _run_job(self, status: JobStatus) -> None:
         job_id = status.job_id
+        started_at = time.monotonic()
         try:
             job = await self._db(self._store.load_job_by_id, job_id)
             steps = self._step_sets.get(job.kind)
@@ -417,8 +448,9 @@ class JobRunner:
                         )
                         return
                     continue  # reuse: the committed completion record is the proof
-                if not await self._run_step(status, job, step):
+                if not await self._run_step(status, job, step, started_at=started_at):
                     return
+                started_at = self._step_completed_at
             try:
                 await self._db(self._store.finish_job, job_id, "completed")
             except ConflictingWriteError:
@@ -435,6 +467,8 @@ class JobRunner:
             await self._record_job_failure(job_id, f"runner error: {type(error).__name__}")
         finally:
             self._claimed_job_id = None
+            if self._reconcile is not None and not self._stopping.is_set():
+                await self._db(self._reconcile)
 
     async def _record_job_failure(self, job_id: str, reason: str) -> None:
         """Record a failed outcome, keeping it pending when the write fails.
@@ -481,9 +515,12 @@ class JobRunner:
             return default_inputs_fingerprint(job, step)
         return sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
-    async def _run_step(self, status: JobStatus, job: Job, step: StepDefinition) -> bool:
+    async def _run_step(
+        self, status: JobStatus, job: Job, step: StepDefinition, *, started_at: float | None = None
+    ) -> bool:
         """Run one step with retries. Returns False when the job must stop."""
         policy = self._policy_for(status, step)
+        attempt_started = time.monotonic() if started_at is None else started_at
         fingerprint = await self._fingerprint(job, step)
         while True:
             attempts = await self._db(self._store.load_step_attempts, job.id, step.step_key)
@@ -533,19 +570,15 @@ class JobRunner:
                 return False
             attempt = await self._db(self._store.start_step_attempt, job.id, step.step_key)
             deadline = time.monotonic() + policy.timeout_seconds
-            context = StepContext(
-                job_id=job.id,
-                step_key=step.step_key,
-                attempt_number=attempt.attempt_number,
-                is_cancelled=lambda: self._observed_cancelled(job.id),
-                should_stop=lambda deadline=deadline: (
-                    self._stopping.is_set()
-                    or time.monotonic() >= deadline
-                    or self._observed_cancelled(job.id)
-                ),
-            )
             key = (job.id, step.step_key, attempt.attempt_number)
-            worker_future = self._executor.submit(step.run, context)
+            worker_future = self._executor.submit(
+                self._run_step_with_reader,
+                step,
+                job.id,
+                AttemptGuard(self._owner, step.step_key, attempt.attempt_number),
+                deadline,
+                attempt_started,
+            )
             self._begin_inflight(key, policy)
             worker_future.add_done_callback(
                 lambda _future, done_key=key: self._end_inflight(done_key)
@@ -588,6 +621,7 @@ class JobRunner:
                         f"step {step.step_key} timed out after {attempt.attempt_number} attempt(s)",
                     )
                     return False
+                attempt_started = time.monotonic()
                 await self._backoff(policy, attempt.attempt_number)
                 continue
             except JobStepCancelled:
@@ -647,6 +681,7 @@ class JobRunner:
                         f"step {step.step_key} failed after {attempt.attempt_number} attempt(s)",
                     )
                     return False
+                attempt_started = time.monotonic()
                 await self._backoff(policy, attempt.attempt_number)
                 continue
 
@@ -662,6 +697,24 @@ class JobRunner:
                         outcome=outcome,
                     ),
                 )
+            except PermanentStepFailure as error:
+                await self._db(
+                    self._store.finish_step_attempt,
+                    job.id,
+                    step.step_key,
+                    attempt.attempt_number,
+                    f"PermanentStepFailure: {error}",
+                )
+                await self._db(
+                    partial(
+                        self._store.finish_job,
+                        job.id,
+                        "failed",
+                        f"step {step.step_key} failed permanently: {error}",
+                        failure_code=error.code,
+                    )
+                )
+                return False
             except ConflictingWriteError:
                 # The guarded commit saw a cancellation, a superseded attempt,
                 # or a finished job: the late result must not be recorded.
@@ -673,14 +726,48 @@ class JobRunner:
                     "commit rejected",
                 )
                 return False
+            self._step_completed_at = time.monotonic()
             await self._db(
                 self._store.finish_step_attempt, job.id, step.step_key, attempt.attempt_number, None
             )
             return True
 
-    def _observed_cancelled(self, job_id: str) -> bool:
-        status = self._store.load_job_status(job_id)
-        return status is None or status.status == "cancelled"
+    def _run_step_with_reader(
+        self,
+        step: StepDefinition,
+        job_id: str,
+        guard: AttemptGuard,
+        deadline: float,
+        started_at: float | None = None,
+    ) -> StepOutcome:
+        # Open/close on the actual worker, including exceptions and retries. A
+        # timed-out thread keeps its reader only until it really finishes; no
+        # other worker or the event loop may borrow its SQLite connection.
+        owner_thread = threading.get_ident()
+        if started_at is None:
+            started_at = time.monotonic()
+        with self._store.job_cancellation_reader(job_id) as read_cancelled:
+
+            def cancelled() -> bool:
+                if threading.get_ident() == owner_thread:
+                    return read_cancelled()
+                # Extraction has a separate stop watcher. Preserve its fresh
+                # reads without lending it this worker's SQLite connection.
+                status = self._store.load_job_status(job_id)
+                return status is None or status.status == "cancelled"
+
+            context = StepContext(
+                job_id=job_id,
+                step_key=step.step_key,
+                attempt_number=guard.expected_attempt_number,
+                is_cancelled=cancelled,
+                should_stop=lambda: (
+                    self._stopping.is_set() or time.monotonic() >= deadline or cancelled()
+                ),
+                guard=guard,
+                started_at=started_at,
+            )
+            return replace(step.run(context), completed_at=time.monotonic(), started_at=started_at)
 
     async def _backoff(self, policy: StepPolicy, attempt_number: int) -> None:
         delay = min(
