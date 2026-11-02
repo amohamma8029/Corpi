@@ -3,8 +3,11 @@ import { launcher as TauriLauncher, type TauriServiceOptions } from "@wdio/tauri
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
-const APPLICATION = path.resolve(`./src-tauri/target/release/corpi-desktop${process.platform === "win32" ? ".exe" : ""}`);
+const APPLICATION = process.env.CORPI_E2E_BINARY
+  ?? path.resolve(`./src-tauri/target/release/corpi-desktop${process.platform === "win32" ? ".exe" : ""}`);
+if (!path.isAbsolute(APPLICATION)) throw new Error("CORPI_E2E_BINARY must be an absolute test binary path");
 const embedded = process.env.CORPI_E2E_PROVIDER === "embedded";
+const modelDownloads = process.env.CORPI_RUN_MODEL_DOWNLOAD === "1";
 const results = process.env.CORPI_E2E_RESULTS ?? path.resolve("e2e-results");
 mkdirSync(results, { recursive: true });
 const launcherOptions: TauriServiceOptions = {
@@ -27,7 +30,8 @@ export const config: WebdriverIO.Config = {
   logLevel: "warn",
   outputDir: path.join(results, "logs"),
   framework: "mocha",
-  mochaOpts: { timeout: 180000, bail: true },
+  mochaOpts: { timeout: process.env.CORPI_READINESS_CASE ? 45 * 60 * 1000
+    : modelDownloads || process.env.CORPI_RUN_INSTALLED_MODEL_E2E === "1" ? 25 * 60 * 1000 : 180000, bail: true },
   reporters: ["spec"],
   waitforTimeout: 15000,
   connectionRetryCount: 3,

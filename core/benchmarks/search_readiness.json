@@ -1,0 +1,34 @@
+{
+  "scope": "Original public PDF desktop readiness; separate from frozen retrieval-quality questions",
+  "fixtures": [
+    {
+      "id": "attention",
+      "filename": "attention.pdf",
+      "title": "Attention Is All You Need",
+      "url": "https://arxiv.org/pdf/1706.03762",
+      "sha256": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+      "bytes": 2215244,
+      "pages": 15
+    },
+    {
+      "id": "bert",
+      "filename": "bert.pdf",
+      "title": "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding",
+      "url": "https://arxiv.org/pdf/1810.04805",
+      "sha256": "5692a5514787a8c6727b4ff3b726a3385798bc68e12138d1d4af83947e2acf6e",
+      "bytes": 775166,
+      "pages": 16
+    },
+    {
+      "id": "global-economic-prospects-2015",
+      "filename": "global-economic-prospects-2015.pdf",
+      "title": "Global Economic Prospects, June 2015: The Global Economy in Transition",
+      "url": "https://www.worldbank.org/content/dam/Worldbank/GEP/GEP2015b/Global-Economic-Prospects-June-2015-Global-economy-in-transition.pdf",
+      "sha256": "e2d666717a8ac2c5c868c751bf873133a9e1e759b454460b69b3dfecad0e4f3e",
+      "bytes": 7304908,
+      "pages": 200,
+      "review_exclusions": {"unreadable": [2, 199], "blank": [4, 14, 16, 18, 20, 22, 82, 84, 112, 128, 138]},
+      "license": "World Bank Group 2015, CC BY 3.0 IGO; original unmodified PDF"
+    }
+  ]
+}
