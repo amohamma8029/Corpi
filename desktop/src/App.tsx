@@ -1,5 +1,8 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ModelSettings } from "./components/ModelSettings";
+import { SearchProgress } from "./components/SearchProgress";
+import { NotebookSearch } from "./components/NotebookSearch";
 
 import {
   cancelPdfAcquisition,
@@ -20,6 +23,7 @@ import {
   listPdfImports,
   Notebook,
   NotebookSource,
+  NotebookSearchResult,
   PdfAcquisition,
   PdfImport,
   reopenExtractionReview,
@@ -63,6 +67,10 @@ export function App() {
   const [extraction, setExtraction] = useState<ExtractionReport | null>(null);
   const [uploading, setUploading] = useState(false);
   const [viewerImport, setViewerImport] = useState<PdfImport | null>(null);
+  const [viewerPage, setViewerPage] = useState(1);
+  const currentNotebookRef = useRef(selectedNotebookId);
+  currentNotebookRef.current = selectedNotebookId;
+  const viewerRequest = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectionSourceRef = useRef("");
   const nextIntentRef = useRef<{ intent: ImportIntent; sourceId?: string; acquisitionId?: string }>({ intent: "add" });
@@ -113,6 +121,8 @@ export function App() {
 
   useEffect(() => {
     setAcquisition(null);
+    ++viewerRequest.current;
+    setViewerImport(null);
     if (!connection || !selectedNotebookId) {
       setSources([]);
       setSavedAcquisitions([]);
@@ -170,6 +180,11 @@ export function App() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [acquisition?.id, connection, uploading]);
 
+  // Polling returns a new array even when the underlying import state is unchanged.
+  // Refresh on actual transitions, not on every identical response object.
+  const importsRevision = imports.map((item) =>
+    `${item.id}:${item.state}:${item.is_current}:${item.is_pending}:${item.trashed}`,
+  ).join("|");
   useEffect(() => {
     if (selectionSourceRef.current !== selectedSourceId) {
       selectionSourceRef.current = selectedSourceId;
@@ -189,24 +204,30 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [connection, selectedSourceId, imports]);
+  }, [connection, selectedSourceId, importsRevision]);
 
   const processingActive = imports.some((item) => !item.trashed && item.state === "pending");
   useEffect(() => {
     if (!connection || !selectedSourceId || !(processingActive || uploading)) return;
     let cancelled = false;
-    const timer = window.setInterval(() => {
-      void listPdfImports(connection, selectedSourceId)
+    let loading = false;
+    async function refresh() {
+      if (loading || cancelled) return;
+      loading = true;
+      try {
+        await Promise.all([listPdfImports(connection!, selectedSourceId)
         .then((items) => {
           if (!cancelled && selectionSourceRef.current === selectedSourceId) setImports(items);
         })
-        .catch(() => undefined);
-      void getExtraction(connection, selectedSourceId)
+        .catch(() => undefined),
+        getExtraction(connection!, selectedSourceId)
         .then((report) => {
           if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(report);
         })
-        .catch(() => undefined);
-    }, 2000);
+        .catch(() => undefined)]);
+      } finally { loading = false; }
+    }
+    const timer = window.setInterval(() => { void refresh(); }, 2000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -452,6 +473,21 @@ export function App() {
     }
   }
 
+  async function openSearchResult(result: NotebookSearchResult, page: number) {
+    if (!connection || !result.import_id) return;
+    const notebook = selectedNotebookId;
+    const request = ++viewerRequest.current;
+    try {
+      const files = await listPdfImports(connection, result.source_id);
+      if (notebook !== currentNotebookRef.current || request !== viewerRequest.current) return;
+      const file = files.find((item) => item.id === result.import_id && item.source_version_id === result.source_version_id && !item.trashed);
+      if (!file) throw new Error("This saved PDF is no longer available. Search again.");
+      setViewerPage(page);
+      setViewerImport(file);
+      setError(null);
+    } catch (cause) { if (notebook === currentNotebookRef.current && request === viewerRequest.current) setError(messageFor(cause)); }
+  }
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -499,6 +535,7 @@ export function App() {
               />
               <button id="create-notebook" type="submit" disabled={uploading}>Create notebook</button>
             </form>
+            <ModelSettings connection={connection} notebookId={selectedNotebookId} />
             {selectedNotebookId ? (
               <>
                 <button
@@ -540,6 +577,8 @@ export function App() {
           </aside>
 
           <section className="source-panel" aria-label="Notebook source">
+            <NotebookSearch connection={connection} notebookId={selectedNotebookId}
+              onOpen={(result, page) => void openSearchResult(result, page)} />
             {selectedSource ? (
               <>
                 <div className="source-heading">
@@ -560,6 +599,7 @@ export function App() {
                   </button>
                 </div>
                 <h3>Files</h3>
+                <SearchProgress connection={connection} sourceId={selectedSource.id} />
                 {imports.length ? (
                   <ul className="import-list" aria-label="PDF file history">
                     {imports.map((item) => (
@@ -571,7 +611,7 @@ export function App() {
                         </div>
                         <button
                           type="button"
-                          onClick={(event) => { event.currentTarget.focus(); setViewerImport(item); }}
+                          onClick={(event) => { event.currentTarget.focus(); ++viewerRequest.current; setViewerPage(1); setViewerImport(item); }}
                           disabled={item.trashed}
                         >
                           Open
@@ -687,8 +727,9 @@ export function App() {
             sourceId={viewerImport.source_id}
             importId={viewerImport.id}
             filename={viewerImport.filename}
+            initialPage={viewerPage}
             renderedPagePixelLimit={storage.rendered_page_pixel_limit}
-            onClose={() => setViewerImport(null)}
+            onClose={() => { ++viewerRequest.current; setViewerImport(null); }}
           />
         </Suspense>
       ) : null}
