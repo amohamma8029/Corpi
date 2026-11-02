@@ -30,3 +30,9 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+Desktop.ini
+._*
+
+# Generated Windows cache directories
+/%SystemDrive%/ProgramData/Microsoft/Windows/Caches/
+/desktop/%SystemDrive%/ProgramData/Microsoft/Windows/Caches/
