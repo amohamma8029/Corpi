@@ -333,6 +333,9 @@ fn spawn_core(data_dir: &Path) -> Result<(Child, String), String> {
         .current_dir(&core_dir)
         .env("CORPI_CORE_TOKEN", &token)
         .env("CORPI_DATA_DIR", data_dir)
+        // Tokenizer/model metadata is UTF-8, including on legacy-codepage Windows.
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         // The shell holds the stdin pipe; the server exits on EOF, which
         // reaches it even when process-group kills miss the interpreter.
         .env("CORPI_CORE_WATCH_STDIN", "1")
