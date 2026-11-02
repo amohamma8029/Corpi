@@ -1,6 +1,6 @@
 export interface PdfFixture {
   filename: string;
-  kind: "text" | "raster" | "invalid";
+  kind: "text" | "search-text" | "raster" | "invalid";
 }
 
 // Self-contained so the same function can construct the File inside the webview.
@@ -10,9 +10,10 @@ export function pdfFixtureBytes(fixture: PdfFixture): Uint8Array {
     return new TextEncoder().encode("%PDF-1.4\nCorpi invalid viewer fixture\n%%EOF\n");
   }
   let objects: string[];
-  if (fixture.kind === "text") {
-    const first = "q 0.2 0.5 0.8 rg 0 0 200 200 re f Q\nBT /F1 18 Tf 20 100 Td (Corpi page one) Tj ET";
-    const second = "q 0.8 0.2 0.3 rg 0 0 200 200 re f Q\nBT /F1 18 Tf 20 100 Td (Corpi page two) Tj ET";
+  if (fixture.kind === "text" || fixture.kind === "search-text") {
+    const searchable = "BT /F1 8 Tf 15 150 Td 12 TL (The experiment measured rainfall) Tj T* (and soil moisture across study sites.) Tj T* (Researchers compared daily readings) Tj T* (to understand the seasonal changes.) Tj ET";
+    const first = "q 0.2 0.5 0.8 rg 0 0 200 200 re f Q\n" + (fixture.kind === "search-text" ? searchable : "BT /F1 18 Tf 20 100 Td (Corpi page one) Tj ET");
+    const second = "q 0.8 0.2 0.3 rg 0 0 200 200 re f Q\n" + (fixture.kind === "search-text" ? searchable : "BT /F1 18 Tf 20 100 Td (Corpi page two) Tj ET");
     objects = [
       "<< /Type /Catalog /Pages 2 0 R >>",
       "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",

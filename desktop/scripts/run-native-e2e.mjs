@@ -20,6 +20,7 @@ const provider = process.platform === "darwin" || process.argv.includes("--embed
 const results = path.join(desktop, "e2e-results", provider);
 const binary = path.join(desktop, `src-tauri/target/release/corpi-desktop${windows ? ".exe" : ""}`);
 const reuseBuild = process.argv.includes("--reuse-build");
+const modelDownloads = process.env.CORPI_RUN_MODEL_DOWNLOAD === "1";
 let previousBuild = null;
 if (reuseBuild) {
   try {
@@ -58,6 +59,7 @@ const evidence = {
   tauriServiceVersion: packageJson.devDependencies["@wdio/tauri-service"],
   provider,
   reusedBuild: reuseBuild,
+  modelDownloads,
   startedAt: new Date().toISOString(),
   stage: "setup",
   status: "running",
@@ -174,7 +176,8 @@ try {
   }
   evidence.stage = "viewer";
   saveEvidence();
-  await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], 300_000);
+  // Allow the bounded setup test plus the ordinary viewer/startup checks.
+  await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], modelDownloads ? 1_800_000 : 300_000);
 } catch (error) {
   failure = error;
 } finally {
