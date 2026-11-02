@@ -1,0 +1,102 @@
+[
+  {
+    "id": "lealla-small",
+    "model": "setu4993/LEALLA-small",
+    "repository": "sunzhuo/LEALLA-small",
+    "revision": "0277927f474f1b1c5c8eccb6f372b18403035cdd",
+    "license": "apache-2.0",
+    "pooling": "pooler_output",
+    "dimensions": 128,
+    "input_tokens": 512,
+    "chunk_tokens": 384,
+    "overlap_tokens": 64,
+    "query_prefix": "",
+    "passage_prefix": "",
+    "model_file": "onnx/model_quantized.onnx",
+    "runtime": "benchmark-ort-sentence-output-v1",
+    "vector_format": "normalized-float32-le",
+    "separator": "\n\n",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 633,
+        "sha256": "18270e43ee59366e7fcd2fbe6e0dbb1e9165e8edf62b8edee641ed00b082a7df",
+        "url": "https://huggingface.co/sunzhuo/LEALLA-small/resolve/0277927f474f1b1c5c8eccb6f372b18403035cdd/config.json"
+      },
+      {
+        "path": "onnx/model_quantized.onnx",
+        "bytes": 70051130,
+        "sha256": "2c0732d0e8532dd486d83a3939882f928e9891649dcc69703637eb93be9e95ca",
+        "url": "https://huggingface.co/sunzhuo/LEALLA-small/resolve/0277927f474f1b1c5c8eccb6f372b18403035cdd/onnx/model_quantized.onnx"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 125,
+        "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+        "url": "https://huggingface.co/sunzhuo/LEALLA-small/resolve/0277927f474f1b1c5c8eccb6f372b18403035cdd/special_tokens_map.json"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 13631919,
+        "sha256": "09216b42d2697b7b4a26ac05ff09ba8bf52dc19b896c5ceee8bbff9f39055322",
+        "url": "https://huggingface.co/sunzhuo/LEALLA-small/resolve/0277927f474f1b1c5c8eccb6f372b18403035cdd/tokenizer.json"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 367,
+        "sha256": "e6f3b96db926a37d4039995fbf5ad17de158dfb8f6343d607e4dbaad18d75f5a",
+        "url": "https://huggingface.co/sunzhuo/LEALLA-small/resolve/0277927f474f1b1c5c8eccb6f372b18403035cdd/tokenizer_config.json"
+      }
+    ]
+  },
+  {
+    "id": "mmbert-student",
+    "model": "Horizon-Labs/multilingual-embedding-small",
+    "repository": "Horizon-Labs/multilingual-embedding-small",
+    "revision": "6418071ac0a526fea6f72230390298d5e1a5c7b7",
+    "license": "apache-2.0",
+    "pooling": "sentence_embedding",
+    "dimensions": 1024,
+    "input_tokens": 512,
+    "chunk_tokens": 384,
+    "overlap_tokens": 64,
+    "query_prefix": "",
+    "passage_prefix": "",
+    "model_file": "onnx/model_quantized.onnx",
+    "runtime": "benchmark-ort-sentence-output-v1",
+    "vector_format": "normalized-float32-le",
+    "separator": "\n\n",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 1897,
+        "sha256": "524195c495314452b09b47fa45986eb5d696216b20743f8a53742a9e42e97aff",
+        "url": "https://huggingface.co/Horizon-Labs/multilingual-embedding-small/resolve/6418071ac0a526fea6f72230390298d5e1a5c7b7/config.json"
+      },
+      {
+        "path": "onnx/model_quantized.onnx",
+        "bytes": 269308979,
+        "sha256": "67a50ea91c7dc8a1c54e73df94e1ab934b8918edb24d2da316f7ec3bdb23fae2",
+        "url": "https://huggingface.co/Horizon-Labs/multilingual-embedding-small/resolve/6418071ac0a526fea6f72230390298d5e1a5c7b7/onnx/model_quantized.onnx"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 636,
+        "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351",
+        "url": "https://huggingface.co/Horizon-Labs/multilingual-embedding-small/resolve/6418071ac0a526fea6f72230390298d5e1a5c7b7/special_tokens_map.json"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 34363441,
+        "sha256": "0a5069feab370ece9f452dcda41c0ba2c216eebf6cb49b06893698f53cdc2b0b",
+        "url": "https://huggingface.co/Horizon-Labs/multilingual-embedding-small/resolve/6418071ac0a526fea6f72230390298d5e1a5c7b7/tokenizer.json"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 46440,
+        "sha256": "ea349495764b24570b4560fe2e4a557e5c0a47e6bce782c2409b1d6445cf8633",
+        "url": "https://huggingface.co/Horizon-Labs/multilingual-embedding-small/resolve/6418071ac0a526fea6f72230390298d5e1a5c7b7/tokenizer_config.json"
+      }
+    ]
+  }
+]

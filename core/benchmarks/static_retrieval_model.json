@@ -1,0 +1,44 @@
+{
+  "id": "amgix-static-retrieval",
+  "model": "amgix/static-retrieval-multilingual-69m-v1",
+  "repository": "amgix/static-retrieval-multilingual-69m-v1",
+  "revision": "f777a93cd958b280b6c7fad5aaac3cd59d676822",
+  "license": "apache-2.0",
+  "pooling": "static-mean-include-unk",
+  "dimensions": 384,
+  "input_tokens": 512,
+  "chunk_tokens": 384,
+  "overlap_tokens": 64,
+  "query_prefix": "",
+  "passage_prefix": "",
+  "model_file": "model.safetensors",
+  "runtime": "benchmark-st-5.7-static-f32-mmap-v1",
+  "vector_format": "normalized-float32-le",
+  "separator": "\n\n",
+  "files": [
+    {
+      "path": "config.json",
+      "bytes": 376,
+      "sha256": "351151b8d70c6a61f9bac078b8d3c47b66f5680b5969c498bccf57165231c417",
+      "url": "https://huggingface.co/amgix/static-retrieval-multilingual-69m-v1/resolve/f777a93cd958b280b6c7fad5aaac3cd59d676822/config.json"
+    },
+    {
+      "path": "model.safetensors",
+      "bytes": 276381784,
+      "sha256": "793155d4a5933cfa4d05c26fd38cd844cfbeff93c65fb78cbbb31eac920229bb",
+      "url": "https://huggingface.co/amgix/static-retrieval-multilingual-69m-v1/resolve/f777a93cd958b280b6c7fad5aaac3cd59d676822/model.safetensors"
+    },
+    {
+      "path": "modules.json",
+      "bytes": 138,
+      "sha256": "8b0d912ab3bc2ee42d5d788b16789447d163f63f0c680251c71c616305d67603",
+      "url": "https://huggingface.co/amgix/static-retrieval-multilingual-69m-v1/resolve/f777a93cd958b280b6c7fad5aaac3cd59d676822/modules.json"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 10614483,
+      "sha256": "33b9cb8d53183b4c33076e91d1f6578f4d9990ef6657bb68ccb3386a4aa7349f",
+      "url": "https://huggingface.co/amgix/static-retrieval-multilingual-69m-v1/resolve/f777a93cd958b280b6c7fad5aaac3cd59d676822/tokenizer.json"
+    }
+  ]
+}
