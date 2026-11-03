@@ -114,9 +114,28 @@ def record_handoff(
             origin is None
             or origin["kind"] != "pdf-extract"
             or origin["status"] in ("failed", "cancelled")
-            or origin["superseded_by_job_id"]
         ):
             return None
+        if origin["superseded_by_job_id"]:
+            own_output = connection.execute(
+                """SELECT review_generation FROM search_handoffs
+                   WHERE job_id=? AND origin_job_id=?
+                     AND extraction_version_id=? AND purpose='import'""",
+                (origin["superseded_by_job_id"], origin_job_id, extraction_id),
+            ).fetchone()
+            already_published = connection.execute(
+                "SELECT 1 FROM source_readiness WHERE source_id=? AND source_version_id=?",
+                (row["source_id"], row["source_version_id"]),
+            ).fetchone()
+            if (
+                own_output is None
+                or already_published is not None
+                or row["review_generation"] <= own_output["review_generation"]
+            ):
+                return None
+        # Publication supersedes the extraction job too. Its own search output
+        # does not forbid an unpublished, newer confirmed review from scheduling;
+        # the old jobs' durable publication fences remain untouched.
     notebook = ensure_notebook_profile(connection, row["notebook_id"])
     candidates = profiles()
     profile = next(

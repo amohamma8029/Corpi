@@ -106,6 +106,23 @@ def test_cancelled_handoff_is_not_rescheduled_on_startup(store: PersistenceStore
     assert job_status(store, job) == "cancelled"
 
 
+def test_unrelated_supersession_of_extraction_still_blocks_reconfirmation(
+    store: PersistenceStore,
+) -> None:
+    source, extraction, origin = extract(store, partial=True)
+    store.record_review_decision(extraction, "confirmed", 1)
+    first = handoffs(store, extraction)[0]["job_id"]
+    other = store.create_job("unrelated-superseder", "control", source)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE job_status SET superseded_by_job_id=? WHERE job_id=?", (other.id, origin)
+        )
+    review = store.reopen_review(extraction)
+    store.record_review_decision(extraction, "confirmed", review.generation)
+    SearchCoordinator(store, Path("unused")).reconcile()
+    assert [row["job_id"] for row in handoffs(store, extraction)] == [first]
+
+
 def test_failed_queue_write_rolls_back_the_confirm_decision(store: PersistenceStore) -> None:
     _, extraction, _ = extract(store, partial=True)
     with store.database.connect() as connection:
