@@ -153,9 +153,10 @@ it records a job for background execution. The job runs away from the UI thread 
 and results locally, allowing the core to report them to the UI.
 
 PDF receipt first streams bytes into durable app-data staging and records an acquisition. Once the
-original and source/import records commit, Corpi enqueues a `pdf-extract` job. The runner leaves that
-known job queued with a visible waiting reason until M1.5 registers its extraction steps; an unknown
-job kind still fails. The original remains openable during this wait or after extraction failure.
+original and source/import records commit, Corpi enqueues a `pdf-extract` job with registered
+extraction steps. Complete extraction schedules search; partial extraction waits for the exact
+review generation to be confirmed. An unknown job kind still fails. The original remains openable
+during processing or after extraction failure.
 
 When processing steps are available, import jobs parse each format, read PDF pages, split text into
 retrieval chunks, create local embeddings, and build indexes. Background execution also generates
@@ -281,8 +282,9 @@ exercise cancellation during work; the launcher checks stop/restart during an ac
 #### Import flow
 
 Read the diagram from top to bottom. The groups are phases of an import, and diamonds are decisions.
-The source remains unavailable for search throughout preparation; only the final ready step makes
-it searchable. The [format rules](#read-each-format), [PDF limits](#check-pdf-pages-and-handle-partial-imports),
+The candidate version remains unavailable for search throughout preparation; only the final ready
+step makes it searchable. During replacement, the previous eligible published version stays usable.
+The [format rules](#read-each-format), [PDF limits](#check-pdf-pages-and-handle-partial-imports),
 and [passage/chunk distinction](#citation-passages-and-retrieval-chunks) follow the diagram.
 
 ```mermaid
@@ -397,7 +399,17 @@ The notebook search panel submits explicit Meaning or Words queries through the 
 in a supervised singleton worker; Words uses FTS without inference. The query service resolves
 the active model and stored input representation, then rechecks eligibility and decorates
 canonical text/citation/PDF metadata in a final read snapshot. Results retain their saved PDF
-version and mapped page. Stale UI requests cannot take over a different notebook's search.
+version and mapped page. Results expose the actual saved filename, current/previous PDF role and
+indexing profile, independently of the logical source name or a pending model selection.
+
+Each response carries an opaque revision of its initial searchable snapshot. The authenticated
+`GET /notebooks/{notebook_id}/search-state` reads eligible index/publication/review, active-model
+and mutable file-decoration state without reading passages/vectors or loading a model. The UI
+checks that revision before displaying a response and every 1.5 seconds afterward. Local review,
+trash and processing-cancel actions also invalidate and abort old requests immediately. Changed or
+unavailable freshness clears results but retains query text for explicit resubmission. These checks
+never run inference, download models or repeat queries. A merely pending model/PDF replacement
+does not invalidate still-eligible old search. Notebook/request guards reject late replies.
 
 The desktop's extraction-status read uses a compact `ExtractionSummary`: current extraction
 metadata, passage count, page classifications and current review. It does not load passage text,
@@ -405,13 +417,35 @@ location geometry or visual records merely to display progress. Full extraction 
 those original records for preparation and citation consumers. Background UI polling allows only
 one outstanding import/report polling pair per effect, and an unchanged import-list response does
 not independently trigger another report request. Selection/effect lifetime guards still reject
-late replies; processing actions keep their explicit refreshes.
+late replies; processing actions keep their explicit refreshes. Review writes additionally fence
+older extraction reads and serialize the review controls, so a delayed report cannot restore a
+pre-reopen generation or decision. Failed writes refresh the current review and expose the error.
 
 Complete extraction records follow-on work in the extraction transaction. Partial extraction
 does so only after confirmation of the exact review generation. The existing single-job runner
 plans chunks, embeds bounded batches, finishes both search components, and publishes readiness.
 Only extracted pages contribute search text. Chunks retain immutable passage IDs and exact
 half-open Unicode-code-point slices, with recorded separators for reconstruction.
+
+Review Again invalidates the old handoff/readiness and increments its review generation. Confirm
+schedules a new exact-generation handoff, including after prior successful publication. Publication
+marks the extraction job superseded by its own search output; that specific ownership relationship
+does not block an unpublished, newer confirmed generation. A still-published version does not
+enqueue another import merely because a notebook model switch finished. Unrelated supersession, failed/cancelled origins,
+obsolete reviews and old jobs' publication fences still reject. Matching saved vectors can be reused.
+
+PDF-processing cancellation owns pending import work, not a ready PDF's model-switch job. It can
+cancel active jobs or an import waiting between jobs, marks only that import `processing_cancelled`
+and clears its pending pointer. A between-jobs cancellation returns a null `job_id`, rather than
+rewriting completed extraction history. Repeating it is harmless, and failed-import currency checks
+prevent later confirmation/startup from silently resurrecting the candidate. Previous ready PDF and
+search data remain in place. An older import's exact live job may still be stopped without changing
+the successor; an obsolete review-waiting import with no live work is rejected.
+
+Search progress reports the exact job, saved filename/PDF role and preparation profile, along with
+existing waiting/failure details and current Cancel/Resume eligibility. The piece counter counts
+embedded chunks only. Finishing word/vector components, final validation and readiness publication
+remain distinct from completing those chunks; a full counter on a running job is not a ready label.
 
 FastEmbed 0.8.1 runs CPU inference in a supervised child. The parent owns guarded database
 writes, stops and reaps the child on cancellation, and persists batch completion and spent time.
@@ -508,13 +542,14 @@ for the pending selection's current ready sources. It excludes historical select
 other notebooks, import work and stale extraction/review/source versions without
 changing job state, retries, settings or budgets. The panel displays terminal counts
 instead of “Rebuilding” and retains the exact-generation Cancel model change action.
-Pre-action polling responses cannot restore old pending state after that action.
+Pre-action polling responses cannot restore old pending state after that action. The panel always
+names the active model and separately labels a requested model until activation completes.
 
 Terminal job failure/cancellation also checks the exact job's handoff purpose before
 updating PDF import state. A `model-switch` rebuild does not own the saved PDF's
 import outcome, even after its handoff is cancelled. Import and legacy no-handoff
-jobs retain their existing failure behavior, as does explicit PDF-processing
-cancellation. Search-result decoration still requires a ready, nontrashed import;
+jobs retain their existing failure behavior, as does explicit cancellation of pending PDF
+processing. Search-result decoration still requires a ready, nontrashed import;
 no query-eligibility relaxation or old-library migration is used to preserve links.
 
 The pinned FastEmbed 0.8.1 adapter parses one tokenizer before importing NumPy/FastEmbed
@@ -556,8 +591,9 @@ their actual status, and explicit cancellation keeps the active model. Those ter
 jobs no longer mark the saved PDF import failed or remove its search-result PDF/page
 shortcuts. Genuine import failures remain distinct. Old failed import states are not
 reset or migrated. Copied real-API/browser checks retain the exact saved PDF bytes and
-page navigation; completed page drawing and rebuilt native verification remain open,
-alongside strict Windows resource acceptance.
+page navigation. Native verification must use a binary built from the source being checked;
+browser/API checks are not a substitute for WebView page drawing. Strict Windows resource
+acceptance and dedicated default-Bekko coverage remain separate obligations.
 
 Setup uses a private anonymous HTTP opener, not Python's global cookie/auth opener. Initial URLs
 must exactly match the pinned Hugging Face repository/revision/file; every redirect is checked
