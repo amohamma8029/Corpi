@@ -43,6 +43,12 @@ See [Microsoft's WebView2 testing guidance](https://learn.microsoft.com/en-us/mi
 `CORPI_EDGE_DRIVER` can select an existing compatible `msedgedriver.exe` without changing PATH;
 the test runner does not download or update drivers automatically.
 
+If an external Windows run fails with a driver/WebView version mismatch before creating a
+session, compare the versions in that error. Select a driver matching WebView2, for example
+`$env:CORPI_EDGE_DRIVER = "C:\tools\matching-driver\msedgedriver.exe"`, then rerun. Updating
+Edge alone may not fix the mismatch. The embedded runner is an alternative that does not use
+Edge WebDriver; its input checks have the synthetic-input limits described below.
+
 `uv` manages the core's Python environment and packages. It downloads Python 3.13 by default; on macOS, select the Homebrew interpreter below so Python loads a supported SQLite version.
 
 ## Setup
@@ -113,12 +119,29 @@ wording using the notebook's installed model; **Words** finds word matches witho
 model. Submit the search explicitly. Search in the same language as the document; cross-language
 retrieval is not a first-release guarantee. A result's **Open PDF · page …** button opens its
 exact saved PDF version and citation page, including when a replacement is still preparing.
+Results show the actual saved filename, current/previous saved version, and indexing model.
+The replacement's filename never substitutes for the original result's file.
+
+Review, trash and processing-cancel actions clear displayed/in-flight results. A lightweight
+background check also clears them when searchable data changes elsewhere, including expiry.
+Your query text stays in place; submit it again for current results. These checks do not run
+inference, download a model, or automatically repeat a search. A pending replacement or model
+choice alone keeps eligible existing search available.
 
 The Files section offers **Cancel search preparation** and, for eligible stopped work,
 **Resume search preparation**. Resume keeps already prepared chunks, saved settings, attempt
 limits and time charges. It does not grant a fresh allowance. Exhausted work cannot be resumed.
 Cancellation remains stopped after restarting the app; non-cancelled interrupted work recovers
 from its durable progress.
+The piece counter shows embedding progress only. Even when every piece is embedded, validation
+and publication must finish before new search data is ready. Cancelled preparation shows why it
+stopped, such as Review Again reopening its text review or the selected input/model changing.
+
+**Cancel processing** stops the exact PDF import, including when extraction has finished but
+the PDF is waiting for review. The previous ready PDF stays usable. **Review Again** reopens
+the current review; **Confirm** schedules preparation for that new review generation. A review
+reopened on an already searchable PDF hides that PDF's search until it is confirmed and
+published again. Old prepared vectors may be reused without changing saved citations.
 Interrupted preparation conservatively keeps any unfinished time reservation. New jobs
 reserve across a whole batch attempt, so an interruption can consume allowance even
 before inference starts. Existing saved jobs keep their previous accounting rules.
@@ -131,6 +154,9 @@ Changing **Notebook model** rebuilds search for the notebook's ready sources. Ex
 stays usable until every required rebuild completes and the notebook switches models together.
 **Cancel model change** keeps the active model. Download cancellation and notebook-choice
 cancellation are separate controls. Rebuilding search leaves citation passages and PDF originals intact.
+The panel labels both **Active** and **Requested** models during a change. Selecting a model
+does not make it active early. A failed/cancelled rebuild reports its stopped counts and keeps
+the active model available until you cancel the change or the required work succeeds.
 
 New search preparation allows twenty minutes (1,200 seconds), with two inference threads,
 120-second inference calls, 300-second index-build attempts, 10,000 chunks and 20,000,000
@@ -187,8 +213,11 @@ or cancelled rebuilds instead of leaving them labelled “Rebuilding”; Cancel 
 keeps the active model. Failed or cancelled model-switch jobs no longer mark the
 saved PDF import failed, so its search-result PDF/page shortcuts remain available.
 Genuine import failures still report failure; previously failed libraries are not
-reset or migrated. Full M1.6 acceptance remains pending, along with fresh native managed setup,
-current Linux/macOS execution and strict aggregate memory/no-swap evidence.
+reset or migrated. The CI matrix separately exercises MiniLM/E5 managed setup, offline
+inference and native viewer/search flows on Linux/macOS. Those selected checks do not establish
+dedicated default-Bekko coverage or strict aggregate memory/no-swap acceptance. Full M1.6
+acceptance remains pending; benchmark results and native runs are evidence for their recorded
+source, model and scenario, not any later edited build.
 Benchmark-combined quality is not a Meaning-only or Words-only UI success rate.
 
 For desktop-visible timing on Windows, `core/benchmarks/search_readiness.json`
@@ -468,6 +497,22 @@ Run from the repository root:
 
 Core setup is `uv sync` inside `core/`; desktop setup is `pnpm install` inside `desktop/`. On macOS, set `UV_PYTHON` as shown above before syncing or launching the core.
 
+### Verify local changes
+
+After setup, run `just test` for the core tests/static checks, UI unit tests and live-schema
+comparison. Also run `pnpm --dir desktop build` for generated API types, TypeScript and the
+production frontend, plus `pnpm --dir desktop run check:e2e` and
+`pnpm --dir desktop run check:webdriver-isolation` for the native test contract. The ordinary
+test selection skips opt-in model downloads and installed-model inference; skipped tests are
+not model/native acceptance.
+
+For UI or core changes, rerun the appropriate native command from the table without
+`--reuse-build`. That flag checks the retained binary's hash but does not embed your new
+frontend or rebuild changed application code. Preserve the existing `desktop/e2e-results/`
+evidence before rerunning: each provider's output directory is replaced by its next run.
+Keep test libraries separate from personal app data. Cached-model and download-enabled runs
+are distinct checks; enable transfers only when you intend to test setup.
+
 ## Checks and native viewer tests in CI
 
 GitHub Actions is configured to run core, UI, tooling security-patch, schema,
@@ -499,7 +544,7 @@ actual app. Both jobs embed the built frontend, local PDF.js worker, and support
 use the real core and the app's CSP. The test build uses `app.corpi.desktop.e2e` as its Tauri
 identifier so its saved notebooks stay separate from ordinary Corpi data.
 
-Both CI hosts also download the two supported search models through the authenticated setup
+Both CI hosts also download the selected MiniLM and E5 search models through the authenticated setup
 API. They reuse those verified files to check inference with socket connections denied and
 automatic PDF readiness followed by a notebook model switch. Version, manifest, file-hash,
 setup-time and test reports upload as `search-platform-<runner>-<commit>` artifacts for 14 days;
