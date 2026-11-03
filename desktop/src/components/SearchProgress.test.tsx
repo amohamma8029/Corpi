@@ -17,7 +17,7 @@ it("cancels the exact current job then explicitly resumes without pretending to 
   render(<SearchProgress connection={connection} sourceId="one" />);
   fireEvent.click(await screen.findByRole("button", { name: "Cancel search preparation" }));
   fireEvent.click(await screen.findByRole("button", { name: "Resume search preparation" }));
-  expect(await screen.findByText("2 of 10 search pieces prepared")).toBeTruthy();
+  expect(await screen.findByText("2 of 10 text pieces embedded")).toBeTruthy();
   await waitFor(() => expect(coreRequest).toHaveBeenCalledTimes(5));
   const cancel = vi.mocked(coreRequest).mock.calls[1];
   expect(cancel[1]).toBe("/sources/one/search/cancel");
@@ -45,4 +45,44 @@ it("shows an action conflict instead of silently claiming cancellation", async (
   fireEvent.click(await screen.findByRole("button", { name: "Cancel search preparation" }));
   expect((await screen.findByRole("alert")).textContent).toContain("Preparation changed");
   expect(screen.queryByText("Search preparation cancelled")).toBeNull();
+});
+
+it.each([
+  ["review reopened", "Review Again reopened the text review"],
+  ["model selection changed", "The notebook model changed"],
+  ["user cancelled PDF processing", "PDF processing was cancelled"],
+])("explains why preparation stopped: %s", async (reason, explanation) => {
+  vi.mocked(coreRequest).mockResolvedValue({ ...cancelled, waiting_reason: reason, can_resume: false });
+  render(<SearchProgress connection={connection} sourceId="one" />);
+  expect(await screen.findByText(new RegExp(explanation))).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Resume search preparation" })).toBeNull();
+});
+
+it.each(["embed-search", "build-search", "publish-search"])("does not call fully embedded pieces ready during %s", async step => {
+  vi.mocked(coreRequest).mockResolvedValue({ ...running, step, completed_chunks: 10 });
+  render(<SearchProgress connection={connection} sourceId="one" />);
+  expect(await screen.findByText(/10 of 10 text pieces embedded/)).toBeTruthy();
+  expect(screen.getByText(/Search is not ready yet/)).toBeTruthy();
+  expect(screen.queryByText("Search data ready")).toBeNull();
+});
+
+it("shows a terminal failure detail when there is no waiting reason", async () => {
+  vi.mocked(coreRequest).mockResolvedValue({ ...running, status: "failed", failure_code: "search_time_limit", failure_reason: "search preparation allowance exhausted", can_cancel: false });
+  render(<SearchProgress connection={connection} sourceId="one" />);
+  expect(await screen.findByText(/search preparation allowance exhausted/)).toBeTruthy();
+});
+
+it("names the exact pending PDF and model being prepared", async () => {
+  vi.mocked(coreRequest).mockResolvedValue({ ...running, filename: "replacement-fr.pdf", pdf_role: "pending", profile_id: "multilingual-e5" });
+  render(<SearchProgress connection={connection} sourceId="one" />);
+  expect(await screen.findByText(/Saved PDF: replacement-fr.pdf · Pending replacement/)).toBeTruthy();
+  expect(screen.getByText("Search model: Multilingual E5-small")).toBeTruthy();
+});
+
+it.each(["completed", "failed", "cancelled"])("does not let an old waiting reason override %s status", async status => {
+  vi.mocked(coreRequest).mockResolvedValue({ ...running, status, waiting_reason: "model_not_installed", completed_chunks: 10, can_cancel: false });
+  render(<SearchProgress connection={connection} sourceId="one" />);
+  expect(await screen.findByText(status === "completed" ? "Search data ready" : `Search preparation ${status}`)).toBeTruthy();
+  expect(screen.queryByText(/Waiting for model setup/)).toBeNull();
+  expect(screen.queryByText(/Search is not ready yet/)).toBeNull();
 });

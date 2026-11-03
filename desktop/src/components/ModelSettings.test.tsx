@@ -45,6 +45,10 @@ it("explains that a notebook rebuild preserves current search", async () => {
   render(<ModelSettings connection={connection} notebookId="one" />);
   expect(await screen.findByText(/Rebuilding 1 of 2 ready sources/)).toBeTruthy();
   expect(screen.getByText(/Current search stays usable/)).toBeTruthy();
+  expect(screen.getByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
+  expect(screen.getByText(/Requested: Multilingual E5-small/)).toBeTruthy();
+  expect(screen.getByRole("region", { name: "Local search models" }).getAttribute("data-active-profile")).toBe("minilm-en");
+  expect(screen.getByRole("region", { name: "Local search models" }).getAttribute("data-pending-profile")).toBe("multilingual-e5");
 });
 
 it("ignores model polling results belonging to the previous notebook", async () => {
@@ -54,9 +58,9 @@ it("ignores model polling results belonging to the previous notebook", async () 
   await waitFor(() => expect(getNotebookModel).toHaveBeenCalledWith(connection, "one"));
   vi.mocked(getNotebookModel).mockResolvedValue({ ...selection, notebook_id: "two", active_profile_id: "multilingual-e5" });
   view.rerender(<ModelSettings connection={connection} notebookId="two" />);
-  expect(await screen.findByText("Active: Multilingual search")).toBeTruthy();
+  expect(await screen.findByText(/Active: Multilingual E5-small/)).toBeTruthy();
   await act(async () => resolve(selection));
-  expect(screen.queryByText("Active: Fast English search")).toBeNull();
+  expect(screen.queryByText(/Active: MiniLM-L6-v2/)).toBeNull();
 });
 
 it.each([[1, 0], [0, 1], [1, 1]])("reports %i failed and %i cancelled current rebuilds without claiming they are rebuilding", async (failed, cancelled) => {
@@ -71,7 +75,7 @@ it.each([[1, 0], [0, 1], [1, 1]])("reports %i failed and %i cancelled current re
   vi.mocked(getNotebookModel).mockResolvedValue({ ...selection, generation: 5 });
   fireEvent.click(screen.getByRole("button", { name: "Cancel model change" }));
   await waitFor(() => expect(cancelNotebookModel).toHaveBeenCalledWith(connection, blocked));
-  expect(await screen.findByText("Active: Fast English search")).toBeTruthy();
+  expect(await screen.findByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
 });
 
 it("does not let a pre-cancellation poll restore a stale pending failure", async () => {
@@ -87,9 +91,9 @@ it("does not let a pre-cancellation poll restore a stale pending failure", async
   await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
   vi.mocked(getNotebookModel).mockResolvedValue({ ...selection, generation: 5 });
   await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Cancel model change" })); });
-  expect(screen.getByText("Active: Fast English search")).toBeTruthy();
+  expect(screen.getByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
   await act(async () => resolve(blocked));
-  expect(screen.getByText("Active: Fast English search")).toBeTruthy();
+  expect(screen.getByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
 });
 

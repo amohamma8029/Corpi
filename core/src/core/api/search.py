@@ -1,5 +1,7 @@
 """Explicit meaning/word queries behind the existing local authenticated boundary."""
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -34,14 +36,33 @@ class SearchResult(BaseModel):
     score: float
     import_id: str | None
     filename: str | None
+    profile_id: str | None
+    pdf_role: Literal["current", "previous"] | None
     citations: list[SearchCitation]
 
 
 class SearchResponse(BaseModel):
     notebook_id: str
     mode: SearchMode
+    revision: str
     ready_sources: int
     results: list[SearchResult]
+
+
+class SearchState(BaseModel):
+    notebook_id: str
+    revision: str
+
+
+@router.get("/notebooks/{notebook_id}/search-state", response_model=SearchState)
+def search_state(notebook_id: str, request: Request) -> SearchState:
+    service: QueryService | None = getattr(request.app.state, "search_queries", None)
+    if service is None:
+        raise HTTPException(503, "local search is unavailable")
+    try:
+        return SearchState.model_validate(service.state(notebook_id))
+    except (PersistenceError, ValueError):
+        raise HTTPException(404, "notebook or search data is unavailable") from None
 
 
 @router.post("/notebooks/{notebook_id}/search", response_model=SearchResponse)

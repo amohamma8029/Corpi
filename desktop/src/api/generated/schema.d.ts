@@ -506,6 +506,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/notebooks/{notebook_id}/search-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search State */
+        get: operations["search_state_notebooks__notebook_id__search_state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/notebooks/{notebook_id}/search": {
         parameters: {
             query?: never;
@@ -812,7 +829,7 @@ export interface components {
         /** ProcessingActionPayload */
         ProcessingActionPayload: {
             /** Job Id */
-            job_id: string;
+            job_id: string | null;
             /** Status */
             status: string;
         };
@@ -868,6 +885,8 @@ export interface components {
              * @enum {string}
              */
             mode: "meaning" | "words";
+            /** Revision */
+            revision: string;
             /** Ready Sources */
             ready_sources: number;
             /** Results */
@@ -895,8 +914,19 @@ export interface components {
             import_id: string | null;
             /** Filename */
             filename: string | null;
+            /** Profile Id */
+            profile_id: string | null;
+            /** Pdf Role */
+            pdf_role: ("current" | "previous") | null;
             /** Citations */
             citations: components["schemas"]["SearchCitation"][];
+        };
+        /** SearchState */
+        SearchState: {
+            /** Notebook Id */
+            notebook_id: string;
+            /** Revision */
+            revision: string;
         };
         /** SourcePayload */
         SourcePayload: {
@@ -927,6 +957,14 @@ export interface components {
             waiting_reason: string | null;
             /** Failure Code */
             failure_code: string | null;
+            /** Failure Reason */
+            failure_reason?: string | null;
+            /** Profile Id */
+            profile_id?: string | null;
+            /** Filename */
+            filename?: string | null;
+            /** Pdf Role */
+            pdf_role?: ("current" | "pending" | "previous") | null;
             /** Completed Chunks */
             completed_chunks: number;
             /** Total Chunks */
@@ -1959,6 +1997,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ModelSetupPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_state_notebooks__notebook_id__search_state_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchState"];
                 };
             };
             /** @description Validation Error */

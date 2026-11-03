@@ -205,6 +205,8 @@ def test_source_control_routes_share_auth_and_only_offer_current_resumable_work(
         assert client.post(path, json={"job_id": job}, headers=headers).status_code == 200
         progress = client.get(f"/sources/{source}/search-progress", headers=headers).json()
         assert progress["status"] == "cancelled" and progress["can_resume"] is True
+        assert progress["waiting_reason"] == "search preparation cancelled"
+        assert progress["failure_reason"] == "search preparation cancelled"
         store.create_source_version(source, "b" * 64)
         progress = client.get(f"/sources/{source}/search-progress", headers=headers).json()
         assert progress["can_resume"] is False
@@ -216,3 +218,62 @@ def test_source_control_routes_share_auth_and_only_offer_current_resumable_work(
             ).status_code
             == 409
         )
+
+
+def test_progress_keeps_fully_embedded_counts_separate_from_publication(store):
+    from fastapi.testclient import TestClient
+
+    from core.api.app import create_app
+    from core.persistence.models import AttemptGuard
+    from core.search.chunking import make_chunks
+    from core.search.runtime import vector_bytes
+    from core.search.storage import SearchStorage
+
+    _, source, job = queued(store)
+    store.claim_job(job, "progress-test")
+    attempt = store.start_step_attempt(job, "plan-search")
+    guard = AttemptGuard("progress-test", "plan-search", attempt.attempt_number)
+    report = store.load_extraction_report(store.load_job_by_id(job).extraction_version_id)
+    profile = profiles()["minilm-en"]
+    with store.database.connect() as connection:
+        settings = json.loads(
+            connection.execute(
+                "SELECT settings_json FROM search_job_inputs WHERE job_id=?", (job,)
+            ).fetchone()[0]
+        )
+    storage = SearchStorage(store)
+    index = storage.create_generation(
+        job,
+        guard,
+        profile,
+        make_chunks(report.passages, profile, lambda _: 1, lambda text: text),
+        settings,
+    )
+    graph = store.load_index(index)
+    store.commit_index_step(
+        job, "plan-search", graph.index, graph.chunks, graph.mappings, 1, {}, guard=guard
+    )
+    store.finish_step_attempt(job, "plan-search", attempt.attempt_number, None)
+    attempt = store.start_step_attempt(job, "embed-search")
+    guard = AttemptGuard("progress-test", "embed-search", attempt.attempt_number)
+    storage.commit_batch(
+        job,
+        guard,
+        index,
+        0,
+        [chunk.id for chunk in graph.chunks],
+        [vector_bytes(VECTOR, 384)] * len(graph.chunks),
+    )
+    with TestClient(
+        create_app("progress-test", store=store), base_url="http://127.0.0.1"
+    ) as client:
+        for step in ("embed-search", "build-search", "publish-search"):
+            if step != "embed-search":
+                store.start_step_attempt(job, step)
+            result = client.get(
+                f"/sources/{source}/search-progress",
+                headers={"Authorization": "Bearer progress-test"},
+            ).json()
+            assert result["step"] == step and result["status"] == "running"
+            assert result["total_chunks"] == result["completed_chunks"] == len(graph.chunks) > 0
+        assert store.load_job_status(job).status != "completed"
