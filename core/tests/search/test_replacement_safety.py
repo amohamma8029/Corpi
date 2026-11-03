@@ -24,13 +24,13 @@ from core.search.profiles import profiles
 from core.search.switching import NotebookModelService, publish_replacement
 
 
-def upload(client, notebook, content, target=None):
+def upload(client, notebook, content, target=None, *, filename="replacement.pdf"):
     created = client.post(
         f"/notebooks/{notebook}/pdf-acquisitions",
         headers=HEADERS,
         json={
             "retry_key": new_id(),
-            "filename": "replacement.pdf",
+            "filename": filename,
             "intent": "replace" if target else "add",
             "target_source_id": target,
         },
@@ -45,7 +45,8 @@ def upload(client, notebook, content, target=None):
     return result.json()["import_id"]
 
 
-def extract_candidate(store, import_id):
+def finish_extraction(store, import_id):
+    """Complete real extraction, including partial PDFs that cannot schedule search yet."""
     item = store.load_pdf_import(import_id)
     with store.database.connect() as connection:
         job = connection.execute(
@@ -67,6 +68,12 @@ def extract_candidate(store, import_id):
     store.finish_step_attempt(job, step.step_key, attempt.attempt_number, None)
     store.finish_job(job, "completed")
     extraction = store.load_job_steps(job)[0].output_extraction_version_id
+    assert extraction is not None
+    return extraction
+
+
+def extract_candidate(store, import_id):
+    extraction = finish_extraction(store, import_id)
     with store.database.connect() as connection:
         return connection.execute(
             "SELECT job_id FROM search_handoffs WHERE extraction_version_id=? AND purpose='import'",
@@ -182,3 +189,28 @@ def test_ready_replacement_during_pending_switch_requires_the_new_version_rebuil
         for method in native_hits(restarted, notebook, [candidate.source_version_id])
     )
     assert old.original.read_bytes() == old.content
+
+
+def test_pending_pdf_and_model_choices_do_not_relabel_or_invalidate_saved_results(store, original):
+    from core.search.query import QueryService
+
+    notebook, client, old = original
+    service = QueryService(store, store.database.config.data_dir / "unused-models")
+    before = service.state(notebook)
+    candidate = upload(
+        client,
+        notebook,
+        native_text_pdf("New rainfall pending evidence."),
+        old.item.source_id,
+        filename="new-name.pdf",
+    )
+    NotebookModelService(store).choose(notebook, "multilingual-e5", 0, "provenance-control")
+    result = service.search(notebook, "rainfall", "words")
+    assert result["revision"] == before["revision"]
+    hit = result["results"][0]
+    assert hit["filename"] == old.item.display_filename != "new-name.pdf"
+    assert (
+        hit["import_id"] == old.item.id and hit["source_version_id"] == old.item.source_version_id
+    )
+    assert hit["profile_id"] == "minilm-en" and hit["pdf_role"] == "current"
+    assert store.load_pdf_import(candidate).display_filename == "new-name.pdf"
