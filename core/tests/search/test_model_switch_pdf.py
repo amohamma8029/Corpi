@@ -62,6 +62,9 @@ def assert_saved_result(store, notebook, old):
         assert hit["source_version_id"] == old.item.source_version_id
         assert hit["index_version_id"] == old.index
         assert hit["import_id"] == old.item.id
+        assert hit["filename"] == old.item.display_filename
+        assert hit["pdf_role"] == "current"
+        assert hit["profile_id"] == "minilm-en"
         assert [citation["page_number"] for citation in hit["citations"]] == [1]
         saved = client.get(
             f"/sources/{hit['source_id']}/imports/{hit['import_id']}/pdf",

@@ -1197,7 +1197,12 @@ class PersistenceStore:
             )
             return job_id
 
-    def cancel_pdf_import_processing(self, import_id: str) -> str:
+    def cancel_pdf_import_processing(self, import_id: str) -> str | None:
+        """Cancel the selected pending import, including its between-jobs review wait.
+
+        No job ID means only the import was cancelled; completed jobs stay completed.
+        Ready-PDF model rebuilds belong to model selection, not this action.
+        """
         validate_id(import_id)
         timestamp = utc_timestamp()
         with self._transaction() as connection:
@@ -1211,39 +1216,57 @@ class PersistenceStore:
                 is not None
             ):
                 raise ConflictingWriteError("PDF import is in trash")
-            job = _fetchone(
+            if item["state"] == "failed" and item["failure_code"] == "processing_cancelled":
+                return None
+            state = _fetchone(
                 connection,
-                """SELECT jobs.id FROM jobs JOIN job_status ON job_status.job_id=jobs.id
-                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
-                   ORDER BY jobs.created_at DESC,jobs.id DESC LIMIT 1""",
-                (item["source_version_id"],),
+                "SELECT * FROM source_pdf_state WHERE source_id=?",
+                (item["source_id"],),
             )
-            if job is None:
-                raise ConflictingWriteError("PDF import has no active processing job")
+            jobs = connection.execute(
+                """SELECT jobs.id FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                    WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                      AND jobs.kind IN ('pdf-extract','pdf-search')
+                      AND NOT EXISTS(SELECT 1 FROM search_handoffs h
+                                     WHERE h.job_id=jobs.id AND h.purpose='model-switch')
+                    ORDER BY jobs.created_at DESC,jobs.rowid DESC""",
+                (item["source_version_id"],),
+            ).fetchall()
+            if item["state"] != "pending" or (
+                not jobs
+                and (
+                    state is None
+                    or import_id not in (state["current_import_id"], state["pending_import_id"])
+                )
+            ):
+                raise ConflictingWriteError("PDF import has no current processing to cancel")
             from core.search.handoff import invalidate_handoffs
 
             invalidate_handoffs(
-                connection, job_id=job["id"], reason="user cancelled PDF processing"
+                connection,
+                source_version_id=item["source_version_id"],
+                reason="user cancelled PDF processing",
             )
-            connection.execute(
-                """UPDATE job_status SET status='cancelled',
+            for job in jobs:
+                connection.execute(
+                    """UPDATE job_status SET status='cancelled',
                           failure_reason='user cancelled PDF processing',updated_at=?
                    WHERE job_id=? AND status IN ('queued','running')""",
-                (timestamp, job["id"]),
-            )
-            connection.execute(
-                """DELETE FROM source_readiness_indexes WHERE source_id IN (
+                    (timestamp, job["id"]),
+                )
+                connection.execute(
+                    """DELETE FROM source_readiness_indexes WHERE source_id IN (
                        SELECT source_id FROM source_readiness WHERE published_by_job_id=?
                    )""",
-                (job["id"],),
-            )
-            connection.execute(
-                "DELETE FROM source_readiness WHERE published_by_job_id=?", (job["id"],)
-            )
+                    (job["id"],),
+                )
+                connection.execute(
+                    "DELETE FROM source_readiness WHERE published_by_job_id=?", (job["id"],)
+                )
             _mark_pdf_import_failed(
                 connection, item["source_version_id"], "processing_cancelled", timestamp
             )
-            return str(job["id"])
+            return str(jobs[0]["id"]) if jobs else None
 
     def load_source_pdf_state(self, source_id: str) -> SourcePdfState | None:
         validate_id(source_id)
