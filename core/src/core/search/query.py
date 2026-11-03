@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -50,7 +51,13 @@ class QueryService:
         return [
             dict(r)
             for r in connection.execute(
-                """SELECT i.id AS index_id,i.source_version_id,g.manifest_id,g.settings_json
+                """SELECT i.id AS index_id,i.source_version_id,g.manifest_id,g.settings_json,
+                          ready.published_by_job_id,r.generation AS review_generation,
+                          s.display_name,pdf.id AS import_id,pdf.display_filename,
+                          pdf.state AS pdf_state,
+                          saved.current_import_id,
+                          EXISTS(SELECT 1 FROM pdf_import_trash t
+                                 WHERE t.import_id=pdf.id) AS pdf_trashed
                    FROM source_readiness ready JOIN sources s ON s.id=ready.source_id
                    JOIN source_readiness_indexes ri ON ri.source_id=s.id
                    JOIN index_versions i ON i.id=ri.index_version_id
@@ -59,6 +66,8 @@ class QueryService:
                    JOIN notebook_profiles n ON n.notebook_id=s.notebook_id
                    JOIN extraction_outcomes o ON o.extraction_version_id=i.extraction_version_id
                    LEFT JOIN extraction_reviews r ON r.extraction_version_id=i.extraction_version_id
+                   LEFT JOIN pdf_imports pdf ON pdf.source_version_id=i.source_version_id
+                   LEFT JOIN source_pdf_state saved ON saved.source_id=s.id
                    WHERE s.notebook_id=? AND g.manifest_id=n.active_manifest_id
                       AND (o.outcome='complete' OR (o.outcome='partial' AND r.state='confirmed'))
                       AND i.extraction_version_id=(SELECT e.id FROM extraction_versions e
@@ -74,6 +83,31 @@ class QueryService:
             )
         ]
 
+    def _revision(self, notebook_id: str, connection, scope) -> str:
+        model = connection.execute(
+            "SELECT active_manifest_id FROM notebook_profiles WHERE notebook_id=?", (notebook_id,)
+        ).fetchone()
+        # Index IDs bind immutable settings/text. Include mutable publication,
+        # review and saved-file decoration without reading passages or vectors.
+        snapshot = {
+            "model": model[0] if model else None,
+            "sources": [
+                {key: value for key, value in row.items() if key != "settings_json"}
+                for row in scope
+            ],
+        }
+        return hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
+
+    def state(self, notebook_id: str) -> dict[str, Any]:
+        self.store.load_notebook(notebook_id)
+        with self.store._transaction(write=False) as connection:
+            return {
+                "notebook_id": notebook_id,
+                "revision": self._revision(
+                    notebook_id, connection, self._scope(notebook_id, connection)
+                ),
+            }
+
     def search(
         self, notebook_id: str, query: str, mode: SearchMode, *, limit: int = 10
     ) -> dict[str, Any]:
@@ -85,9 +119,17 @@ class QueryService:
             or not 1 <= limit <= 50
         ):
             raise ValueError("invalid_search_query")
-        scope = self._scope(notebook_id)
+        with self.store._transaction(write=False) as connection:
+            scope = self._scope(notebook_id, connection)
+            revision = self._revision(notebook_id, connection, scope)
         if not scope:
-            return {"notebook_id": notebook_id, "mode": mode, "ready_sources": 0, "results": []}
+            return {
+                "notebook_id": notebook_id,
+                "mode": mode,
+                "revision": revision,
+                "ready_sources": 0,
+                "results": [],
+            }
         groups: dict[str, list[str]] = defaultdict(list)
         runtime_groups: dict[tuple[bool, bool, int | None], dict[str, list[str]]] = defaultdict(
             lambda: defaultdict(list)
@@ -172,6 +214,7 @@ class QueryService:
         return {
             "notebook_id": notebook_id,
             "mode": mode,
+            "revision": revision,
             **self._decorate(notebook_id, scope, hits, limit),
         }
 
@@ -179,6 +222,7 @@ class QueryService:
         self, notebook_id: str, scope: list[dict[str, Any]], hits: list[SearchHit], limit: int
     ) -> dict[str, Any]:
         result = []
+        profile_ids = {profile.identity: profile.id for profile in profiles().values()}
         # Eligibility and citation/PDF decoration share one post-inference snapshot.
         with self.store._transaction(write=False) as connection:
             current = {r["index_id"]: r for r in self._scope(notebook_id, connection)}
@@ -229,6 +273,14 @@ class QueryService:
                         "source_name": source[0],
                         "import_id": pdf[0] if pdf else None,
                         "filename": pdf[1] if pdf else None,
+                        "profile_id": profile_ids.get(hit.manifest_id),
+                        "pdf_role": (
+                            "current"
+                            if current[hit.index_version_id]["current_import_id"] == pdf[0]
+                            else "previous"
+                        )
+                        if pdf
+                        else None,
                         "citations": citations,
                     }
                 )

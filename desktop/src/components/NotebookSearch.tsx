@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { modelName } from "./modelNames";
 
 import {
-  searchNotebook, type CoreConnection, type NotebookSearchResponse,
+  getNotebookSearchState, searchNotebook, type CoreConnection, type NotebookSearchResponse,
   type NotebookSearchResult,
 } from "../api/client";
 
-export function NotebookSearch({ connection, notebookId, onOpen }: {
+export function NotebookSearch({ connection, notebookId, invalidationKey = 0, onOpen }: {
   connection: CoreConnection;
   notebookId: string;
+  invalidationKey?: number;
   onOpen: (result: NotebookSearchResult, page: number) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -15,8 +17,14 @@ export function NotebookSearch({ connection, notebookId, onOpen }: {
   const [response, setResponse] = useState<NotebookSearchResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const request = useRef(0);
   const controller = useRef<AbortController | null>(null);
+  const epoch = useRef(0);
+  const revision = useRef<string | null>(null);
+  const stateRead = useRef(0);
+  const searching = useRef(false);
+  const searched = useRef(false);
 
   useEffect(() => {
     ++request.current;
@@ -25,28 +33,82 @@ export function NotebookSearch({ connection, notebookId, onOpen }: {
     setResponse(null);
     setError(null);
     setBusy(false);
+    setNotice(null);
+    searched.current = false;
     return () => { ++request.current; controller.current?.abort(); };
   }, [connection, notebookId]);
+
+  useEffect(() => {
+    const current = ++epoch.current;
+    let stopped = false;
+    let loading = false;
+    const stateController = new AbortController();
+    function clear(message: string) {
+      ++request.current;
+      controller.current?.abort();
+      searching.current = false;
+      setResponse(null);
+      setBusy(false);
+      if (searched.current) setNotice(message);
+    }
+    clear("Search data changed. Search again for current results.");
+    revision.current = null;
+    async function refresh() {
+      if (stopped || loading || searching.current || !notebookId) return;
+      loading = true;
+      const read = ++stateRead.current;
+      try {
+        const state = await getNotebookSearchState(connection, notebookId, stateController.signal);
+        if (stopped || current !== epoch.current || read !== stateRead.current) return;
+        if (state.notebook_id !== notebookId) throw new Error("Search state belongs to another notebook.");
+        if (revision.current !== null && state.revision !== revision.current) {
+          clear("Search data changed. Search again for current results.");
+        }
+        revision.current = state.revision;
+      } catch {
+        if (!stopped && current === epoch.current && read === stateRead.current) {
+          clear("Current search data could not be checked. Search again when the connection is available.");
+          revision.current = null;
+        }
+      } finally { loading = false; }
+    }
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1500);
+    return () => { stopped = true; ++epoch.current; stateController.abort(); window.clearInterval(timer); };
+  }, [connection, notebookId, invalidationKey]);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     if (!query.trim() || !notebookId) return;
     const current = ++request.current;
+    const currentEpoch = epoch.current;
+    ++stateRead.current;
+    searching.current = true;
+    searched.current = true;
     controller.current?.abort();
     controller.current = new AbortController();
     setBusy(true);
     setError(null);
     setResponse(null);
+    setNotice(null);
     try {
       const result = await searchNotebook(connection, notebookId, query, mode, controller.current.signal);
       if (current !== request.current) return;
       if (result.notebook_id !== notebookId) throw new Error("The search response belongs to another notebook.");
+      const state = await getNotebookSearchState(connection, notebookId, controller.current.signal);
+      if (current !== request.current || currentEpoch !== epoch.current) return;
+      if (state.notebook_id !== notebookId) throw new Error("Search state belongs to another notebook.");
+      revision.current = state.revision;
+      if (result.revision !== state.revision) {
+        setNotice("Search data changed. Search again for current results.");
+        return;
+      }
       setResponse(result);
     } catch (cause) {
       if (current === request.current && !(cause instanceof DOMException && cause.name === "AbortError")) {
         setError(cause instanceof Error ? cause.message : "Local search could not finish.");
       }
-    } finally { if (current === request.current) setBusy(false); }
+    } finally { if (current === request.current) { searching.current = false; setBusy(false); } }
   }
 
   if (!notebookId) return null;
@@ -69,6 +131,7 @@ export function NotebookSearch({ connection, notebookId, onOpen }: {
     </form>
     {busy ? <p role="status">Searching locally…</p> : null}
     {error ? <p role="alert">{error}</p> : null}
+    {notice ? <p role="status">{notice}</p> : null}
     {response ? <>
       <p role="status">{response.ready_sources === 0
         ? "No sources are ready yet. Finish model setup and search preparation first."
@@ -76,7 +139,10 @@ export function NotebookSearch({ connection, notebookId, onOpen }: {
         : `${response.results.length} results from ${response.ready_sources} ready sources.`}</p>
       <ol className="search-results" aria-label="Search results">
         {response.results.map((result) => <li key={`${result.source_version_id}:${result.chunk_id}`}>
-          <h3 dir="auto">{result.source_name}</h3>
+          <h3 dir="auto">{result.filename ?? result.source_name}</h3>
+          {result.filename && result.filename !== result.source_name ? <small dir="auto">Notebook source: {result.source_name}</small> : null}
+          {result.filename ? <p dir="auto">Saved PDF: {result.filename} · {result.pdf_role === "current" ? "Current saved version" : result.pdf_role === "previous" ? "Previous saved version" : "Saved version"}</p> : null}
+          <small>Search model: {modelName(result.profile_id ?? result.manifest_id)}</small>
           <p className="search-result__text" dir="auto">{result.text}</p>
           {result.import_id ? <div className="search-result__citations">
             {result.citations.filter((citation, index, citations) => citation.page_number !== null

@@ -1,5 +1,7 @@
 """Managed, supported local-model setup behind the existing authenticated boundary."""
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -57,6 +59,10 @@ class SourceSearchProgress(BaseModel):
     step: str | None
     waiting_reason: str | None
     failure_code: str | None
+    failure_reason: str | None = None
+    profile_id: str | None = None
+    filename: str | None = None
+    pdf_role: Literal["current", "pending", "previous"] | None = None
     completed_chunks: int
     total_chunks: int
     job_id: str | None = None
@@ -121,10 +127,17 @@ def source_search_progress(source_id: str, request: Request) -> SourceSearchProg
         raise HTTPException(404, "source does not exist") from error
     with store.database.connect() as connection:
         row = connection.execute(
-            """SELECT j.id,s.status,s.current_step_key,s.failure_code,h.waiting_reason,
-                      h.state AS handoff_state
+            """SELECT j.id,s.status,s.current_step_key,s.failure_code,s.failure_reason,
+                       h.waiting_reason,
+                       h.state AS handoff_state,i.profile_id,pdf.display_filename,
+                       CASE WHEN saved.current_import_id=pdf.id THEN 'current'
+                            WHEN saved.pending_import_id=pdf.id THEN 'pending'
+                            WHEN pdf.id IS NOT NULL THEN 'previous' END AS pdf_role
                FROM jobs j JOIN job_status s ON s.job_id=j.id
-               JOIN search_handoffs h ON h.job_id=j.id
+                JOIN search_handoffs h ON h.job_id=j.id
+                JOIN search_job_inputs i ON i.job_id=j.id
+                LEFT JOIN pdf_imports pdf ON pdf.source_version_id=j.source_version_id
+                LEFT JOIN source_pdf_state saved ON saved.source_id=j.source_id
                WHERE j.source_id=? AND h.purpose='import'
                ORDER BY j.created_at DESC,j.rowid DESC LIMIT 1""",
             (source_id,),
@@ -163,6 +176,10 @@ def source_search_progress(source_id: str, request: Request) -> SourceSearchProg
             step=row["current_step_key"],
             waiting_reason=row["waiting_reason"],
             failure_code=row["failure_code"],
+            failure_reason=row["failure_reason"],
+            profile_id=row["profile_id"],
+            filename=row["display_filename"],
+            pdf_role=row["pdf_role"],
             completed_chunks=completed,
             total_chunks=total,
             job_id=row["id"],

@@ -30,6 +30,7 @@ export type PdfImport = components["schemas"]["ImportPayload"];
 export type StorageReport = components["schemas"]["StoragePayload"];
 export type PdfImportTrash = components["schemas"]["TrashPayload"];
 export type ProcessingAction = components["schemas"]["ProcessingActionPayload"];
+export type SourceSearchProgress = components["schemas"]["SourceSearchProgress"];
 export type ExtractionPageReport = components["schemas"]["ExtractionPagePayload"];
 export type ExtractionReview = components["schemas"]["ExtractionReviewPayload"];
 export type ExtractionReport = components["schemas"]["ExtractionReportPayload"];
@@ -37,6 +38,13 @@ export type SupportedModel = components["schemas"]["ModelSetupPayload"];
 export type NotebookModel = components["schemas"]["NotebookModelPayload"];
 export type NotebookSearchResult = components["schemas"]["SearchResult"];
 export type NotebookSearchResponse = components["schemas"]["SearchResponse"];
+export type NotebookSearchState = components["schemas"]["SearchState"];
+
+export function getNotebookSearchState(
+  connection: CoreConnection, notebookId: string, signal?: AbortSignal,
+): Promise<NotebookSearchState> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebookId)}/search-state`, { signal });
+}
 
 export function searchNotebook(
   connection: CoreConnection, notebookId: string, query: string,

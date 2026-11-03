@@ -87,7 +87,7 @@ if (selected) {
       await $("#search-model").selectByAttribute("value", choice.profile);
     }
     await browser.waitUntil(async () => (await $("#search-model").getValue()) === choice.profile
-      && (await settings.getText()).includes(`Active: ${modelName}`), {
+      && (await settings.getAttribute("data-active-profile")) === choice.profile, {
       timeout: 15000, timeoutMsg: "Requested installed model did not become active on empty notebook",
     });
     return String(await $("#notebook-select").getValue());
@@ -111,13 +111,14 @@ if (selected) {
           .find((row) => row.querySelector("strong")?.textContent === expected);
         data.status = item?.querySelector("small")?.textContent ?? "";
         data.searchStatus = document.querySelector("[aria-label='Search preparation']")?.textContent ?? "";
-        const progress = document.querySelector<HTMLProgressElement>("[aria-label='Search pieces prepared']");
+        const progress = document.querySelector<HTMLProgressElement>("[aria-label='Text pieces embedded']");
         data.completedChunks = progress?.value ?? 0;
         data.totalChunks = progress?.max ?? 0;
         if (data.cancelledUiMs === null && data.searchStatus.includes("cancelled")
           && data.status.includes("processing failed")) data.cancelledUiMs = data.elapsedMs;
         if (item) data.importId = item.getAttribute("data-testid")?.replace("pdf-import-", "") ?? null;
-        if (data.importReadyMs === null && data.status.includes("ready for questions")) data.importReadyMs = data.elapsedMs;
+        if (data.importReadyMs === null && item?.getAttribute("data-processing-state") === "ready"
+          && item.getAttribute("data-current") === "true") data.importReadyMs = data.elapsedMs;
         if (data.searchReadyMs === null && item && data.searchStatus.includes("Search data ready")) data.searchReadyMs = data.elapsedMs;
         if (data.readyMs === null && data.importReadyMs !== null && data.searchReadyMs !== null) data.readyMs = data.elapsedMs;
       };

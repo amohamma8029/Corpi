@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { modelName } from "./modelNames";
 
 import {
   cancelModelSetup, cancelNotebookModel, chooseNotebookModel, getNotebookModel,
@@ -75,7 +76,7 @@ export function ModelSettings({ connection, notebookId }: { connection: CoreConn
   const cancelled = notebook?.cancelled_sources ?? 0;
   const blocked = failed > 0 || cancelled > 0;
   return (
-    <section aria-label="Local search models" className="model-settings">
+    <section aria-label="Local search models" className="model-settings" data-active-profile={notebook?.active_profile_id} data-pending-profile={notebook?.pending_profile_id ?? undefined}>
       <h3>Local search</h3>
       <p>Models prepare search on your device. Originals stay accessible during setup.</p>
       <p>Large sources may take up to twenty minutes to prepare. Search in the same language as your documents.</p>
@@ -89,12 +90,14 @@ export function ModelSettings({ connection, notebookId }: { connection: CoreConn
           }}>
           {models.map((model) => <option key={model.profile_id} value={model.profile_id}>{NAMES[model.profile_id] ?? model.model}</option>)}
         </select>
+        <p>Active: {modelName(notebook.active_profile_id)} · {NAMES[notebook.active_profile_id] ?? notebook.active_profile_id}</p>
         {notebook.pending_profile_id ? <div role={blocked ? "alert" : "status"}>
+          <p>Requested: {modelName(notebook.pending_profile_id)} · {NAMES[notebook.pending_profile_id] ?? notebook.pending_profile_id}</p>
           <p>{blocked
             ? `Model change could not finish: ${failed} failed, ${cancelled} cancelled out of ${notebook.ready_sources} ready sources. Your current model remains active. Cancel the model change to keep it.`
             : `Rebuilding ${notebook.rebuilt_sources} of ${notebook.ready_sources} ready sources. Current search stays usable until the switch finishes.`}</p>
           <button type="button" disabled={busy} onClick={() => void action(() => cancelNotebookModel(connection, notebook))}>Cancel model change</button>
-        </div> : <p>Active: {NAMES[notebook.active_profile_id] ?? notebook.active_profile_id}</p>}
+        </div> : null}
       </> : <p role="status">Loading model settings…</p>}
       <ul aria-label="Supported search models">
         {models.map((model) => <li key={model.profile_id}>

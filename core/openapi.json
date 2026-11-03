@@ -1302,6 +1302,45 @@
         }
       }
     },
+    "/notebooks/{notebook_id}/search-state": {
+      "get": {
+        "summary": "Search State",
+        "operationId": "search_state_notebooks__notebook_id__search_state_get",
+        "parameters": [
+          {
+            "name": "notebook_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Notebook Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/notebooks/{notebook_id}/search": {
       "post": {
         "summary": "Search Notebook",
@@ -2256,7 +2295,14 @@
       "ProcessingActionPayload": {
         "properties": {
           "job_id": {
-            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Job Id"
           },
           "status": {
@@ -2408,6 +2454,10 @@
             ],
             "title": "Mode"
           },
+          "revision": {
+            "type": "string",
+            "title": "Revision"
+          },
           "ready_sources": {
             "type": "integer",
             "title": "Ready Sources"
@@ -2424,6 +2474,7 @@
         "required": [
           "notebook_id",
           "mode",
+          "revision",
           "ready_sources",
           "results"
         ],
@@ -2485,6 +2536,32 @@
             ],
             "title": "Filename"
           },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "pdf_role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "current",
+                  "previous"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pdf Role"
+          },
           "citations": {
             "items": {
               "$ref": "#/components/schemas/SearchCitation"
@@ -2505,9 +2582,29 @@
           "score",
           "import_id",
           "filename",
+          "profile_id",
+          "pdf_role",
           "citations"
         ],
         "title": "SearchResult"
+      },
+      "SearchState": {
+        "properties": {
+          "notebook_id": {
+            "type": "string",
+            "title": "Notebook Id"
+          },
+          "revision": {
+            "type": "string",
+            "title": "Revision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "notebook_id",
+          "revision"
+        ],
+        "title": "SearchState"
       },
       "SourcePayload": {
         "properties": {
@@ -2608,6 +2705,55 @@
               }
             ],
             "title": "Failure Code"
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Reason"
+          },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Id"
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename"
+          },
+          "pdf_role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "current",
+                  "pending",
+                  "previous"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pdf Role"
           },
           "completed_chunks": {
             "type": "integer",

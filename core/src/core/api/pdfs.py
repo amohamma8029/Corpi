@@ -79,7 +79,7 @@ class TrashPayload(BaseModel):
 
 
 class ProcessingActionPayload(BaseModel):
-    job_id: str
+    job_id: str | None
     status: str
 
 

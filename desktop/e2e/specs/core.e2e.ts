@@ -464,7 +464,8 @@ describe("Corpi native notebook and PDF workflow", () => {
       await openPdf(fixture.filename);
       await waitForPage(firstPageColor);
       await closePdf();
-      await browser.waitUntil(async () => (await $(".import-list").getText()).includes("ready for questions"), {
+      const readyPdf = () => $(".import-list li[data-processing-state='ready'][data-current='true']");
+      await readyPdf().waitForDisplayed({
         timeout: 90000, timeoutMsg: "Readable native PDF did not publish readiness",
       });
       await expect($("[aria-label='Search preparation']")).toHaveText(expect.stringContaining("Search data ready"));
@@ -485,7 +486,7 @@ describe("Corpi native notebook and PDF workflow", () => {
       await browser.waitUntil(async () => (await settings.getText()).includes("Current search stays usable"), {
         timeout: 10000, timeoutMsg: "Pending model choice did not explain preserved search",
       });
-      await expect($(".import-list")).toHaveText(expect.stringContaining("ready for questions"));
+      await expect(readyPdf()).toBeDisplayed();
       const alternative = settings.$("li*=Multilingual search");
       if (!(await installed("Multilingual search"))) {
         if (process.env.CORPI_RUN_MODEL_DOWNLOAD !== "1") {
@@ -494,10 +495,10 @@ describe("Corpi native notebook and PDF workflow", () => {
         await alternative.$("button*=Multilingual search").click();
         record("native-model-download-started", { profile: "multilingual-e5" });
       }
-      await browser.waitUntil(async () => (await settings.getText()).includes("Active: Multilingual search"), {
+      await browser.waitUntil(async () => (await settings.getAttribute("data-active-profile")) === "multilingual-e5", {
         timeout: 700000, timeoutMsg: "Multilingual download and notebook rebuild did not activate",
       });
-      await expect($(".import-list")).toHaveText(expect.stringContaining("ready for questions"));
+      await expect(readyPdf()).toBeDisplayed();
       record("native-model-switch", { active: "multilingual-e5", originalRetained: true });
       await browser.saveScreenshot(path.join(results, "model-switch-ready.png"));
       await openPdf(fixture.filename);

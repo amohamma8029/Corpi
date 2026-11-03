@@ -195,3 +195,62 @@ def test_search_api_auth_validation_empty_and_canonical_response(store):
             f"/notebooks/{empty.id}/search", json={"query": "rainfall"}, headers=headers
         )
         assert response.json()["ready_sources"] == 0 and response.json()["results"] == []
+
+
+def test_search_state_is_authenticated_scoped_stable_and_never_runs_inference(store):
+    notebook, source, _, _, _, _ = seed(store, "rainfall", VECTOR)
+    other, _, _, _, _, _ = seed(store, "other rainfall", VECTOR)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("freshness checks must not load a model")
+
+    service = QueryService(store, store.database.config.data_dir, session_factory=forbidden)
+    initial = service.state(notebook)
+    assert initial == service.state(notebook)
+    assert len(initial["revision"]) == 64
+    assert service.search(notebook, "rainfall", "words")["revision"] == initial["revision"]
+    seed(store, "unrelated rainfall", VECTOR, notebook_id=other)
+    assert service.state(notebook) == initial
+    # Pending source versions do not hide the still-active published version.
+    store.create_source_version(source, "b" * 64)
+    assert service.state(notebook) == initial
+    store.trash_source(source, "9999-01-01T00:00:00.000000Z")
+    assert service.state(notebook)["revision"] != initial["revision"]
+    assert service.search(notebook, "rainfall", "words")["results"] == []
+
+    app = create_app("freshness-test", store=store)
+    headers = {"Authorization": "Bearer freshness-test"}
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        path = f"/notebooks/{notebook}/search-state"
+        assert client.get(path).status_code == 401
+        assert (
+            client.get(path, headers={**headers, "Origin": "https://other.example"}).status_code
+            == 403
+        )
+        assert client.get(path, headers=headers).json() == service.state(notebook)
+        assert client.get(f"/notebooks/{new_id()}/search-state", headers=headers).status_code == 404
+
+
+def test_review_reopen_and_republication_change_freshness_even_when_vectors_are_reused(store):
+    from test_search_safety import partial_source, prepare
+
+    notebook, source, version, extraction, _, job = partial_source(store)
+    index, guard = prepare(store, job)
+    store.publish_readiness(job, source, version, [index], guard=guard)
+    service = QueryService(store, store.database.config.data_dir)
+    initial = service.state(notebook)
+    review = store.reopen_review(extraction)
+    hidden = service.state(notebook)
+    assert hidden != initial and service.search(notebook, "rainfall", "words")["results"] == []
+    store.record_review_decision(extraction, "confirmed", review.generation)
+    with store.database.connect() as connection:
+        fresh = connection.execute(
+            "SELECT job_id FROM search_handoffs WHERE extraction_version_id=? "
+            "AND review_generation=?",
+            (extraction, review.generation),
+        ).fetchone()[0]
+    fresh_index, fresh_guard = prepare(store, fresh)
+    store.publish_readiness(fresh, source, version, [fresh_index], guard=fresh_guard)
+    assert fresh_index == index
+    assert service.state(notebook) not in (initial, hidden)
+    assert service.search(notebook, "rainfall", "words")["results"]

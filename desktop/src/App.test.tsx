@@ -6,6 +6,7 @@ import {
   coreHealthWithRetry,
   createNotebook,
   cancelPdfAcquisition,
+  cancelPdfProcessing,
   createPdfAcquisition,
   decideExtractionReview,
   getExtraction,
@@ -13,6 +14,7 @@ import {
   listNotebooks,
   listModels,
   getNotebookModel,
+  getNotebookSearchState,
   listNotebookSources,
   listPdfAcquisitions,
   listPdfImports,
@@ -24,6 +26,8 @@ import {
   type PdfAcquisition,
   storageReport,
   searchNotebook,
+  trashSource,
+  trashPdfImport,
   type NotebookSearchResult,
 } from "./api/client";
 import { App } from "./App";
@@ -50,6 +54,7 @@ vi.mock("./api/client", async (loadActual) => {
     retryPdfAcquisition: vi.fn(),
     retryPdfProcessing: vi.fn(),
     cancelPdfAcquisition: vi.fn(),
+    cancelPdfProcessing: vi.fn(),
     getPdfAcquisition: vi.fn(),
     createPdfAcquisition: vi.fn(),
     uploadPdf: vi.fn(),
@@ -57,6 +62,9 @@ vi.mock("./api/client", async (loadActual) => {
     decideExtractionReview: vi.fn(),
     reopenExtractionReview: vi.fn(),
     searchNotebook: vi.fn(),
+    getNotebookSearchState: vi.fn(),
+    trashSource: vi.fn(),
+    trashPdfImport: vi.fn(),
   };
 });
 
@@ -124,6 +132,7 @@ const searchResult: NotebookSearchResult = {
   source_id: source.id, source_version_id: "old-version", index_version_id: "index",
   chunk_id: "chunk", manifest_id: "model", source_name: source.display_name,
   text: "Canonical rainfall evidence", score: 0.1, import_id: "original-import", filename: "old.pdf",
+  profile_id: "minilm-en", pdf_role: "previous",
   citations: [{ passage_id: "passage", ordinal: 0, start_offset: null, end_offset: null, page_number: 2 }],
 };
 
@@ -137,6 +146,7 @@ beforeEach(() => {
     notebook_id: notebook.id, active_profile_id: "minilm-en", pending_profile_id: null,
     generation: 0, ready_sources: 0, rebuilt_sources: 0, failed_sources: 0, cancelled_sources: 0,
   });
+  vi.mocked(getNotebookSearchState).mockImplementation(async (_connection, notebookId) => ({ notebook_id: notebookId, revision: "a".repeat(64) }));
   vi.mocked(listNotebookSources).mockResolvedValue([]);
   vi.mocked(listPdfAcquisitions).mockResolvedValue([]);
   vi.mocked(listPdfImports).mockResolvedValue([]);
@@ -152,6 +162,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 it("keeps startup responsive while the shell is still connecting", async () => {
@@ -380,12 +391,117 @@ it("refreshes the report when background processing completes", async () => {
   }
 });
 
+it.each(["confirmed", "declined"])("completes Review Again and Confirm after a delayed %s extraction poll", async state => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(listPdfImports).mockResolvedValue([{ ...failedImport, id: "replacement", state: "pending", is_current: false, is_pending: true }]);
+  const old = { ...partialExtraction, review: { state, generation: 1, decided_at: notebook.created_at } };
+  vi.mocked(getExtraction).mockResolvedValue(old);
+  vi.mocked(reopenExtractionReview).mockResolvedValue({ state: "pending", generation: 2, decided_at: null });
+  vi.mocked(decideExtractionReview).mockResolvedValue({ state: "confirmed", generation: 2, decided_at: notebook.updated_at });
+  render(<App />);
+  await screen.findByRole("button", { name: "Review Again" });
+  let finish!: (report: ExtractionReport) => void;
+  vi.mocked(getExtraction).mockImplementationOnce(() => new Promise(done => { finish = done; }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(finish).toBeTypeOf("function");
+  fireEvent.click(screen.getByRole("button", { name: "Review Again" }));
+  await screen.findByRole("button", { name: "Confirm" });
+  await act(async () => finish(old));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+  await waitFor(() => expect(decideExtractionReview).toHaveBeenCalledWith(connection, "extraction-1", { decision: "confirmed", generation: 2 }));
+  expect(await screen.findByText("Review: confirmed")).toBeTruthy();
+});
+
+it("cancels the review-waiting replacement and keeps the original file available", async () => {
+  const pending = { ...failedImport, id: "replacement", filename: "replacement.pdf", state: "pending", is_current: false, is_pending: true };
+  const original = { ...failedImport, filename: "original.pdf", state: "ready" };
+  vi.mocked(listNotebookSources).mockResolvedValue([{ ...source, pending_import_id: pending.id }]);
+  vi.mocked(listPdfImports).mockResolvedValue([pending, original]);
+  vi.mocked(getExtraction).mockResolvedValue(partialExtraction);
+  vi.mocked(cancelPdfProcessing).mockResolvedValue({ job_id: null, status: "cancelled" });
+  render(<App />);
+  const replacement = await screen.findByTestId("pdf-import-replacement");
+  vi.mocked(listPdfImports).mockResolvedValue([{ ...pending, state: "failed", failure_code: "processing_cancelled", is_pending: false }, original]);
+  fireEvent.click(within(replacement).getByRole("button", { name: "Cancel processing" }));
+  await waitFor(() => expect(cancelPdfProcessing).toHaveBeenCalledWith(connection, source.id, pending.id));
+  await within(replacement).findByRole("button", { name: "Retry processing" });
+  expect(within(replacement).queryByRole("button", { name: "Cancel processing" })).toBeNull();
+  expect(within(screen.getByTestId("pdf-import-import-1")).getByRole("button", { name: "Open" })).toHaveProperty("disabled", false);
+  expect(screen.getByTestId("pdf-import-import-1").getAttribute("data-processing-state")).toBe("ready");
+  expect(screen.getByTestId("pdf-import-import-1").getAttribute("data-current")).toBe("true");
+  expect(replacement.getAttribute("data-processing-state")).toBe("failed");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("does not let a pre-cancellation import poll restore the replacement or its pending badge", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const pending = { ...failedImport, id: "replacement", filename: "replacement.pdf", state: "pending", is_current: false, is_pending: true };
+  const original = { ...failedImport, filename: "original.pdf", state: "ready" };
+  vi.mocked(listNotebookSources).mockResolvedValue([{ ...source, pending_import_id: pending.id }]);
+  vi.mocked(listPdfImports).mockResolvedValue([pending, original]);
+  vi.mocked(cancelPdfProcessing).mockResolvedValue({ job_id: null, status: "cancelled" });
+  render(<App />);
+  await screen.findByRole("button", { name: "Cancel processing" });
+  let finish!: (items: typeof pending[]) => void;
+  vi.mocked(listPdfImports).mockImplementationOnce(() => new Promise(done => { finish = done; }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(finish).toBeTypeOf("function");
+  vi.mocked(listPdfImports).mockResolvedValue([{ ...pending, state: "failed", is_pending: false, failure_code: "processing_cancelled" }, original]);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel processing" }));
+  await screen.findByRole("button", { name: "Retry processing" });
+  await act(async () => finish([pending, original]));
+  expect(screen.queryByRole("button", { name: "Cancel processing" })).toBeNull();
+  expect(screen.queryByText("Replacement pending")).toBeNull();
+});
+
+it("does not let an older import poll restore a trashed history file", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const pending = { ...failedImport, id: "replacement", state: "pending", is_current: false, is_pending: true };
+  const current = { ...failedImport, state: "ready" };
+  const earlier = { ...failedImport, id: "earlier", filename: "earlier.pdf", state: "ready", is_current: false };
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(listPdfImports).mockResolvedValue([pending, current, earlier]);
+  vi.mocked(trashPdfImport).mockResolvedValue({ import_id: earlier.id, source_id: source.id, purge_deadline_at: notebook.updated_at });
+  render(<App />);
+  const history = await screen.findByTestId("pdf-import-earlier");
+  let finish!: (items: typeof earlier[]) => void;
+  vi.mocked(listPdfImports).mockImplementationOnce(() => new Promise(done => { finish = done; }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+  expect(finish).toBeTypeOf("function");
+  vi.mocked(listPdfImports).mockResolvedValue([pending, current, { ...earlier, trashed: true }]);
+  fireEvent.click(within(history).getByRole("button", { name: "Remove earlier import" }));
+  await within(history).findByText("In trash; retained for 30 days");
+  await act(async () => finish([pending, current, earlier]));
+  expect(within(history).getByRole("button", { name: "Open" })).toHaveProperty("disabled", true);
+  expect(within(history).queryByRole("button", { name: "Remove earlier import" })).toBeNull();
+});
+
+it.each(["trash", "reopen"])("clears existing search results when the source action is %s", async action => {
+  vi.mocked(listNotebookSources).mockResolvedValue([source]);
+  vi.mocked(getExtraction).mockResolvedValue({ ...partialExtraction,
+    review: { state: "confirmed", generation: 1, decided_at: notebook.created_at } });
+  vi.mocked(reopenExtractionReview).mockResolvedValue({ state: "pending", generation: 2, decided_at: null });
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "words", revision: "a".repeat(64), ready_sources: 1, results: [searchResult] });
+  render(<App />);
+  fireEvent.change(await screen.findByRole("searchbox"), { target: { value: "rainfall" } });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  await screen.findByText(searchResult.text);
+  if (action === "trash") vi.mocked(listNotebookSources).mockResolvedValue([]);
+  fireEvent.click(screen.getByRole("button", { name: action === "trash" ? "Move source to trash" : "Review Again" }));
+  if (action === "trash") await waitFor(() => expect(trashSource).toHaveBeenCalledWith(connection, source.id));
+  else await waitFor(() => expect(reopenExtractionReview).toHaveBeenCalledWith(connection, partialExtraction.extraction_id));
+  await waitFor(() => expect(screen.queryByText(searchResult.text)).toBeNull());
+  expect(searchNotebook).toHaveBeenCalledTimes(1);
+});
+
 it("opens a search result's saved import and exact page, not the currently selected PDF", async () => {
   vi.mocked(listNotebookSources).mockResolvedValue([source]);
   vi.mocked(listPdfImports).mockResolvedValue([{ ...failedImport, id: "original-import", filename: "old.pdf", source_version_id: "old-version", state: "ready", is_current: false }]);
-  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", ready_sources: 1, results: [searchResult] });
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", revision: "a".repeat(64), ready_sources: 1, results: [searchResult] });
   render(<App />);
   const input = await screen.findByRole("searchbox", { name: "Find a passage" });
+  await waitFor(() => expect(listPdfImports).toHaveBeenCalledWith(connection, source.id));
   fireEvent.change(input, { target: { value: "rainfall" } });
   fireEvent.submit(input.closest("form")!);
   fireEvent.click(await screen.findByRole("button", { name: "Open old.pdf, page 2" }));
@@ -396,7 +512,7 @@ it("opens a search result's saved import and exact page, not the currently selec
 it("does not let an older PDF lookup replace a later result opening", async () => {
   vi.mocked(listNotebookSources).mockResolvedValue([source, sourceB]);
   const second = { ...searchResult, source_id: sourceB.id, chunk_id: "second", import_id: "second-import", filename: "second.pdf" };
-  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", ready_sources: 2, results: [searchResult, second] });
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "meaning", revision: "a".repeat(64), ready_sources: 2, results: [searchResult, second] });
   render(<App />);
   const input = await screen.findByRole("searchbox", { name: "Find a passage" });
   await waitFor(() => expect(listPdfImports).toHaveBeenCalledWith(connection, source.id));
