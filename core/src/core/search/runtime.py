@@ -53,9 +53,7 @@ class InputTokenizer:
         self._preserve_padding = tokenizer is not None
         try:
             if tokenizer is None:
-                from fastembed.common.preprocessor_utils import load_tokenizer
-
-                tokenizer, _ = load_tokenizer(path)
+                tokenizer, _ = _load_runtime_tokenizer(path)
             self.tokenizer = tokenizer
             self.tokenizer.no_truncation()
             if not self._preserve_padding:
@@ -105,6 +103,7 @@ def _load_runtime_tokenizer(path: Path):
     Its text loader parses after session allocation. The runtime instead separates
     that large parse from both backend imports and session allocation. Configuration
     below follows the pinned loader and is checked against its serialized tokenizer.
+    Model JSON is UTF-8, independent of the Windows process's default code page.
     """
     import json
 
@@ -114,14 +113,15 @@ def _load_runtime_tokenizer(path: Path):
     from fastembed.common.preprocessor_utils import (
         _resolve_max_context,
         iter_special_tokens,
-        load_special_tokens,
     )
 
     config_path = path / "config.json"
     config = json.loads(config_path.read_text("utf-8")) if config_path.exists() else {}
     tokenizer_config = json.loads((path / "tokenizer_config.json").read_text("utf-8"))
     tokenizer.enable_truncation(max_length=_resolve_max_context(tokenizer_config, path))
-    for token in iter_special_tokens(load_special_tokens(path)):
+    tokens_path = path / "special_tokens_map.json"
+    tokens_map = json.loads(tokens_path.read_text("utf-8")) if tokens_path.exists() else {}
+    for token in iter_special_tokens(tokens_map):
         if isinstance(token, str):
             tokenizer.add_special_tokens([token])
         elif isinstance(token, dict):

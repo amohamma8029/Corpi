@@ -64,6 +64,8 @@ def assert_closed(session):
 def test_parent_tokenizer_does_not_propagate_native_diagnostics(
     tmp_path, monkeypatch, capfd, caplog, phase, error_type
 ):
+    calls: list[str] = []
+
     class NativeTokenizer:
         def no_truncation(self):
             pass
@@ -72,17 +74,20 @@ def test_parent_tokenizer_does_not_propagate_native_diagnostics(
             pass
 
         def encode(self, *args, **kwargs):
+            calls.append("encode")
             raise error_type(DIAGNOSTIC)
 
     def load(_path):
+        calls.append("load")
         if phase == "load":
             raise error_type(DIAGNOSTIC)
         return NativeTokenizer(), {}
 
-    monkeypatch.setattr("fastembed.common.preprocessor_utils.load_tokenizer", load)
+    monkeypatch.setattr("core.search.runtime._load_runtime_tokenizer", load)
     with pytest.raises(ValueError) as failure:
         tokenizer = InputTokenizer(tmp_path, profiles()["minilm-en"])
         tokenizer.count(SOURCE)
+    assert calls == (["load"] if phase == "load" else ["load", "encode"])
     assert str(failure.value) == "tokenizer_failed"
     captured = capfd.readouterr()
     assert_private(
@@ -231,6 +236,7 @@ raise SystemExit(worker.main())
 def test_preparation_failure_records_and_api_never_echo_native_payload(
     store, tmp_path, monkeypatch, capfd, caplog, payload, expected
 ):
+    tokenizer_calls: list[str] = []
     _, source, version, _, prior_job, _ = seed(store, SOURCE, [1.0] + [0.0] * 383)
     store.finish_job(prior_job, "completed")
     extraction = store.load_job_by_id(prior_job).extraction_version_id
@@ -246,9 +252,10 @@ def test_preparation_failure_records_and_api_never_echo_native_payload(
     if payload is None:
 
         def fail_tokenizer(_path):
+            tokenizer_calls.append("load")
             raise RuntimeError(DIAGNOSTIC)
 
-        monkeypatch.setattr("fastembed.common.preprocessor_utils.load_tokenizer", fail_tokenizer)
+        monkeypatch.setattr("core.search.runtime._load_runtime_tokenizer", fail_tokenizer)
     else:
         monkeypatch.setattr(
             "core.search.preparation.InputTokenizer",
@@ -281,6 +288,7 @@ def test_preparation_failure_records_and_api_never_echo_native_payload(
     assert status is not None and status.status == "failed" and status.failure_code == expected
     assert all(response.status_code == 200 for response in responses)
     attempts = store.load_job_attempts(job)
+    assert tokenizer_calls == (["load"] if payload is None else [])
     if payload is None:
         assert "tokenizer_failed" in str(attempts)
     captured = capfd.readouterr()
