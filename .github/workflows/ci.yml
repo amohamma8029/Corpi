@@ -75,6 +75,14 @@ jobs:
           uv run ruff format --check .
           uv run pyright
 
+      - name: Windows memory and process-object controls (no skips)
+        if: runner.os == 'Windows'
+        working-directory: core
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpi-search-evidence"
+          uv run pytest tests/search/test_memory.py tests/search/test_embedding_supervisor.py --junitxml "$RUNNER_TEMP/corpi-search-evidence/windows-controls.xml" -q
+          uv run python -c 'import sys, xml.etree.ElementTree as ET; cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase"); assert cases and not any(c.find("skipped") is not None for c in cases), "Windows controls must execute without skips"' "$RUNNER_TEMP/corpi-search-evidence/windows-controls.xml"
+
       - name: Managed search model setup (both supported profiles)
         working-directory: core
         timeout-minutes: 25
@@ -119,9 +127,20 @@ jobs:
           CORPI_CORE_DIR: ${{ github.workspace }}/core
         run: cargo test --test launcher -- --test-threads=1
 
-      - name: Install native WebDriver (Linux)
-        if: runner.os == 'Linux'
+      - name: Install native WebDriver (Linux / Windows)
+        if: runner.os != 'macOS'
         run: cargo install tauri-driver --version 2.1.0 --locked
+
+      - name: Verify Windows driver provisioning controls
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.Tests.ps1
+
+      - name: Provision Microsoft-signed driver matching WebView2 (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.ps1
 
       - name: Native viewer and search setup E2E (Linux / WebKitGTK)
         if: runner.os == 'Linux'
@@ -135,8 +154,14 @@ jobs:
           CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: pnpm --dir desktop run test:e2e
 
+      - name: Native viewer and search setup E2E (Windows / WebView2)
+        if: runner.os == 'Windows'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
+        run: pnpm --dir desktop run test:e2e
+
       - name: Upload native viewer evidence
-        if: always() && runner.os != 'Windows'
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-viewer-${{ matrix.os }}-${{ github.sha }}
