@@ -33,7 +33,8 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and safe test data, and
   - WebView2 runtime (Windows ships it with Edge)
 - macOS builds additionally need Homebrew Python 3.13 with SQLite 3.51.3 or newer; see the macOS setup below. `uv` still manages the core's packages.
 - Native E2E tooling depends on the host:
-  - Windows: [tauri-driver](https://v2.tauri.app/develop/tests/webdriver/) and Microsoft Edge WebDriver (winget: `Microsoft.EdgeDriver`).
+  - Windows: Microsoft Edge WebDriver matching the app's WebView2 runtime (winget: `Microsoft.EdgeDriver`).
+    The runner launches the app itself and attaches directly to that driver.
   - Ubuntu: the Tauri build libraries, `webkit2gtk-driver`, `xvfb`, `xauth`, and `dbus-x11`; install `tauri-driver` with `cargo install tauri-driver --version 2.1.0 --locked`.
   - macOS: the test runner uses the embedded WebDriver plugin; it needs no external driver or paid subscription.
 
@@ -487,7 +488,7 @@ Run from the repository root:
 | `just test` | Core tests (pytest), lint (Ruff), types (Pyright), tooling security-patch checks, UI unit tests (Vitest), and the OpenAPI schema drift check. |
 | `just core` | Core tests + Ruff + Pyright. |
 | `just ui` | UI unit tests. |
-| `just e2e` | Windows WebdriverIO + tauri-driver checks against the real window, including PDF import/viewer/worker, then an orphaned-core shutdown check. |
+| `just e2e` | Windows WebdriverIO + Microsoft Edge WebDriver checks against the real window, including PDF import/viewer/worker, then an orphaned-core shutdown check. |
 | `pnpm --dir desktop run test:e2e` | Build and test the native app with the external driver on Windows/Linux or the embedded provider on macOS. |
 | `pnpm --dir desktop run test:e2e:embedded` | Test the embedded provider explicitly, including on a Windows development host. |
 | `pnpm --dir desktop run check:e2e` | Type-check the native E2E tests and WebdriverIO configuration. |
@@ -541,7 +542,12 @@ automatic BiDi negotiation. On WebView2, the BiDi mapper can replace the loaded 
 page with `about:blank`. Keep `wdio:enforceWebDriverClassic` enabled for that path in
 `desktop/wdio.conf.ts`; the startup test rejects a negotiated BiDi session and still
 requires the real app and core to become ready. It does not navigate a blank page to
-make the test pass. Other platforms and the embedded provider retain their existing settings.
+make the test pass. The runner first starts one app with a separate temporary WebView2
+profile, waits for its loopback debugging endpoint, then attaches the matching driver.
+Session retries reattach to that same app instead of launching duplicate cores. It closes
+the native window before stopping the driver; failed graceful cleanup remains a test failure.
+The browser profile is outside the uploaded evidence directory. Other platforms and the
+embedded provider retain their existing settings.
 
 Shared Bash commands fail on the first error on Windows as well as other hosts.
 See the [maintainer checklist](docs/maintainer-checklist.md#before-merging-search-pr-16)
@@ -560,14 +566,14 @@ package mirror cannot consume the whole test job.
 
 The macOS job runs `pnpm --dir desktop run test:e2e` with the Homebrew Python selection above.
 It uses WebdriverIO's Tauri launcher and the optional `webdriver` Cargo feature to control the
-actual app. The Windows job uses `tauri-driver` and the verified Microsoft driver to test
-the native WebView2 window. All three jobs embed the built frontend, local PDF.js worker,
-and support assets; they use the real core and the app's CSP. The test build uses
+actual app. Linux uses `tauri-driver`; Windows attaches the verified Microsoft driver
+directly to its runner-owned WebView2 window. All three jobs embed the built frontend,
+local PDF.js worker and support assets; they use the real core and the app's CSP. The test build uses
 `app.corpi.desktop.e2e` as its Tauri
 identifier so its saved notebooks stay separate from ordinary Corpi data.
 
-All three CI hosts also download the selected MiniLM and E5 search models through the authenticated setup
-API. They reuse those verified files to check inference with socket connections denied and
+All three CI hosts also download the pinned default Bekko, MiniLM and E5 search models
+through the authenticated setup API. They reuse those verified files to check inference with socket connections denied and
 automatic PDF readiness followed by a notebook model switch. Version, manifest, file-hash,
 setup-time and test reports upload as `search-platform-<runner>-<commit>` artifacts for 14 days;
 model weights are excluded from the uploads.
