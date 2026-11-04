@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { pdfFixtureBytes, type PdfFixture } from "../pdf-fixtures";
+import { waitForSavedImport } from "../import-history";
 import { isStaleElementResult } from "../protocol-errors";
 
 interface ViewerSnapshot {
@@ -132,9 +133,7 @@ async function openPdf(filename: string) {
       break;
     }
   }
-  await browser.waitUntil(async () => (await $(".import-list").getText()).includes(filename), {
-    timeout: 15000, timeoutMsg: `${filename} was not listed in saved import history`,
-  });
+  await waitForSavedImport(filename);
   await $(".import-list").$("button=Open").click();
   await $("[data-testid='pdf-viewer']").waitForDisplayed();
   await $("[data-testid='pdf-viewer'] h2").waitForDisplayed();
