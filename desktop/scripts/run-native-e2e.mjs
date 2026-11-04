@@ -1,10 +1,12 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { arch, release, version } from "node:os";
+import { arch, release, tmpdir, version } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+
+import { WindowsWebDriver } from "./windows-webdriver.mjs";
 
 const desktop = fileURLToPath(new URL("../", import.meta.url));
 const repo = path.dirname(desktop);
@@ -135,6 +137,7 @@ async function waitForDriver(child) {
 
 const existingCorePids = new Set();
 let driver;
+let windowsDriver;
 let failure;
 try {
   for (const pid of corePids()) existingCorePids.add(pid);
@@ -159,20 +162,27 @@ try {
   evidence.testBinarySha256 = createHash("sha256").update(readFileSync(binary)).digest("hex");
 
   if (provider === "external") {
-    const driverArgs = ["--port", "4444"];
     if (windows) {
       const edgeDriver = process.env.CORPI_EDGE_DRIVER ?? execFileSync("powershell.exe", ["-NoProfile", "-Command",
         "$driver = (Get-Command msedgedriver.exe -ErrorAction SilentlyContinue).Source; if (-not $driver) { $driver = Get-ChildItem \"$env:LOCALAPPDATA\\Microsoft\\WinGet\\Packages\" -Recurse -Filter msedgedriver.exe | Select-Object -First 1 -ExpandProperty FullName }; if (-not $driver) { throw 'Microsoft Edge WebDriver was not found' }; $driver"],
       { encoding: "utf8", timeout: 15_000 }).trim();
-      driverArgs.push("--native-driver", edgeDriver);
+      evidence.stage = "native-startup";
+      saveEvidence();
+      windowsDriver = new WindowsWebDriver({
+        application: binary, driver: edgeDriver, cwd: desktop, env,
+        scratch: env.RUNNER_TEMP ?? tmpdir(),
+      });
+      Object.assign(env, await windowsDriver.start());
+      evidence.windowsSession = { mode: "prelaunched-classic", loopbackOnly: true };
+    } else {
+      driver = spawn("tauri-driver", ["--port", "4444"], { cwd: desktop, env, stdio: "inherit", detached: true });
+      // Capture spawn failure before polling, avoiding an unhandled child-process error.
+      let spawnError;
+      driver.once("error", (error) => { spawnError = error; });
+      await delay(50);
+      if (spawnError) throw spawnError;
+      await waitForDriver(driver);
     }
-    driver = spawn("tauri-driver", driverArgs, { cwd: desktop, env, stdio: "inherit", detached: !windows });
-    // Capture spawn failure before polling, avoiding an unhandled child-process error.
-    let spawnError;
-    driver.once("error", (error) => { spawnError = error; });
-    await delay(50);
-    if (spawnError) throw spawnError;
-    await waitForDriver(driver);
   }
   evidence.stage = "viewer";
   saveEvidence();
@@ -181,8 +191,13 @@ try {
 } catch (error) {
   failure = error;
 } finally {
-  try { await stopProcess(driver); }
-  catch (error) { failure ??= error; }
+  try {
+    if (windowsDriver) await windowsDriver.stop();
+    else await stopProcess(driver);
+  } catch (error) {
+    evidence.cleanupErrors = (error.errors ?? [error]).map((item) => item.message);
+    failure ??= error;
+  }
   // Observe shutdown before any core cleanup. Never kill a core to make this pass.
   let orphans = [];
   const deadline = Date.now() + 10_000;
