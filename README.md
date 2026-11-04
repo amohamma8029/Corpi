@@ -520,22 +520,30 @@ are distinct checks; enable transfers only when you intend to test setup.
 ## Native viewer tests in CI
 
 The GitHub Actions matrix includes Ubuntu/WebKitGTK, macOS/WKWebView and Windows/WebView2.
-Each job runs core tests/lint/types, the existing pinned-model setup and offline-inference
-checks, UI tests/build/contracts, Rust formatting, shell build/launcher tests and the
-shared native viewer/search suite. Shared command steps use Bash on all three hosts;
-Windows prerequisite steps use PowerShell explicitly.
+Each matrix job runs core tests/lint/types, the existing pinned-model setup and
+offline-inference checks, UI tests/build/contracts, Rust formatting and shell
+build/launcher tests. Linux and macOS also run the shared native viewer/search suite
+there. Windows runs that full suite in the separate `Native checks (windows-latest)`
+job so it no longer shares its budget with core checks and the debug shell build. Both Windows
+jobs retain a 45-minute limit; test and application limits are unchanged. The native
+job is independent of the matrix, so a missing macOS runner does not block it. This
+uses another Windows runner and repeats tool setup, but does not repeat the core
+test/model suites. Shared command steps use Bash on all three hosts; Windows
+prerequisite steps use PowerShell explicitly.
 
 Windows CI selects uv-managed Python from `core/.python-version`, rather than the runner's
 default Python. Every host checks the actual loaded SQLite version before running core
 tests. Windows additionally runs the memory-sampler/process-object controls with a
 no-skips assertion and retains their JUnit report.
 
-After building the shell, `.github/scripts/Setup-WindowsWebDriver.ps1` queries the installed
+The Windows native job fetches the locked Rust dependencies without a redundant debug
+build, then `.github/scripts/Setup-WindowsWebDriver.ps1` queries the installed
 WebView2 runtime through the loader from the locked Rust dependency. It downloads that
 exact version of EdgeDriver from Microsoft into the runner's temporary directory, checks
 the archive layout, Microsoft signature and first-three-component version match, then
 sets `CORPI_EDGE_DRIVER` for subsequent CI steps only. It retains a version/hash receipt
-with the platform evidence. Missing exact-version downloads, invalid signatures or mismatches
+as `native-driver-windows-latest-<commit>`, separately from the matrix's platform evidence.
+Missing exact-version downloads, invalid signatures or mismatches
 fail setup; there is no fallback to the Edge browser's version or an unverified driver.
 It does not install a driver, change PATH or update WebView2. The ordinary local E2E
 runner still never downloads drivers automatically.
@@ -579,10 +587,11 @@ package mirror cannot consume the whole test job.
 The macOS job runs `pnpm --dir desktop run test:e2e` with the Homebrew Python selection above.
 It uses WebdriverIO's Tauri launcher and the optional `webdriver` Cargo feature to control the
 actual app. Linux uses `tauri-driver`; Windows attaches the verified Microsoft driver
-directly to its runner-owned WebView2 window. All three jobs embed the built frontend,
-local PDF.js worker and support assets; they use the real core and the app's CSP. The test build uses
-`app.corpi.desktop.e2e` as its Tauri
-identifier so its saved notebooks stay separate from ordinary Corpi data.
+directly to its runner-owned WebView2 window. All three native suites embed the built
+frontend, local PDF.js worker and support assets; they use the real core and the app's
+CSP. Linux/macOS test builds use the `app.corpi.desktop.e2e` Tauri identifier; fresh
+Windows external builds use its unique suffix described above. Their saved notebooks
+stay separate from ordinary Corpi data.
 
 All three CI hosts also download the pinned default Bekko, MiniLM and E5 search models
 through the authenticated setup API. They reuse those verified files to check inference with socket connections denied and
