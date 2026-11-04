@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_storage import seed
@@ -17,9 +18,16 @@ from core.search.preparation import (
 from core.search.profiles import profiles
 
 
+@pytest.mark.parametrize("elapsed", [0.05, 0.3])
 def test_unfinished_reservation_survives_cancellation_and_blocks_a_fresh_allowance(
-    store: PersistenceStore,
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch, elapsed: float
 ) -> None:
+    clock = SimpleNamespace(now=0.0)
+    # Database scheduling must not choose whether this test's 200 ms lease expires.
+    # Exercise both outcomes explicitly without changing the durable reservation.
+    monkeypatch.setattr(
+        "core.search.preparation.time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
     _, _, _, index, job, guard = seed(store, "measurements", [1.0] + [0.0] * 383)
     context = StepContext(
         job, guard.step_key, guard.expected_attempt_number, lambda: False, lambda: False, guard
@@ -30,7 +38,13 @@ def test_unfinished_reservation_survives_cancellation_and_blocks_a_fresh_allowan
         with _budget(store, context, 0.2, 0.2, index):
             pass
     store.cancel_job(job)
-    lease.__exit__(None, None, None)
+    clock.now = elapsed
+    if elapsed > 0.2:
+        with pytest.raises(PermanentStepFailure, match="budget exhausted") as failure:
+            lease.__exit__(None, None, None)
+        assert failure.value.code == "search_time_limit"
+    else:
+        lease.__exit__(None, None, None)
     # A separate connection sees the committed conservative charge, not a reset.
     with store.database.connect() as connection:
         assert connection.execute(
@@ -75,6 +89,13 @@ def test_exhausted_source_budget_is_permanent_not_an_automatic_step_retry(
     store: PersistenceStore,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    # The one-second source allowance is intentionally below the embed stop margin.
+    # Hold matching runner/step/store clocks so database scheduling cannot exhaust it
+    # in planning first. The real test wait and database timestamps stay untouched.
+    worker_clock = SimpleNamespace(monotonic=lambda: 0.0)
+    monkeypatch.setattr("core.search.preparation.time", worker_clock)
+    monkeypatch.setattr("core.jobs.runner.time", worker_clock)
+    monkeypatch.setattr("core.persistence.store.time", worker_clock)
     _, source, _, index, prior_job, _ = seed(
         store,
         "rainfall",
