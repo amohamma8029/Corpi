@@ -46,6 +46,9 @@ export const config: WebdriverIO.Config = {
       // tauri-driver preserves browserName on Linux; WebKitWebDriver rejects
       // "wry". Let it select its native browser, as in Tauri's manual example.
       ...(process.platform === "linux" && !embedded ? {} : { browserName: "wry" }),
+      // EdgeDriver's BiDi mapper can replace a loaded WebView2 page with about:blank.
+      // Keep Windows external sessions on the native driver's classic protocol.
+      ...(process.platform === "win32" && !embedded ? { "wdio:enforceWebDriverClassic": true } : {}),
       "tauri:options": {
         application: APPLICATION,
       },
