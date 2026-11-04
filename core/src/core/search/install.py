@@ -66,6 +66,20 @@ class ModelSetupService:
 
     def _ensure(self, profile: ModelProfile) -> None:
         manifest = json.dumps(asdict(profile), sort_keys=True)
+        # Polls of existing state must not compete with transfer-progress writes.
+        # Still validate the saved identity on every read; initialize missing rows
+        # under the original transaction and recheck there for concurrent callers.
+        with self.store.database.connect() as connection:
+            row = connection.execute(
+                "SELECT m.manifest_json,i.manifest_id FROM model_manifests m"
+                " LEFT JOIN model_installations i ON i.manifest_id=m.id WHERE m.id=?",
+                (profile.identity,),
+            ).fetchone()
+            if row is not None:
+                if row[0] != manifest:
+                    raise ConflictingWriteError("model manifest identity mismatch")
+                if row[1] is not None:
+                    return
         with self.store._transaction() as connection:
             connection.execute(
                 "INSERT INTO model_manifests VALUES(?,?,?) ON CONFLICT(id) DO NOTHING",
