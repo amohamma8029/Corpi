@@ -40,9 +40,7 @@ def test_token_count_reuse_preserves_special_token_checks_and_remains_bounded(mo
             return SimpleNamespace(ids=range(len(text) + (2 if add_special_tokens else 0)))
 
     native = Tokenizer()
-    monkeypatch.setattr(
-        "fastembed.common.preprocessor_utils.load_tokenizer", lambda _: (native, {})
-    )
+    monkeypatch.setattr("core.search.runtime._load_runtime_tokenizer", lambda _: (native, {}))
     profile = replace(profiles()["minilm-en"], input_tokens=6)
     tokenizer = InputTokenizer(Path("unused"), profile)
     assert tokenizer.count("rain") == tokenizer.count("rain") == 4
