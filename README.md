@@ -513,20 +513,40 @@ evidence before rerunning: each provider's output directory is replaced by its n
 Keep test libraries separate from personal app data. Cached-model and download-enabled runs
 are distinct checks; enable transfers only when you intend to test setup.
 
-## Checks and native viewer tests in CI
+## Native viewer tests in CI
 
-GitHub Actions is configured to run core, UI, tooling security-patch, schema,
-Rust build and launcher checks on Ubuntu, macOS and Windows. Windows selects
-uv-managed Python using `core/.python-version` and checks the same SQLite minimum.
-Shared commands use Bash so a failed earlier check cannot be hidden by a later
-successful command on Windows.
+The GitHub Actions matrix includes Ubuntu/WebKitGTK, macOS/WKWebView and Windows/WebView2.
+Each job runs core tests/lint/types, the existing pinned-model setup and offline-inference
+checks, UI tests/build/contracts, Rust formatting, shell build/launcher tests and the
+shared native viewer/search suite. Shared command steps use Bash on all three hosts;
+Windows prerequisite steps use PowerShell explicitly.
 
-The shared native viewer suite runs on Ubuntu/WebKitGTK and macOS/WKWebView after
-those checks. Windows native viewer and search-specific checks remain separate
-requirements for [PR #16](https://github.com/amohamma8029/Corpi/pull/16); the
-Windows job here does not run them. See the
-[maintainer checklist](docs/maintainer-checklist.md#before-merging-search-pr-16).
-Configuration alone does not establish a passing hosted run or native compatibility.
+Windows CI selects uv-managed Python from `core/.python-version`, rather than the runner's
+default Python. Every host checks the actual loaded SQLite version before running core
+tests. Windows additionally runs the memory-sampler/process-object controls with a
+no-skips assertion and retains their JUnit report.
+
+After building the shell, `.github/scripts/Setup-WindowsWebDriver.ps1` queries the installed
+WebView2 runtime through the loader from the locked Rust dependency. It downloads that
+exact version of EdgeDriver from Microsoft into the runner's temporary directory, checks
+the archive layout, Microsoft signature and first-three-component version match, then
+sets `CORPI_EDGE_DRIVER` for subsequent CI steps only. It retains a version/hash receipt
+with the platform evidence. Missing exact-version downloads, invalid signatures or mismatches
+fail setup; there is no fallback to the Edge browser's version or an unverified driver.
+It does not install a driver, change PATH or update WebView2. The ordinary local E2E
+runner still never downloads drivers automatically.
+
+Windows external sessions use classic WebDriver commands rather than WebdriverIO's
+automatic BiDi negotiation. On WebView2, the BiDi mapper can replace the loaded app
+page with `about:blank`. Keep `wdio:enforceWebDriverClassic` enabled for that path in
+`desktop/wdio.conf.ts`; the startup test rejects a negotiated BiDi session and still
+requires the real app and core to become ready. It does not navigate a blank page to
+make the test pass. Other platforms and the embedded provider retain their existing settings.
+
+Shared Bash commands fail on the first error on Windows as well as other hosts.
+See the [maintainer checklist](docs/maintainer-checklist.md#before-merging-search-pr-16)
+before integrating this branch. Configuration alone does not establish a passing
+hosted run or native compatibility.
 
 Ubuntu launches the app under Xvfb and D-Bus:
 
@@ -540,11 +560,13 @@ package mirror cannot consume the whole test job.
 
 The macOS job runs `pnpm --dir desktop run test:e2e` with the Homebrew Python selection above.
 It uses WebdriverIO's Tauri launcher and the optional `webdriver` Cargo feature to control the
-actual app. Both jobs embed the built frontend, local PDF.js worker, and support assets; they
-use the real core and the app's CSP. The test build uses `app.corpi.desktop.e2e` as its Tauri
+actual app. The Windows job uses `tauri-driver` and the verified Microsoft driver to test
+the native WebView2 window. All three jobs embed the built frontend, local PDF.js worker,
+and support assets; they use the real core and the app's CSP. The test build uses
+`app.corpi.desktop.e2e` as its Tauri
 identifier so its saved notebooks stay separate from ordinary Corpi data.
 
-Both CI hosts also download the selected MiniLM and E5 search models through the authenticated setup
+All three CI hosts also download the selected MiniLM and E5 search models through the authenticated setup
 API. They reuse those verified files to check inference with socket connections denied and
 automatic PDF readiness followed by a notebook model switch. Version, manifest, file-hash,
 setup-time and test reports upload as `search-platform-<runner>-<commit>` artifacts for 14 days;
@@ -564,6 +586,16 @@ for setup plus the existing viewer checks. Ordinary runs retain their three-minu
 and five-minute suite limits. The application enforces its own setup/preparation budgets.
 Embedded-provider model selection uses a synthetic DOM change event; external providers use
 their select control. Passing the embedded flow does not establish trusted physical input.
+
+The original large-PDF search-readiness measurements in `desktop/e2e/specs/readiness.e2e.ts`
+do not run in CI. They require an explicit `CORPI_READINESS_CASE`, `CORPI_READINESS_PDFS`
+pointing to the original hash-pinned PDFs, and already installed models; the workflow sets
+neither readiness variable. The retained measurements described above are not CI replays.
+The near-25-MB raster viewer check below measures drawing, not the twenty-minute search
+preparation limit. Original-PDF capacity remains an explicit manual release check; a
+portable large-fixture replay is still outstanding. Retain the twenty-minute preparation,
+10,000-chunk and 20,000,000-byte limits. Hosted functional checks do not prove the separate
+1 GiB application-tree RAM/cache/no-swap requirement.
 
 The suite checks painted content on distinct pages, navigation and zoom, a 24,999,190-byte
 image-only PDF rendered under the 20-MP canvas cap, worker/canvas release after close and file
