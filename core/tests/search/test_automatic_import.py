@@ -1,3 +1,7 @@
+import json
+import os
+import subprocess
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -36,6 +40,41 @@ def readiness_failure_state(
             )
         ]
     return {"runner": asdict(snapshot), "jobs": jobs}
+
+
+def readiness_failure_message(
+    store: PersistenceStore, source_id: str, snapshot: RunnerSnapshot
+) -> str:
+    """JSON text preserves fields that pytest shortens in mapping representations."""
+    return json.dumps(readiness_failure_state(store, source_id, snapshot), sort_keys=True)
+
+
+def test_readiness_diagnostic_survives_quiet_pytest_reporting(
+    store: PersistenceStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {
+        "runner": {"queued_job_ids": ["public-test-job"] * 80},
+        "jobs": [{"failure_code": "embedding_worker_failed"}],
+    }
+    monkeypatch.setattr(sys.modules[__name__], "readiness_failure_state", lambda *_: state)
+    message = readiness_failure_message(
+        store, "test-source", RunnerSnapshot("idle", None, None, (), ())
+    )
+    assert len(message) > 640
+    probe = tmp_path / "failure_probe.py"
+    probe.write_text(
+        "def test_failure():\n    assert False, " + repr(message) + "\n", encoding="utf-8"
+    )
+    report = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", str(probe), "-q", "--color=no"],
+        cwd=tmp_path,
+        env={**os.environ, "CI": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert report.returncode == 1
+    assert message in report.stdout
 
 
 @pytest.mark.parametrize("status", ["queued", "running", "failed"])
@@ -137,7 +176,7 @@ def test_real_import_automatically_reaches_searchable_readiness(
             if ready is not None:
                 break
             time.sleep(0.05)
-        assert ready is not None, readiness_failure_state(store, source, runner.snapshot())
+        assert ready is not None, readiness_failure_message(store, source, runner.snapshot())
         response = client.post(
             f"/notebooks/{notebook.id}/search",
             headers=headers,
