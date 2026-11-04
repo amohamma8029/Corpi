@@ -4,6 +4,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { pdfFixtureBytes, type PdfFixture } from "../pdf-fixtures";
+import { isStaleElementResult } from "../protocol-errors";
 
 interface ViewerSnapshot {
   filename: string;
@@ -46,8 +47,10 @@ const evidence: Record<string, unknown> = { fixtures: [], observations: [] };
 const firstPageColor = [51, 128, 204];
 const secondPageColor = [204, 51, 77];
 const rasterColor = [204, 136, 85];
+let lastObservation = "startup";
 
 function record(name: string, value: unknown) {
+  if (name !== "native-stale-command") lastObservation = name;
   (evidence.observations as unknown[]).push({ name, value });
   mkdirSync(results, { recursive: true });
   writeFileSync(path.join(results, "viewer.json"), `${JSON.stringify(evidence, null, 2)}\n`);
@@ -177,6 +180,14 @@ async function selectedNotebookMatches(title: string): Promise<boolean> {
 
 describe("Corpi native notebook and PDF workflow", () => {
   it("launches the real shell and core in the native webview", async () => {
+    // WDIO may refetch a stale handle successfully while WKWebView also reports
+    // its page-side exception globally. Retain the offending protocol operation;
+    // never clear/filter the global errors or relax the later empty-error check.
+    browser.on("result", ({ command, result }) => {
+      if (isStaleElementResult(result)) {
+        record("native-stale-command", { command, afterObservation: lastObservation });
+      }
+    });
     if (process.platform === "win32" && process.env.CORPI_E2E_PROVIDER !== "embedded") {
       const bidiSession = typeof browser.capabilities.webSocketUrl === "string";
       record("native-session-protocol", { webdriverClassic: !bidiSession });
