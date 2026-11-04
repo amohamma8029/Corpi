@@ -131,17 +131,6 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo install tauri-driver --version 2.1.0 --locked
 
-      - name: Verify Windows driver provisioning controls
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./.github/scripts/Setup-WindowsWebDriver.Tests.ps1
-
-      - name: Provision Microsoft-signed driver matching WebView2 (Windows)
-        if: runner.os == 'Windows'
-        timeout-minutes: 5
-        shell: pwsh
-        run: ./.github/scripts/Setup-WindowsWebDriver.ps1
-
       - name: Native viewer and search setup E2E (Linux / WebKitGTK)
         if: runner.os == 'Linux'
         env:
@@ -154,14 +143,8 @@ jobs:
           CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: pnpm --dir desktop run test:e2e
 
-      - name: Native viewer and search setup E2E (Windows / WebView2)
-        if: runner.os == 'Windows'
-        env:
-          CORPI_RUN_MODEL_DOWNLOAD: "1"
-        run: pnpm --dir desktop run test:e2e
-
       - name: Upload native viewer evidence
-        if: always()
+        if: always() && runner.os != 'Windows'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-viewer-${{ matrix.os }}-${{ github.sha }}
@@ -177,5 +160,85 @@ jobs:
           path: |
             ${{ runner.temp }}/corpi-search-evidence/
             ${{ runner.temp }}/corpi-search-models/*-setup.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Native model setup gets its own existing-size job budget, rather than the
+  # few minutes left after Windows core/model checks and the debug shell build.
+  # Keep this independent: unavailable macOS runners must not block Windows E2E.
+  windows-native:
+    name: Native checks (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+
+      - name: Select Windows managed Python
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (Get-Content core/.python-version -Raw).Trim()
+          uv python install $version
+          $python = uv python find --managed-python --no-project $version
+          "UV_PYTHON=$python" >> $env:GITHUB_ENV
+
+      - name: Core setup
+        run: uv sync --directory core
+
+      - name: Check loaded SQLite version
+        working-directory: core
+        run: |
+          uv run python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 51, 3), "SQLite 3.51.3 or newer is required"'
+
+      - name: UI setup
+        run: pnpm --dir desktop install --frozen-lockfile
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Fetch locked Windows shell dependencies
+        working-directory: desktop/src-tauri
+        # Provisioning reads the loader from the locked crate's source. No debug
+        # shell build is needed here; the native runner builds the release app.
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify Windows driver provisioning controls
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.Tests.ps1
+
+      - name: Provision Microsoft-signed driver matching WebView2 (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.ps1
+
+      - name: Native viewer and search setup E2E (Windows / WebView2)
+        if: runner.os == 'Windows'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
+        run: pnpm --dir desktop run test:e2e
+
+      - name: Upload native viewer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-viewer-windows-latest-${{ github.sha }}
+          path: desktop/e2e-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload native driver evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-driver-windows-latest-${{ github.sha }}
+          path: ${{ runner.temp }}/corpi-search-evidence/windows-webdriver.json
           if-no-files-found: warn
           retention-days: 14
