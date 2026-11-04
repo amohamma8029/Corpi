@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,11 +19,11 @@ export function windowsAttachment(env) {
   return { debuggerAddress: address, port: portNumber(env.CORPI_E2E_DRIVER_PORT) };
 }
 
-async function freePort() {
+async function freePort(port = 0) {
   const server = createServer();
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
         server.close(() => reject(new Error("No loopback test port was assigned.")));
@@ -51,11 +51,12 @@ async function waitForExit(child) {
 }
 
 export class WindowsWebDriver {
-  constructor({ application, driver, cwd, env, scratch }) {
-    if (![application, driver, cwd, scratch].every((value) => path.isAbsolute(value))) {
+  constructor({ application, driver, cwd, env }) {
+    if (![application, driver, cwd].every((value) => path.isAbsolute(value))) {
       throw new Error("Windows E2E requires absolute owned paths.");
     }
-    this.options = { application, driver, cwd, env, scratch };
+    this.options = { application, driver, cwd, env };
+    this.binding = null;
     this.app = null;
     this.driver = null;
     this.environment = null;
@@ -67,6 +68,47 @@ export class WindowsWebDriver {
     const child = spawn(command, args, { cwd: this.options.cwd, env, stdio: "inherit" });
     child.once("error", (error) => { this.spawnErrors.set(child, error); });
     return child;
+  }
+
+  async prepare({ baseConfig, e2eConfig, wryVersion }, previous) {
+    if (this.binding) throw new Error("Windows test build settings were already prepared.");
+    // Explicit arguments replace Wry's defaults. This exact pinned version uses
+    // these feature switches, autoplay=true and no proxy for Corpi's main window.
+    if (wryVersion !== "0.55.1") throw new Error("Review Windows test browser defaults for the locked Wry version.");
+    const windows = baseConfig.app?.windows;
+    if (!Array.isArray(windows) || windows.length !== 1 || windows[0].label !== "main"
+      || e2eConfig.identifier !== "app.corpi.desktop.e2e" || e2eConfig.app?.windows) {
+      throw new Error("Windows E2E requires the unchanged single main window and test-only identifier.");
+    }
+    const window = windows[0];
+    if (["additionalBrowserArgs", "dataDirectory", "proxyUrl"].some((key) => window[key] != null)) {
+      throw new Error("Review configured Windows browser arguments, data directory or proxy before overriding them.");
+    }
+    const binding = previous ?? {
+      debugPort: await freePort(), identifier: `app.corpi.desktop.e2e.t${randomUUID()}`,
+    };
+    if (!Number.isInteger(binding.debugPort)
+      || !/^app\.corpi\.desktop\.e2e\.t[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(binding.identifier ?? "")) {
+      throw new Error("Invalid previous Windows test build binding; rebuild without --reuse-build.");
+    }
+    portNumber(String(binding.debugPort));
+    this.binding = { debugPort: binding.debugPort, identifier: binding.identifier };
+    return {
+      binding: { ...this.binding },
+      configuration: {
+        ...e2eConfig,
+        // The pinned Tauri manager passes local-app-data/<identifier> directly
+        // to WebView2. A new test identifier gives each build fresh profile and
+        // core data without relying on environment overrides or touching old data.
+        identifier: binding.identifier,
+        app: { ...e2eConfig.app, windows: [{
+          ...window,
+          additionalBrowserArgs: "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection"
+            + " --autoplay-policy=no-user-gesture-required"
+            + ` --remote-debugging-port=${binding.debugPort} --remote-debugging-address=127.0.0.1`,
+        }] },
+      },
+    };
   }
 
   async waitFor(child, endpoint, accepts) {
@@ -86,17 +128,19 @@ export class WindowsWebDriver {
 
   async start() {
     if (this.app || this.driver) throw new Error("A Windows test session cannot be started twice.");
-    const debugPort = await freePort();
-    const root = mkdtempSync(path.join(this.options.scratch, "corpi-native-webview-"));
-    const profile = path.join(root, "profile");
-    mkdirSync(profile);
+    if (!this.binding) throw new Error("Prepare Windows test build settings before building and launching the app.");
+    const { debugPort } = this.binding;
+    // The binary embeds this port. Fail if it is occupied; never silently attach
+    // to a different process or invent another port for an already-built app.
+    await freePort(debugPort);
     const env = {
       ...this.options.env,
       TAURI_WEBVIEW_AUTOMATION: "true",
-      WEBVIEW2_USER_DATA_FOLDER: profile,
-      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:
-        `--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1`,
     };
+    // Runtime 150+ ignores these on elevated hosts. Both settings now reach the
+    // native WebView2 API through the E2E-only build configuration instead.
+    delete env.WEBVIEW2_USER_DATA_FOLDER;
+    delete env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS;
     this.app = this.launch(this.options.application, [], env);
     await this.waitFor(this.app, `http://127.0.0.1:${debugPort}/json/list`, (targets) =>
       Array.isArray(targets) && targets.some((target) => target.type === "page"

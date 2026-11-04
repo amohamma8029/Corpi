@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { arch, release, tmpdir, version } from "node:os";
+import { arch, release, version } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -155,23 +155,37 @@ try {
   await run("pnpm", ["run", "check:e2e"], 120_000);
   evidence.stage = "build";
   saveEvidence();
+  let windowsConfiguration;
+  if (windows && provider === "external") {
+    const edgeDriver = process.env.CORPI_EDGE_DRIVER ?? execFileSync("powershell.exe", ["-NoProfile", "-Command",
+      "$driver = (Get-Command msedgedriver.exe -ErrorAction SilentlyContinue).Source; if (-not $driver) { $driver = Get-ChildItem \"$env:LOCALAPPDATA\\Microsoft\\WinGet\\Packages\" -Recurse -Filter msedgedriver.exe | Select-Object -First 1 -ExpandProperty FullName }; if (-not $driver) { throw 'Microsoft Edge WebDriver was not found' }; $driver"],
+    { encoding: "utf8", timeout: 15_000 }).trim();
+    const lock = readFileSync(path.join(desktop, "src-tauri/Cargo.lock"), "utf8");
+    const versions = [...lock.matchAll(/\[\[package\]\]\r?\nname = "wry"\r?\nversion = "([^"]+)"/g)];
+    if (versions.length !== 1) throw new Error("Windows E2E requires exactly one locked Wry version.");
+    if (reuseBuild && !previousBuild.windowsBuild) {
+      throw new Error("The previous Windows binary has no direct-API test settings; rebuild without --reuse-build.");
+    }
+    windowsDriver = new WindowsWebDriver({ application: binary, driver: edgeDriver, cwd: desktop, env });
+    const prepared = await windowsDriver.prepare({
+      baseConfig: JSON.parse(readFileSync(path.join(desktop, "src-tauri/tauri.conf.json"), "utf8")),
+      e2eConfig: JSON.parse(readFileSync(path.join(desktop, "src-tauri/tauri.e2e.conf.json"), "utf8")),
+      wryVersion: versions[0][1],
+    }, reuseBuild ? previousBuild.windowsBuild : undefined);
+    windowsConfiguration = JSON.stringify(prepared.configuration);
+    evidence.windowsBuild = prepared.binding;
+    saveEvidence();
+  }
   const buildArgs = ["tauri", "build", "--no-bundle", "--config",
-    `src-tauri/tauri.${provider === "embedded" ? "webdriver" : "e2e"}.conf.json`];
+    windowsConfiguration ?? `src-tauri/tauri.${provider === "embedded" ? "webdriver" : "e2e"}.conf.json`];
   if (provider === "embedded") buildArgs.push("--features", "webdriver");
   if (!reuseBuild) await run("pnpm", buildArgs);
   evidence.testBinarySha256 = createHash("sha256").update(readFileSync(binary)).digest("hex");
 
   if (provider === "external") {
     if (windows) {
-      const edgeDriver = process.env.CORPI_EDGE_DRIVER ?? execFileSync("powershell.exe", ["-NoProfile", "-Command",
-        "$driver = (Get-Command msedgedriver.exe -ErrorAction SilentlyContinue).Source; if (-not $driver) { $driver = Get-ChildItem \"$env:LOCALAPPDATA\\Microsoft\\WinGet\\Packages\" -Recurse -Filter msedgedriver.exe | Select-Object -First 1 -ExpandProperty FullName }; if (-not $driver) { throw 'Microsoft Edge WebDriver was not found' }; $driver"],
-      { encoding: "utf8", timeout: 15_000 }).trim();
       evidence.stage = "native-startup";
       saveEvidence();
-      windowsDriver = new WindowsWebDriver({
-        application: binary, driver: edgeDriver, cwd: desktop, env,
-        scratch: env.RUNNER_TEMP ?? tmpdir(),
-      });
       Object.assign(env, await windowsDriver.start());
       evidence.windowsSession = { mode: "prelaunched-classic", loopbackOnly: true };
     } else {
