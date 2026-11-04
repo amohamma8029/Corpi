@@ -1,4 +1,5 @@
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from pdf_fixtures import native_text_pdf
 
 from core.api.app import create_app
 from core.ingest.service import PdfIngestService
-from core.jobs.runner import JobRunner
+from core.jobs.runner import JobRunner, RunnerSnapshot
 from core.jobs.steps import build_pdf_extract_steps
 from core.persistence.models import new_id, utc_timestamp
 from core.persistence.store import PersistenceStore
@@ -17,6 +18,62 @@ from core.search.profiles import profiles, verify_installation
 from core.search.query import QueryService
 from core.search.storage import SearchStorage
 from core.search.switching import NotebookModelService
+
+
+def readiness_failure_state(
+    store: PersistenceStore, source_id: str, snapshot: RunnerSnapshot
+) -> dict:
+    """Report source-scoped processing state, not PDF text, vectors or environment."""
+    with store.database.connect() as connection:
+        jobs = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT j.kind,s.status,s.current_step_key,s.attempt_count,"
+                "s.failure_code FROM jobs j"
+                " JOIN job_status s ON s.job_id=j.id WHERE j.source_id=?"
+                " ORDER BY j.created_at,j.id",
+                (source_id,),
+            )
+        ]
+    return {"runner": asdict(snapshot), "jobs": jobs}
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "failed"])
+def test_readiness_failure_reports_source_job_state_without_mutation(
+    store: PersistenceStore, status: str
+) -> None:
+    notebook = store.create_notebook(new_id(), "Readiness diagnostics")
+    source = store.create_source(new_id(), notebook.id, "diagnostic.pdf")
+    job = store.create_job("diagnostic:target", "pdf-search", source.id)
+    store.create_job_status(job.id)
+    other = store.create_source(new_id(), notebook.id, "unrelated.pdf")
+    unrelated = store.create_job("diagnostic:unrelated", "pdf-extract", other.id)
+    store.create_job_status(unrelated.id)
+    code = "embedding_worker_failed" if status == "failed" else None
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE job_status SET status=?,current_step_key='embed-search',"
+            "attempt_count=1,failure_code=?,failure_reason=? WHERE job_id=?",
+            (status, code, "source text must not be exported", job.id),
+        )
+    before = store.load_job_status(job.id)
+    other_before = store.load_job_status(unrelated.id)
+    snapshot = RunnerSnapshot("idle", None, None, (), ())
+    state = readiness_failure_state(store, source.id, snapshot)
+    assert state == {
+        "runner": asdict(snapshot),
+        "jobs": [
+            {
+                "kind": "pdf-search",
+                "status": status,
+                "current_step_key": "embed-search",
+                "attempt_count": 1,
+                "failure_code": code,
+            }
+        ],
+    }
+    assert store.load_job_status(job.id) == before
+    assert store.load_job_status(unrelated.id) == other_before
 
 
 def test_real_import_automatically_reaches_searchable_readiness(
@@ -80,7 +137,7 @@ def test_real_import_automatically_reaches_searchable_readiness(
             if ready is not None:
                 break
             time.sleep(0.05)
-        assert ready is not None
+        assert ready is not None, readiness_failure_state(store, source, runner.snapshot())
         response = client.post(
             f"/notebooks/{notebook.id}/search",
             headers=headers,
