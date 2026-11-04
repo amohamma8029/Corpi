@@ -177,6 +177,11 @@ async function selectedNotebookMatches(title: string): Promise<boolean> {
 
 describe("Corpi native notebook and PDF workflow", () => {
   it("launches the real shell and core in the native webview", async () => {
+    if (process.platform === "win32" && process.env.CORPI_E2E_PROVIDER !== "embedded") {
+      const bidiSession = typeof browser.capabilities.webSocketUrl === "string";
+      record("native-session-protocol", { webdriverClassic: !bidiSession });
+      await expect(bidiSession).toBe(false);
+    }
     try {
       await browser.waitUntil(async () => {
         for (const handle of await browser.getWindowHandles()) {
