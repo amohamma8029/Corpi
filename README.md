@@ -511,6 +511,9 @@ For UI or core changes, rerun the appropriate native command from the table with
 `--reuse-build`. That flag checks the retained binary's hash but does not embed your new
 frontend or rebuild changed application code. Preserve the existing `desktop/e2e-results/`
 evidence before rerunning: each provider's output directory is replaced by its next run.
+Windows external reuse also requires the original generated test identifier and debugging
+port saved in `run.json`. Older binaries without that binding must be rebuilt. A reused
+binary keeps its test library/profile; a fresh Windows E2E build gets new isolated data.
 Keep test libraries separate from personal app data. Cached-model and download-enabled runs
 are distinct checks; enable transfers only when you intend to test setup.
 
@@ -542,11 +545,20 @@ automatic BiDi negotiation. On WebView2, the BiDi mapper can replace the loaded 
 page with `about:blank`. Keep `wdio:enforceWebDriverClassic` enabled for that path in
 `desktop/wdio.conf.ts`; the startup test rejects a negotiated BiDi session and still
 requires the real app and core to become ready. It does not navigate a blank page to
-make the test pass. The runner first starts one app with a separate temporary WebView2
-profile, waits for its loopback debugging endpoint, then attaches the matching driver.
+make the test pass. Before building, the Windows runner generates an E2E-only configuration
+with a loopback debugging port and a unique `app.corpi.desktop.e2e.t...` identifier.
+Tauri passes the debugging arguments directly to WebView2 and gives that identifier its own
+profile/library in Windows app-data. This works without relying on debugging
+environment variables, which [WebView2 ignores in elevated processes](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5640#issuecomment-4923662109).
+The pinned Wry browser defaults are preserved; changed Wry versions or existing custom
+browser/proxy settings require review rather than silently dropping those settings.
+Normal app configuration, Cargo features, CSP and runtime pins are unchanged.
+
+The runner starts one app, waits for its loopback debugging endpoint, then attaches the matching driver.
 Session retries reattach to that same app instead of launching duplicate cores. It closes
 the native window before stopping the driver; failed graceful cleanup remains a test failure.
-The browser profile is outside the uploaded evidence directory. Other platforms and the
+The isolated profile/library stays outside the uploaded evidence directory; old test data
+is not moved or deleted. Other platforms and the
 embedded provider retain their existing settings.
 
 Shared Bash commands fail on the first error on Windows as well as other hosts.
