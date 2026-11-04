@@ -1223,7 +1223,35 @@ def test_pdf_disk_write_failure_is_reported_without_creating_a_source(
 
 
 @pytest.mark.anyio
-async def test_total_upload_deadline_busy_slot_and_health_responsiveness(tmp_path: Path) -> None:
+async def test_total_upload_deadline_busy_slot_and_health_responsiveness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from core.ingest import service as ingest_module
+
+    # Advance only the upload clock. Real SQLite/file scheduling must not decide
+    # whether the test's 80 ms idle or 250 ms total deadline expired first.
+    clock = SimpleNamespace(now=0.0)
+    stream_timeouts = []
+
+    class UploadScheduler:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def wait_for(self, awaitable, timeout):
+            started = clock.now
+            is_stream = not asyncio.isfuture(awaitable)
+            if is_stream:
+                stream_timeouts.append(timeout)
+            result = await awaitable
+            if clock.now - started >= timeout:
+                clock.now = started + timeout
+                raise TimeoutError
+            return result
+
+    monkeypatch.setattr(ingest_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(ingest_module, "asyncio", UploadScheduler())
     database = Database(DatabaseConfig(tmp_path / "data"))
     database.initialize()
     store = PersistenceStore(database)
@@ -1239,15 +1267,20 @@ async def test_total_upload_deadline_busy_slot_and_health_responsiveness(tmp_pat
     app = create_app(TOKEN, allowed_origins=(ORIGIN,), store=store, pdf_ingest=ingest)
     transport = httpx.ASGITransport(app=app)
 
+    body_started = asyncio.Event()
+    release_body = asyncio.Event()
+
     async def slow_body():
+        body_started.set()
         yield b"%PDF-"
+        await release_body.wait()
         for _ in range(12):
-            await asyncio.sleep(0.03)
+            clock.now += 0.03
             yield b"x" * 12
 
     async def idle_body():
         yield b"%PDF-"
-        await asyncio.sleep(0.12)
+        clock.now += 0.12
         yield b"remaining bytes"
 
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
@@ -1258,13 +1291,14 @@ async def test_total_upload_deadline_busy_slot_and_health_responsiveness(tmp_pat
                 content=slow_body(),
             )
         )
-        await asyncio.sleep(0.02)
+        await body_started.wait()
         health = await client.get("/health", headers=auth_headers())
         busy = await client.put(
             f"/pdf-acquisitions/{second.id}/content",
             headers={**auth_headers(), "Content-Type": "application/pdf"},
             content=minimal_pdf("second"),
         )
+        release_body.set()
         timed_out = await first_request
         idle_timeout = await client.put(
             f"/pdf-acquisitions/{idle.id}/content",
@@ -1280,6 +1314,8 @@ async def test_total_upload_deadline_busy_slot_and_health_responsiveness(tmp_pat
     assert timed_out.json()["detail"]["code"] == "upload_timeout"
     assert idle_timeout.status_code == 408
     assert idle_timeout.json()["detail"]["code"] == "upload_idle_timeout"
+    assert 0 < min(stream_timeouts) < ingest.limits.upload_idle_seconds
+    assert max(stream_timeouts) == ingest.limits.upload_idle_seconds
     with database.connect() as connection:
         assert connection.execute("SELECT count(*) FROM sources").fetchone()[0] == 0
 
