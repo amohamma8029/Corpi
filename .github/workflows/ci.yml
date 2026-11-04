@@ -127,8 +127,8 @@ jobs:
           CORPI_CORE_DIR: ${{ github.workspace }}/core
         run: cargo test --test launcher -- --test-threads=1
 
-      - name: Install native WebDriver (Linux / Windows)
-        if: runner.os != 'macOS'
+      - name: Install native WebDriver (Linux)
+        if: runner.os == 'Linux'
         run: cargo install tauri-driver --version 2.1.0 --locked
 
       - name: Verify Windows driver provisioning controls
