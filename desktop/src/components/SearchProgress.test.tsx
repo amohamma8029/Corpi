@@ -9,14 +9,16 @@ const connection = { base_url: "http://127.0.0.1:1234", token: "test-only" };
 const running = { source_id: "one", status: "running", step: "embed-search", waiting_reason: null, failure_code: null, completed_chunks: 2, total_chunks: 10, job_id: "original-job", can_cancel: true, can_resume: false };
 const cancelled = { ...running, status: "cancelled", can_cancel: false, can_resume: true };
 beforeEach(() => vi.resetAllMocks());
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 it("cancels the exact current job then explicitly resumes without pretending to reset progress", async () => {
+  // Keep periodic progress polling from consuming this action-only reply sequence.
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   vi.mocked(coreRequest).mockResolvedValueOnce(running).mockResolvedValueOnce({ job_id: running.job_id }).mockResolvedValueOnce(cancelled)
     .mockResolvedValueOnce({ job_id: "resumed-job" }).mockResolvedValueOnce({ ...running, job_id: "resumed-job" });
-  render(<SearchProgress connection={connection} sourceId="one" />);
-  fireEvent.click(await screen.findByRole("button", { name: "Cancel search preparation" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Resume search preparation" }));
+  await act(async () => { render(<SearchProgress connection={connection} sourceId="one" />); });
+  await act(async () => { fireEvent.click(await screen.findByRole("button", { name: "Cancel search preparation" })); });
+  await act(async () => { fireEvent.click(await screen.findByRole("button", { name: "Resume search preparation" })); });
   expect(await screen.findByText("2 of 10 text pieces embedded")).toBeTruthy();
   await waitFor(() => expect(coreRequest).toHaveBeenCalledTimes(5));
   const cancel = vi.mocked(coreRequest).mock.calls[1];
