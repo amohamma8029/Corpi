@@ -5,6 +5,7 @@ on:
     branches: ["main", "feat/**"]
   pull_request:
 
+# CI needs repository reads, not permission to change code or approve PRs.
 permissions:
   contents: read
 
@@ -154,7 +155,7 @@ jobs:
 
       - name: Upload search model/platform evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: search-platform-${{ matrix.os }}-${{ github.sha }}
           path: |
@@ -171,9 +172,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
 
       - name: Select Windows managed Python
         if: runner.os == 'Windows'
@@ -198,7 +201,7 @@ jobs:
       - name: UI setup
         run: pnpm --dir desktop install --frozen-lockfile
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: desktop/src-tauri
 
@@ -227,7 +230,7 @@ jobs:
 
       - name: Upload native viewer evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-viewer-windows-latest-${{ github.sha }}
           path: desktop/e2e-results/
@@ -236,7 +239,7 @@ jobs:
 
       - name: Upload native driver evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-driver-windows-latest-${{ github.sha }}
           path: ${{ runner.temp }}/corpi-search-evidence/windows-webdriver.json

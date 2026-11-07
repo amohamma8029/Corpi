@@ -4,7 +4,8 @@ Corpi is an in-development, single-user desktop app for working with imported so
 The current `main` branch includes notebooks, saved PDF imports, a PDF viewer, text
 extraction and readability review. Local Words/Meaning search is being developed
 separately in [PR #16](https://github.com/amohamma8029/Corpi/pull/16); it is not yet
-part of `main`.
+part of `main`. Search and model setup documented below are on
+`feat/search-local-index`.
 
 Notebooks and imported files stay on the user's device. Provider-generated answers
 and external model-provider configuration are planned, not implemented here.
@@ -15,6 +16,9 @@ Corpi is not a supported stable release. Native compatibility needs evidence for
 the particular commit and platform; a unit-test or build pass does not replace it.
 Supervised PDF parsing and resource limits are not an OS security sandbox for
 hostile files. A user-facing backup/restore feature is deferred to Milestone 2.
+Publishing the source is not a finished-release claim. Current-feature CI/native
+verification, capacity acceptance and strict aggregate memory/no-swap proof remain
+unfinished.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and safe test data, and
 [SECURITY.md](SECURITY.md) for private reporting and current dependency limitations.
@@ -35,7 +39,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and safe test data, and
 - Native E2E tooling depends on the host:
   - Windows: Microsoft Edge WebDriver matching the app's WebView2 runtime (winget: `Microsoft.EdgeDriver`).
     The runner launches the app itself and attaches directly to that driver.
-  - Ubuntu: the Tauri build libraries, `webkit2gtk-driver`, `xvfb`, `xauth`, and `dbus-x11`; install `tauri-driver` with `cargo install tauri-driver --version 2.1.0 --locked`.
+  - Ubuntu: the Tauri build libraries, `webkitgtk-webdriver` (Ubuntu 26.04) or `webkit2gtk-driver` (older releases), `xvfb`, `xauth`, and `dbus-x11`; install `tauri-driver` with `cargo install tauri-driver --version 2.1.0 --locked`.
   - macOS: the test runner uses the embedded WebDriver plugin; it needs no external driver or paid subscription.
 
 On Windows, Edge WebDriver's first three version components must match the **WebView2 runtime**
@@ -500,9 +504,10 @@ Core setup is `uv sync` inside `core/`; desktop setup is `pnpm install` inside `
 
 ### Verify local changes
 
-After setup, run `just test` for the core tests/static checks, UI unit tests and live-schema
-comparison. Also run `pnpm --dir desktop build` for generated API types, TypeScript and the
-production frontend, plus `pnpm --dir desktop run check:e2e` and
+After setup, run `just test` for the core tests/static checks, tooling security-patch
+checks, UI unit tests and live-schema comparison. Also run `pnpm --dir desktop build`
+for generated API types, TypeScript and the production frontend, plus
+`pnpm --dir desktop run check:e2e` and
 `pnpm --dir desktop run check:webdriver-isolation` for the native test contract. The ordinary
 test selection skips opt-in model downloads and installed-model inference; skipped tests are
 not model/native acceptance.
@@ -521,9 +526,10 @@ are distinct checks; enable transfers only when you intend to test setup.
 
 The GitHub Actions matrix includes Ubuntu/WebKitGTK, macOS/WKWebView and Windows/WebView2.
 Each matrix job runs core tests/lint/types, the existing pinned-model setup and
-offline-inference checks, UI tests/build/contracts, Rust formatting and shell
-build/launcher tests. Linux and macOS also run the shared native viewer/search suite
-there. Windows runs that full suite in the separate `Native checks (windows-latest)`
+offline-inference checks, tooling security-patch checks before UI tests/build/contracts,
+Rust formatting and shell build/launcher tests. Linux and macOS also run the shared
+native viewer/search suite there. Windows runs that full suite in the separate
+`Native checks (windows-latest)`
 job so it no longer shares its budget with core checks and the debug shell build. Both Windows
 jobs retain a 45-minute limit; test and application limits are unchanged. The native
 job is independent of the matrix, so a missing macOS runner does not block it. This
