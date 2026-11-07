@@ -18,8 +18,10 @@ just test
 This runs the core tests, lint/format/type checks, tooling security-patch checks,
 UI unit tests, and API schema drift check. CI also runs the security-patch check
 before its UI tests. These checks do not replace desktop builds or native E2E
-checks. See the README's native testing instructions for the relevant platform. These require
-explicit environment setup and use a dedicated synthetic test library.
+checks. See the README's native testing instructions for the relevant platform.
+Native checks require explicit environment setup and a dedicated synthetic test
+library. Model downloads and capacity benchmarks are explicit opt-ins, not
+prerequisites for every change.
 Report the exact commands and platform used, and preserve existing resource limits
 and failed evidence rather than changing them to make a check pass.
 
