@@ -185,6 +185,26 @@ unproved. These limits do not establish a hard production RAM cap or everyday sp
 Setup allows one transfer at a time, up to three transfer attempts within a 600-second budget,
 a cumulative 1,000,000,000 received-byte ceiling, and a 30-second no-bytes deadline.
 
+### Search runtime upgrades and recovery
+
+FastEmbed 0.9.1 runs Corpi's existing embedding contract without changing saved model
+or installation IDs. New batch attempts record the actual worker-library versions
+separately from the generation's original settings. Resuming old work does not rewrite
+those settings, relabel completed vectors, or reset attempts or consumed allowances.
+
+Before upgrading an existing revision-14 database, migration 15 creates a SQLite
+recovery copy under the data directory's `migration-snapshots/`. Existing copies are
+retained; a filename suffix distinguishes repeated copies. Backup failure stops the
+upgrade. This is a database migration safeguard, not a general backup/restore feature.
+
+Older builds cannot open the upgraded database. For developer rollback, stop Corpi
+and preserve the entire current data directory first, including SQLite WAL/SHM files.
+Validate a revision-14 recovery copy in a separate directory with the older build;
+do not replace a live database or mix it with the newer database's WAL/SHM files.
+Restoring an older database loses later database changes. These copies do not back
+up PDF/model files or recover files deleted since the copy. General local backup/
+restore remains planned for Milestone 2; do not treat this safeguard as that feature.
+
 ### Local search developer benchmarks
 
 The scripts under `core/scripts/` compare pinned local embedding models using authenticated

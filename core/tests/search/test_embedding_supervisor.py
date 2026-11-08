@@ -12,7 +12,7 @@ from core.search.supervisor import EmbeddingFailure, EmbeddingSession, Embedding
 
 def command(profile, body: str) -> list[str]:
     code = (
-        "import os,json,sys,time; "
+        "import os,json,sys,time; from core.search.provenance import runtime_versions; "
         f"print(json.dumps({{'type':'started','manifest':{profile.identity!r},"
         "'request':0,'pid':os.getpid()}),flush=True); " + body
     )
@@ -113,7 +113,7 @@ def test_worker_environment_has_no_core_or_provider_credentials(
         "assert 'CORPI_CORE_TOKEN' not in os.environ and 'OPENAI_API_KEY' not in os.environ; "
         "assert os.environ['PYTHONUTF8']=='1' and sys.flags.utf8_mode==1; "
         f"print(json.dumps({{'type':'ready','manifest':{profile.identity!r},"
-        "'request':0}),flush=True); "
+        "'request':0,'runtime':runtime_versions()}),flush=True); "
         "time.sleep(30)"
     )
     with EmbeddingSession(
@@ -131,7 +131,7 @@ def test_worker_receives_explicit_saved_arena_and_spinning_flags(tmp_path, enabl
     body = (
         f"assert sys.argv[3:5]==[{expected!r},{expected!r}]; "
         f"print(json.dumps({{'type':'ready','manifest':{profile.identity!r},"
-        "'request':0}),flush=True); time.sleep(30)"
+        "'request':0,'runtime':runtime_versions()}),flush=True); time.sleep(30)"
     )
     with EmbeddingSession(
         tmp_path,

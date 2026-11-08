@@ -19,6 +19,7 @@ from core.persistence.models import AttemptGuard
 from core.persistence.store import PersistenceStore
 from core.search import preparation
 from core.search import storage as storage_module
+from core.search.provenance import runtime_versions
 from core.search.runtime import vector_bytes
 from core.search.storage import SearchStorage, generation_identity
 from core.search.supervisor import stop_owned_process_tree, worker_environment
@@ -35,6 +36,7 @@ def embed_stage(store, planned, monkeypatch):
     class Session:
         load_seconds = 1
         peak_bytes = 1024
+        execution_runtime = runtime_versions()
 
         def __init__(self, *args, **kwargs):
             sessions.append(self)
@@ -217,6 +219,20 @@ def test_expired_batch_commit_rolls_back_native_vectors(store, monkeypatch, plan
     clock, job, context, _, _, _ = embed_stage(store, planned, monkeypatch)
     assert context.guard is not None
     batch = batch_state(store, job)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE search_batches SET attempts=1 WHERE index_version_id=?",
+            (batch["index_version_id"],),
+        )
+    SearchStorage(store).record_batch_execution(
+        job,
+        context.guard,
+        batch["index_version_id"],
+        0,
+        1,
+        runtime_versions(),
+        deadline=clock.monotonic() + 20,
+    )
     times = iter([clock.monotonic(), clock.monotonic() + 30])
     monkeypatch.setattr(storage_module, "time", SimpleNamespace(monotonic=lambda: next(times)))
     with pytest.raises(TimeoutError, match="deadline expired"):
@@ -228,6 +244,7 @@ def test_expired_batch_commit_rolls_back_native_vectors(store, monkeypatch, plan
             json.loads(batch["chunk_ids_json"]),
             [VECTOR],
             deadline=clock.monotonic() + 20,
+            execution_attempt=1,
         )
     assert batch_state(store, job)["complete"] == 0
     with store.database.connect() as connection:
@@ -411,6 +428,7 @@ def crash_worker(root, job, boundary):
     class Session:
         load_seconds = 0
         peak_bytes = 0
+        execution_runtime = runtime_versions()
 
         def __init__(self, *args, **kwargs):
             if boundary == "admission":
@@ -477,6 +495,12 @@ def test_actual_exit_retains_batch_reservation_and_restart_reuses_commits(
     batch = batch_state(restarted, job)
     assert batch["attempts"] == (0 if boundary == "input" else 1)
     assert batch["complete"] == (boundary == "commit")
+    with restarted.database.connect() as connection:
+        before_receipts = connection.execute(
+            "SELECT * FROM search_batch_executions WHERE job_id=?", (job,)
+        ).fetchall()
+    assert len(before_receipts) == (1 if boundary in {"inference", "commit"} else 0)
+    assert all(json.loads(row["runtime_json"]) == runtime_versions() for row in before_receipts)
     restarted.release_running_jobs()
     restarted.claim_job(job, "batch-restart")
     attempt = restarted.start_step_attempt(job, "embed-search")
@@ -489,6 +513,15 @@ def test_actual_exit_retains_batch_reservation_and_restart_reuses_commits(
     assert batch_state(restarted, job)["complete"] == 1
     assert batch_state(restarted, job)["attempts"] == (1 if boundary in {"input", "commit"} else 2)
     assert charge(restarted, job) >= before + 20
+    with restarted.database.connect() as connection:
+        after_receipts = connection.execute(
+            "SELECT * FROM search_batch_executions WHERE job_id=? ORDER BY batch_attempt_number",
+            (job,),
+        ).fetchall()
+    assert len(after_receipts) == (2 if boundary == "inference" else 1)
+    assert [tuple(row) for row in after_receipts[: len(before_receipts)]] == [
+        tuple(row) for row in before_receipts
+    ]
 
 
 if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "--crash-batch":

@@ -221,11 +221,14 @@ def test_source_control_routes_share_auth_and_only_offer_current_resumable_work(
 
 
 def test_progress_keeps_fully_embedded_counts_separate_from_publication(store):
+    from time import monotonic
+
     from fastapi.testclient import TestClient
 
     from core.api.app import create_app
     from core.persistence.models import AttemptGuard
     from core.search.chunking import make_chunks
+    from core.search.provenance import runtime_versions
     from core.search.runtime import vector_bytes
     from core.search.storage import SearchStorage
 
@@ -256,6 +259,13 @@ def test_progress_keeps_fully_embedded_counts_separate_from_publication(store):
     store.finish_step_attempt(job, "plan-search", attempt.attempt_number, None)
     attempt = store.start_step_attempt(job, "embed-search")
     guard = AttemptGuard("progress-test", "embed-search", attempt.attempt_number)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE search_batches SET attempts=1 WHERE index_version_id=?", (index,)
+        )
+    storage.record_batch_execution(
+        job, guard, index, 0, 1, runtime_versions(), deadline=monotonic() + 20
+    )
     storage.commit_batch(
         job,
         guard,
@@ -263,6 +273,7 @@ def test_progress_keeps_fully_embedded_counts_separate_from_publication(store):
         0,
         [chunk.id for chunk in graph.chunks],
         [vector_bytes(VECTOR, 384)] * len(graph.chunks),
+        execution_attempt=1,
     )
     with TestClient(
         create_app("progress-test", store=store), base_url="http://127.0.0.1"

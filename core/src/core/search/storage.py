@@ -28,6 +28,7 @@ from core.persistence.models import (
 )
 from core.search.chunking import CHUNKER_VERSION, Chunk
 from core.search.profiles import ModelProfile
+from core.search.provenance import validate_runtime_versions
 from core.search.representation import (
     CANONICAL,
     EncodedQuery,
@@ -368,6 +369,59 @@ class SearchStorage:
                 )
             return index_id
 
+    def record_batch_execution(
+        self,
+        job_id: str,
+        guard: AttemptGuard,
+        index_id: str,
+        ordinal: int,
+        batch_attempt_number: int,
+        runtime: object,
+        *,
+        deadline: float,
+    ) -> None:
+        """Durably identify the actual worker before any text goes to this attempt."""
+        from core.persistence.store import _verify_attempt_current
+
+        payload = json.dumps(validate_runtime_versions(runtime), sort_keys=True)
+        if (
+            guard.step_key != "embed-search"
+            or type(batch_attempt_number) is not int
+            or not 1 <= batch_attempt_number <= 2
+        ):
+            raise ConflictingWriteError("search execution requires embedding attempt")
+        with self.store._transaction() as connection:
+            _verify_attempt_current(connection, job_id, guard.step_key, guard)
+            batch = connection.execute(
+                """SELECT b.* FROM search_batches b JOIN index_versions i
+                   ON i.id=b.index_version_id JOIN jobs j
+                   ON j.source_id=i.source_id AND j.source_version_id=i.source_version_id
+                   AND j.extraction_version_id=i.extraction_version_id
+                   WHERE j.id=? AND b.index_version_id=? AND b.ordinal=?""",
+                (job_id, index_id, ordinal),
+            ).fetchone()
+            if batch is None or batch["complete"] or batch["attempts"] != batch_attempt_number:
+                raise ConflictingWriteError("search execution attempt changed")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("search batch deadline expired")
+            existing = connection.execute(
+                "SELECT job_id,step_key,step_attempt_number,runtime_json"
+                " FROM search_batch_executions WHERE index_version_id=? AND ordinal=?"
+                " AND batch_attempt_number=?",
+                (index_id, ordinal, batch_attempt_number),
+            ).fetchone()
+            values = (job_id, guard.step_key, guard.expected_attempt_number, payload)
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ConflictingWriteError("search execution already has another owner")
+                return
+            connection.execute(
+                "INSERT INTO search_batch_executions VALUES(?,?,?,?,?,?,?,?)",
+                (index_id, ordinal, batch_attempt_number, *values, utc_timestamp()),
+            )
+            if time.monotonic() >= deadline:
+                raise TimeoutError("search batch deadline expired")
+
     def commit_batch(
         self,
         job_id: str,
@@ -379,6 +433,7 @@ class SearchStorage:
         *,
         search_input_sha256: str | None = None,
         deadline: float | None = None,
+        execution_attempt: int | None = None,
     ) -> None:
         from core.persistence.store import _verify_attempt_current
 
@@ -420,6 +475,22 @@ class SearchStorage:
                 ):
                     raise ConflictingWriteError("search batch already has different vectors")
                 return
+            if guard.step_key == "embed-search":
+                receipt = connection.execute(
+                    "SELECT 1 FROM search_batch_executions WHERE index_version_id=?"
+                    " AND ordinal=? AND batch_attempt_number=? AND job_id=?"
+                    " AND step_key=? AND step_attempt_number=?",
+                    (
+                        index_id,
+                        ordinal,
+                        execution_attempt,
+                        job_id,
+                        guard.step_key,
+                        guard.expected_attempt_number,
+                    ),
+                ).fetchone()
+                if receipt is None or batch["attempts"] != execution_attempt:
+                    raise ConflictingWriteError("search execution receipt missing or stale")
             for chunk_id, blob in zip(chunk_ids, vectors, strict=True):
                 row = connection.execute(
                     "SELECT row_id FROM search_rows WHERE chunk_id=? AND index_version_id=?",
@@ -659,6 +730,7 @@ def purge_search(
             connection.execute("DELETE FROM search_vectors WHERE rowid=?", (row[0],))
             connection.execute("DELETE FROM search_text_inputs WHERE row_id=?", (row[0],))
         for table in (
+            "search_batch_executions",
             "profile_search_publications",
             "search_components",
             "search_batches",

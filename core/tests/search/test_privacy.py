@@ -107,7 +107,14 @@ def recorded_session(sessions, worker):
 def response_worker(profile, payload, phase="document"):
     body = ""
     if phase != "load":
-        ready = {"type": "ready", "manifest": profile.identity, "request": 0}
+        from core.search.provenance import runtime_versions
+
+        ready = {
+            "type": "ready",
+            "manifest": profile.identity,
+            "request": 0,
+            "runtime": runtime_versions(),
+        }
         body += f"print(json.dumps({ready!r}),flush=True)\n"
         body += "request=json.loads(sys.stdin.readline())\n"
         expected = QUERY if phase == "query" else SOURCE
@@ -198,7 +205,7 @@ def test_actual_worker_sanitizes_native_exceptions_and_discards_diagnostics(
 import sys
 from core.search import worker
 class FailingRuntime:
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         if {phase == "load"}:
             print({DIAGNOSTIC!r}, flush=True)
             raise {error_type}({DIAGNOSTIC!r})
@@ -212,11 +219,17 @@ raise SystemExit(worker.main())
 """
     sessions = []
     session_type = recorded_session(sessions, lambda _: [sys.executable, "-c", script])
-    with pytest.raises(EmbeddingFailure) as failure:
+    if phase == "load":
+        with pytest.raises(EmbeddingFailure) as failure:
+            session_type(tmp_path, profiles()["minilm-en"], load_timeout=5)
+    else:
+        # Construction must succeed: a constructor mismatch is not evidence that
+        # document/query exceptions were sanitized at their intended boundary.
         with session_type(tmp_path, profiles()["minilm-en"], load_timeout=5) as session:
-            session.embed(
-                [QUERY if phase == "query" else SOURCE], query=phase == "query", timeout=5
-            )
+            with pytest.raises(EmbeddingFailure) as failure:
+                session.embed(
+                    [QUERY if phase == "query" else SOURCE], query=phase == "query", timeout=5
+                )
     assert failure.value.code == "embedding_worker_failed"
     captured = capfd.readouterr()
     assert_private(str(failure.value), captured.out, captured.err, caplog.text)

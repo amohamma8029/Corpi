@@ -205,14 +205,14 @@ def seed_graph(
 
 
 def test_populated_upgrade_to_revision_fourteen_preserves_records(data_dir: Path) -> None:
-    migrations = load_migrations()
+    migrations = load_migrations()[:14]
     assert [migration.revision for migration in migrations] == list(range(1, 15))
 
     legacy = Database(DatabaseConfig(data_dir), migrations=migrations[:1])
     legacy.initialize()
     source_id, _ = seed_source(PersistenceStore(legacy))
 
-    upgraded = Database(DatabaseConfig(data_dir))
+    upgraded = Database(DatabaseConfig(data_dir), migrations=migrations)
     upgraded.initialize()
     store = PersistenceStore(upgraded)
     assert store.load_source(source_id).id == source_id

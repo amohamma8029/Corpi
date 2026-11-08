@@ -26,6 +26,7 @@ from core.persistence.models import new_id, utc_timestamp
 from core.persistence.store import PersistenceStore
 
 CORE_ROOT = Path(__file__).resolve().parents[2]
+HEAD_REVISION = len(load_migrations())
 
 
 def notebook_exists(connection: sqlite3.Connection, notebook_id: str) -> bool:
@@ -37,8 +38,8 @@ def notebook_exists(connection: sqlite3.Connection, notebook_id: str) -> bool:
 
 def migration_two(*, requires_backup: bool = False) -> Migration:
     return Migration(
-        15,
-        "0015_add_notebook_color.sql",
+        HEAD_REVISION + 1,
+        f"{HEAD_REVISION + 1:04d}_add_notebook_color.sql",
         "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';",
         requires_backup,
     )
@@ -49,7 +50,7 @@ def test_application_id_and_schema_fingerprint_are_stable(database: Database) ->
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x434F5250
         assert CORPI_APPLICATION_ID == 0x434F5250
         assert schema_fingerprint(connection) == (
-            "07634b6734dc76b6aa06d648d75cbdd91ba4b73e8827c47fe35f28a7aee4f091"
+            "d05470bf0e809e09e954569b5917ef7a2d673597fb1da614f7e761109d549cb6"
         )
 
 
@@ -65,7 +66,7 @@ def test_upgrade_preserves_existing_record_identity(database: Database) -> None:
 
     assert PersistenceStore(upgraded).load_notebook(notebook.id) == notebook
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION + 1
         color = connection.execute(
             "SELECT color FROM notebooks WHERE id=?",
             (notebook.id,),
@@ -77,29 +78,42 @@ def test_failed_risky_upgrade_keeps_rollback_and_recovery_snapshot(database: Dat
     store = PersistenceStore(database)
     notebook = store.create_notebook(new_id(), "Snapshot identity")
     migration_five = Migration(
-        15,
-        "0015_fail_for_test.sql",
+        HEAD_REVISION + 1,
+        f"{HEAD_REVISION + 1:04d}_fail_for_test.sql",
         "ALTER TABLE table_that_does_not_exist ADD COLUMN value TEXT;",
         requires_backup=True,
     )
     migrations = load_migrations() + (migration_five,)
     target = Database(database.config, migrations=migrations)
+    prior_snapshots = {
+        path: path.read_bytes() for path in database.config.snapshot_dir.glob("snapshot-r*.sqlite3")
+    }
 
     with pytest.raises(MigrationError):
         target.initialize()
 
-    snapshot = database.config.snapshot_dir / "snapshot-r0014.sqlite3"
+    snapshot = database.config.snapshot_dir / f"snapshot-r{HEAD_REVISION:04d}.sqlite3"
     assert snapshot.is_file()
     assert snapshot.is_relative_to(database.config.data_dir)
-    assert list(database.config.snapshot_dir.glob("snapshot-r*.sqlite3")) == [snapshot]
+    assert set(database.config.snapshot_dir.glob("snapshot-r*.sqlite3")) == {
+        *prior_snapshots,
+        snapshot,
+    }
+    assert all(path.read_bytes() == contents for path, contents in prior_snapshots.items())
     with sqlite3.connect(snapshot) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION
         assert notebook_exists(connection, notebook.id)
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 14
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == HEAD_REVISION
+        )
     with sqlite3.connect(database.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION
         assert notebook_exists(connection, notebook.id)
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 14
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == HEAD_REVISION
+        )
     if os.name != "nt":
         assert snapshot.stat().st_mode & 0o777 == 0o600
         assert database.config.snapshot_dir.stat().st_mode & 0o777 == 0o700
@@ -147,7 +161,7 @@ from core.persistence.database import Database, DatabaseConfig
 from core.persistence.migrations import Migration, load_migrations
 root = Path(__import__('sys').argv[1])
 sql = "ALTER TABLE notebooks ADD COLUMN color TEXT NOT NULL DEFAULT 'neutral';"
-migration = Migration(15, '0015_add_notebook_color.sql', sql)
+migration = Migration(len(load_migrations()) + 1, 'next_add_notebook_color.sql', sql)
 Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).initialize()
 """
     env = os.environ.copy()
@@ -166,8 +180,11 @@ Database(DatabaseConfig(root), migrations=load_migrations() + (migration,)).init
 
     assert [process.returncode for process in processes] == [0, 0], results
     with sqlite3.connect(database.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == HEAD_REVISION + 1
+        assert (
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == HEAD_REVISION + 1
+        )
         assert notebook_exists(connection, notebook.id)
 
 

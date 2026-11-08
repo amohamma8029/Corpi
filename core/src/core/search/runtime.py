@@ -27,6 +27,27 @@ def masked_mean_pool(embeddings, attention_mask):
     return sums / counts
 
 
+def _legacy_normalized_embeddings(embeddings, attention_mask, pooling: str):
+    """Keep the FastEmbed 0.8.1 contract encoded in immutable model identities.
+
+    Preserve its reduction order and float64 mean output, including normalization
+    before vector_bytes. FastEmbed 0.9.1 changes the reduction and casts earlier.
+    The tiled mask deliberately retains the old memory cost, not a new algorithm.
+    """
+    import numpy as np
+
+    if pooling == "cls":
+        pooled = embeddings[:, 0]
+    elif pooling in {"mean", "masked-mean"} and attention_mask is not None:
+        mask = np.expand_dims(attention_mask, axis=-1).astype(np.int64)
+        mask = np.tile(mask, (1, 1, embeddings.shape[-1]))
+        pooled = np.sum(embeddings * mask, axis=1) / np.maximum(np.sum(mask, axis=1), 1e-9)
+    else:
+        raise ValueError("runtime_mismatch")
+    norm = np.linalg.norm(pooled, ord=2, axis=1, keepdims=True)
+    return pooled / np.maximum(norm, 1e-12)
+
+
 def vector_bytes(values: Sequence[float], dimensions: int) -> bytes:
     if len(values) != dimensions or not all(
         isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values
@@ -163,7 +184,11 @@ class EmbeddingRuntime:
     ) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         verify_installation(path, profile)
-        if version("fastembed") != "0.8.1":
+        if (
+            version("fastembed") != "0.9.1"
+            or profile.runtime != "fastembed==0.8.1"
+            or profile.pooling not in {"cls", "mean", "masked-mean"}
+        ):
             raise ValueError("runtime_mismatch")
         self.profile = profile
         try:
@@ -178,12 +203,17 @@ class EmbeddingRuntime:
 
         class RestingCustomEmbedding(CustomTextEmbedding):
             def _load_onnx_model(self, *args, **kwargs):
-                # In pinned FastEmbed 0.8.1 the text loader only calls this base
-                # session loader, then loads a tokenizer. Keep that session path
-                # unchanged while reusing the tokenizer loaded before the session.
+                # The reviewed 0.9.1 base accepts additional_files too. Corpi uses
+                # verified owned directories, not Hub snapshots/cache relinking.
+                # Bypass the text loader to retain the legacy tokenizer settings.
                 OnnxModel._load_onnx_model(self, *args, **kwargs)
                 self.tokenizer = native_tokenizer
                 self.special_token_to_id = special_token_to_id
+
+            def _post_process_onnx_output(self, output, **kwargs):
+                return _legacy_normalized_embeddings(
+                    output.model_output, output.attention_mask, profile.pooling
+                )
 
             @classmethod
             def add_extra_session_options(cls, session_options, extra_options):

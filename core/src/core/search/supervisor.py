@@ -16,6 +16,7 @@ from typing import Any, TypedDict
 from core.search.memory import resident_bytes
 from core.search.profiles import ModelProfile
 from core.search.protocol import MAX_MESSAGE_BYTES, WORKER_ERROR_CODES
+from core.search.provenance import validate_runtime_versions
 from core.search.storage import validate_vector
 from core.search.worker_diagnostics import WorkerDiagnostics
 
@@ -154,8 +155,13 @@ class EmbeddingSession:
             self.worker_pid = started["pid"]
             self._next_sample = 0
             ready = self._receive(deadline)
+            runtime = ready.pop("runtime", None)
             if ready != {"type": "ready", "manifest": profile.identity, "request": 0}:
                 raise EmbeddingFailure("embedding_protocol_error")
+            try:
+                self.execution_runtime = validate_runtime_versions(runtime)
+            except ValueError:
+                raise EmbeddingFailure("runtime_mismatch") from None
         except BaseException as error:
             if self._diagnostic:
                 self._diagnostic.note_error("load", error)

@@ -108,6 +108,7 @@ def fake_backend(monkeypatch, native):
                 cuda=kwargs["cuda"],
                 device_id=None,
                 extra_session_options={"enable_cpu_mem_arena": kwargs["enable_cpu_mem_arena"]},
+                additional_files=[],
             )
             session = SimpleNamespace(
                 add_session_config_entry=lambda key, value: options.update({key: value})
@@ -124,7 +125,7 @@ def fake_backend(monkeypatch, native):
     monkeypatch.setattr(fastembed, "TextEmbedding", Text)
     monkeypatch.setattr(custom_text_embedding, "CustomTextEmbedding", Custom)
     monkeypatch.setattr("core.search.runtime.verify_installation", lambda *args: None)
-    monkeypatch.setattr("core.search.runtime.version", lambda name: "0.8.1")
+    monkeypatch.setattr("core.search.runtime.version", lambda name: "0.9.1")
 
     monkeypatch.setattr(OnnxModel, "_load_onnx_model", load_session)
     monkeypatch.setattr("fastembed.common.preprocessor_utils.load_tokenizer", load_tokenizer)
@@ -151,6 +152,7 @@ def test_runtime_reuses_backend_tokenizer_and_keeps_existing_model_options(monke
         "cuda": False,
         "device_id": None,
         "extra_session_options": {"enable_cpu_mem_arena": True},
+        "additional_files": [],
     }
     assert native.padding == padding and native.truncation is None
     assert options["threads"] == 2 and options["providers"] == ["CPUExecutionProvider"]
