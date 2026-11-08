@@ -11,6 +11,7 @@ from core.jobs.runner import PermanentStepFailure, StepCommitContext, StepContex
 from core.persistence.models import AttemptGuard
 from core.persistence.store import PersistenceStore
 from core.search import preparation
+from core.search.provenance import runtime_versions
 
 
 class Clock:
@@ -292,6 +293,7 @@ def test_runner_preparation_wall_including_handoffs_and_checkpoints_matches_char
     class Session:
         load_seconds = 1
         peak_bytes = 1024
+        execution_runtime = runtime_versions()
 
         def __init__(self, *args, **kwargs):
             clock.advance(1)

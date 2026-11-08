@@ -90,11 +90,13 @@ def test_real_child_receives_only_the_explicit_choice(tmp_path, selected, monkey
     expected = "'1'" if selected else "None"
     body = f"""
 import json,os,sys,time
+from core.search.provenance import runtime_versions
 started = {{'type':'started','manifest':sys.argv[1], 'request':0,'pid':os.getpid()}}
 print(json.dumps(started),flush=True)
 assert os.environ.get('OPENBLAS_NUM_THREADS') == {expected}
 assert 'OMP_NUM_THREADS' not in os.environ and 'MKL_NUM_THREADS' not in os.environ
-print(json.dumps({{'type':'ready','manifest':sys.argv[1],'request':0}}),flush=True)
+print(json.dumps({{'type':'ready','manifest':sys.argv[1],'request':0,
+                  'runtime':runtime_versions()}}),flush=True)
 time.sleep(30)
 """
     profile = profiles()["minilm-en"]

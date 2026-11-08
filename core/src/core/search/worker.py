@@ -10,6 +10,7 @@ from pathlib import Path
 
 from core.search.profiles import profiles
 from core.search.protocol import MAX_MESSAGE_BYTES, WORKER_ERROR_CODES
+from core.search.provenance import runtime_versions
 from core.search.runtime import EmbeddingRuntime
 
 
@@ -32,7 +33,14 @@ def main() -> int:
                 memory_arena=not options or options[0] == "1",
                 stop_spinning=not options or options[1] == "1",
             )
-        emit({"type": "ready", "manifest": profile.identity, "request": 0})
+        emit(
+            {
+                "type": "ready",
+                "manifest": profile.identity,
+                "request": 0,
+                "runtime": runtime_versions(),
+            }
+        )
         while True:
             line = sys.stdin.buffer.readline(MAX_MESSAGE_BYTES + 1)
             if not line:

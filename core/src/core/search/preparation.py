@@ -30,6 +30,7 @@ from core.persistence.models import AttemptGuard, JSONValue, new_id, utc_timesta
 from core.persistence.store import PersistenceStore, _verify_attempt_current
 from core.search.chunking import CHUNKER_VERSION, eligible_passages, make_chunks
 from core.search.profiles import ModelProfile, profiles
+from core.search.provenance import validate_runtime_versions
 from core.search.representation import CANONICAL, settings_for
 from core.search.runtime import InputTokenizer
 from core.search.storage import SearchStorage, generation_identity
@@ -639,6 +640,23 @@ def build_search_steps(
         load_seconds = 0.0
         batch_times = []
 
+        def record_execution(batch: sqlite3.Row, attempt: int, deadline: float) -> None:
+            if session is None:
+                raise ValueError("search_session_missing")
+            try:
+                runtime = validate_runtime_versions(session.execution_runtime)
+            except (AttributeError, ValueError):
+                raise PermanentStepFailure("runtime mismatch", code="runtime_mismatch") from None
+            storage.record_batch_execution(
+                context.job_id,
+                _guard(context),
+                identity,
+                batch["ordinal"],
+                attempt,
+                runtime,
+                deadline=deadline,
+            )
+
         def reserved_batch(batch: sqlite3.Row) -> None:
             """One durable lease covers validation through commit, never a DB lock.
 
@@ -706,6 +724,7 @@ def build_search_steps(
                             )
                             load_seconds += session.load_seconds
                         start = time.monotonic()
+                        record_execution(batch, attempts + 1, deadline)
                         vectors = session.embed(texts, timeout=remaining())
                         check_currency()
                         storage.commit_batch(
@@ -717,6 +736,7 @@ def build_search_steps(
                             vectors,
                             search_input_sha256=input_hash,
                             deadline=deadline,
+                            execution_attempt=attempts + 1,
                         )
                         batch_times.append(time.monotonic() - start)
                     peak = max(peak, session.peak_bytes)
@@ -821,7 +841,11 @@ def build_search_steps(
                             identity,
                         ) as allowance:
                             start = time.monotonic()
-                            vectors = session.embed(texts, timeout=max(0.01, allowance - 2))
+                            deadline = min(start + allowance, source_deadline)
+                            record_execution(batch, attempts + 1, deadline)
+                            vectors = session.embed(
+                                texts, timeout=max(0.01, deadline - time.monotonic() - 2)
+                            )
                             check_currency()
                             storage.commit_batch(
                                 context.job_id,
@@ -831,6 +855,8 @@ def build_search_steps(
                                 ids,
                                 vectors,
                                 search_input_sha256=search_input_sha256,
+                                deadline=deadline,
+                                execution_attempt=attempts + 1,
                             )
                             batch_times.append(time.monotonic() - start)
                         peak = max(peak, session.peak_bytes)
