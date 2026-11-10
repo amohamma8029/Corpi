@@ -27,6 +27,9 @@ async def _reject(send: Send, *, status: int, detail: str) -> None:
 
 
 async def _preflight(send: Send, origin: str, request_headers: str) -> None:
+    if not request_headers.isascii():
+        await _reject(send, status=400, detail="Invalid preflight request headers.")
+        return
     message: Message = {
         "type": "http.response.start",
         "status": 200,
@@ -88,8 +91,11 @@ class AuthMiddleware:
             return
 
         scheme, _, credentials = headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not secrets.compare_digest(
-            credentials.strip(), self.token
+        credentials = credentials.strip()
+        if (
+            scheme.lower() != "bearer"
+            or not credentials.isascii()
+            or not secrets.compare_digest(credentials, self.token)
         ):
             await _reject(send, status=401, detail=_MISSING_OR_INVALID_CREDENTIALS)
             return

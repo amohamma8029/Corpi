@@ -24,6 +24,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# Local agent notes and evidence (not project source)
+/.agent/
+
 # OS files
 .DS_Store
 Thumbs.db

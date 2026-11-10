@@ -6,3 +6,15 @@ onlyBuiltDependencies:
   - esbuild
   - edgedriver
   - geckodriver
+
+# Same-version security backports. See patches/README.md before changing these.
+patchedDependencies:
+  glob@10.5.0: patches/glob@10.5.0.patch
+  minimatch@9.0.9: patches/minimatch@9.0.9.patch
+  minimatch@10.2.6: patches/minimatch@10.2.6.patch
+  get-uri@6.0.5: patches/get-uri@6.0.5.patch
+
+# Native E2E attaches to installed drivers. Do not enable these unused paths.
+overrides:
+  "@puppeteer/browsers@2.13.2>extract-zip": "-"
+  "get-uri@6.0.5>basic-ftp": "-"
