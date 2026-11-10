@@ -41,6 +41,23 @@ def test_absent_origin_is_allowed_for_non_browser_clients(client: TestClient) ->
     assert response.status_code == 200
 
 
+def test_non_ascii_credentials_are_unauthorized(client: TestClient) -> None:
+    response = client.get("/health", headers={b"Authorization": b"Bearer invalid-\xff"})
+    assert response.status_code == 401
+
+
+def test_non_ascii_preflight_headers_are_rejected(client: TestClient) -> None:
+    response = client.options(
+        "/health",
+        headers={
+            b"Origin": ALLOWED_ORIGIN.encode("ascii"),
+            b"Access-Control-Request-Method": b"GET",
+            b"Access-Control-Request-Headers": b"authorization,\xff",
+        },
+    )
+    assert response.status_code == 400
+
+
 def test_allowed_response_carries_cors_headers(client: TestClient) -> None:
     response = client.get(
         "/health",

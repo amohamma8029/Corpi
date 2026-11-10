@@ -1,8 +1,23 @@
 # Corpi
 
-Corpi is a single-user, local-first desktop app for asking questions about imported sources and checking answers against cited evidence.
+Corpi is an in-development, single-user desktop app for working with imported sources.
+The current `main` branch includes notebooks, saved PDF imports, a PDF viewer, text
+extraction and readability review. Local Words/Meaning search is being developed
+separately in [PR #16](https://github.com/amohamma8029/Corpi/pull/16); it is not yet
+part of `main`.
 
-Notebooks and saved research stay on the user's device. Answer generation uses the user's configured external model provider.
+Notebooks and imported files stay on the user's device. Provider-generated answers
+and external model-provider configuration are planned, not implemented here.
+
+## Development status and limits
+
+Corpi is not a supported stable release. Native compatibility needs evidence for
+the particular commit and platform; a unit-test or build pass does not replace it.
+Supervised PDF parsing and resource limits are not an OS security sandbox for
+hostile files. A user-facing backup/restore feature is deferred to Milestone 2.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and safe test data, and
+[SECURITY.md](SECURITY.md) for private reporting and current dependency limitations.
 
 ## Repository layout
 
@@ -69,9 +84,10 @@ Environment overrides are read by the core at startup:
 | `CORPI_PDF_STAGING_AGE_SECONDS` | `86400` | Minimum idle age before unowned staging can be cleaned. |
 | `CORPI_MAINTENANCE_INTERVAL_SECONDS` | `3600` | Existing local maintenance interval. |
 
-Original-PDF import and viewing are implemented before extraction. The source remains available
-to inspect while `pdf-extract` waits for M1.5's parser and readability steps; it doesn't become
-searchable until the required extraction and indexing work publishes readiness.
+Original-PDF import and viewing remain available while the supervised `pdf-extract`
+job parses text and records readability results. The UI supports reviewing partial
+extractions. Extraction alone does not provide search; the separate search work
+must publish its required extraction and indexing readiness before querying it.
 
 ### macOS Python and SQLite
 
@@ -168,5 +184,13 @@ changing core endpoints.
 ## Communication security
 
 The core binds to 127.0.0.1 on an OS-assigned port and requires a bearer token issued fresh
-per launch. Requests must pass `Origin` and `Host` validation. The token is a credential:
-whoever holds it can spend the user's model-API budget under BYOK, so it is never persisted.
+per launch. Requests must pass `Origin` and `Host` validation. The token authorizes
+local API access and must not be shared or persisted. Provider spending is planned
+functionality, not an endpoint available on this branch.
+
+## License
+
+Corpi's own source code is available under the [MIT license](LICENSE).
+Third-party dependencies, models, fonts and other third-party assets retain their
+own licenses and redistribution requirements; Corpi's MIT license does not replace
+those terms.

@@ -1,0 +1,207 @@
+diff --git a/dist/file.js b/dist/file.js
+--- a/dist/file.js
++++ b/dist/file.js
+@@ -16,6 +16,7 @@
+ const file = async ({ href: uri }, opts = {}) => {
+     const { cache, flags = 'r', mode = 438, // =0666
+      } = opts;
++    let fdHandle;
+     try {
+         // Convert URI → Path
+         const filepath = (0, url_1.fileURLToPath)(uri);
+@@ -22,9 +23,7 @@
+         debug('Normalized pathname: %o', filepath);
+         // `open()` first to get a file descriptor and ensure that the file
+         // exists.
+-        const fdHandle = await fs_1.promises.open(filepath, flags, mode);
+-        // extract the numeric file descriptor
+-        const fd = fdHandle.fd;
++        fdHandle = await fs_1.promises.open(filepath, flags, mode);
+         // store the stat object for the cache.
+         const stat = await fdHandle.stat();
+         // if a `cache` was provided, check if the file has not been modified
+@@ -32,17 +31,17 @@
+-            await fdHandle.close();
+             throw new notmodified_1.default();
+         }
+-        // `fs.ReadStream` takes care of calling `fs.close()` on the
+-        // fd after it's done reading
++        // Retain the FileHandle so stream cleanup updates its ownership too.
++        // A bare numeric fd would leave the handle eligible for a second close.
+         const rs = (0, fs_1.createReadStream)(filepath, {
+             autoClose: true,
+             ...opts,
+-            fd,
++            fd: fdHandle,
+         });
+         rs.stat = stat;
+         return rs;
+     }
+     catch (err) {
++        await fdHandle?.close();
+         if (err.code === 'ENOENT') {
+             throw new notfound_1.default();
+         }
+@@ -54,4 +53,3 @@
+ function isNotModified(prev, curr) {
+     return +prev.mtime === +curr.mtime;
+ }
+-//# sourceMappingURL=file.js.map
+\ No newline at end of file
+diff --git a/dist/index.js b/dist/index.js
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -8,14 +8,12 @@
+ // Built-in protocols
+ const data_1 = require("./data");
+ const file_1 = require("./file");
+-const ftp_1 = require("./ftp");
+ const http_1 = require("./http");
+ const https_1 = require("./https");
+ const debug = (0, debug_1.default)('get-uri');
+ exports.protocols = {
+     data: data_1.data,
+     file: file_1.file,
+-    ftp: ftp_1.ftp,
+     http: http_1.http,
+     https: https_1.https,
+ };
+@@ -54,4 +52,3 @@
+     return getter(url, opts);
+ }
+ exports.getUri = getUri;
+-//# sourceMappingURL=index.js.map
+\ No newline at end of file
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -6,7 +6,6 @@
+ export declare const protocols: {
+     data: GetUriProtocol<import("./data").DataOptions>;
+     file: GetUriProtocol<import("./file").FileOptions>;
+-    ftp: GetUriProtocol<import("./ftp").FTPOptions>;
+     http: GetUriProtocol<import("./http").HttpOptions>;
+     https: GetUriProtocol<import("./http").HttpOptions>;
+ };
+diff --git a/dist/ftp.js b/dist/ftp.js
+--- a/dist/ftp.js
++++ /dev/null
+@@ -1,93 +0,0 @@
+-"use strict";
+-var __importDefault = (this && this.__importDefault) || function (mod) {
+-    return (mod && mod.__esModule) ? mod : { "default": mod };
+-};
+-Object.defineProperty(exports, "__esModule", { value: true });
+-exports.ftp = void 0;
+-const basic_ftp_1 = require("basic-ftp");
+-const stream_1 = require("stream");
+-const path_1 = require("path");
+-const debug_1 = __importDefault(require("debug"));
+-const notfound_1 = __importDefault(require("./notfound"));
+-const notmodified_1 = __importDefault(require("./notmodified"));
+-const debug = (0, debug_1.default)('get-uri:ftp');
+-/**
+- * Returns a Readable stream from an "ftp:" URI.
+- */
+-const ftp = async (url, opts = {}) => {
+-    const { cache } = opts;
+-    const filepath = decodeURIComponent(url.pathname);
+-    let lastModified;
+-    if (!filepath) {
+-        throw new TypeError('No "pathname"!');
+-    }
+-    const client = new basic_ftp_1.Client();
+-    try {
+-        const host = url.hostname || url.host || 'localhost';
+-        const port = parseInt(url.port || '0', 10) || 21;
+-        const user = url.username
+-            ? decodeURIComponent(url.username)
+-            : undefined;
+-        const password = url.password
+-            ? decodeURIComponent(url.password)
+-            : undefined;
+-        await client.access({
+-            host,
+-            port,
+-            user,
+-            password,
+-            ...opts,
+-        });
+-        // first we have to figure out the Last Modified date.
+-        // try the MDTM command first, which is an optional extension command.
+-        try {
+-            lastModified = await client.lastMod(filepath);
+-        }
+-        catch (err) {
+-            // handle the "file not found" error code
+-            if (err.code === 550) {
+-                throw new notfound_1.default();
+-            }
+-        }
+-        if (!lastModified) {
+-            // Try to get the last modified date via the LIST command (uses
+-            // more bandwidth, but is more compatible with older FTP servers
+-            const list = await client.list((0, path_1.dirname)(filepath));
+-            // attempt to find the "entry" with a matching "name"
+-            const name = (0, path_1.basename)(filepath);
+-            const entry = list.find((e) => e.name === name);
+-            if (entry) {
+-                lastModified = entry.modifiedAt;
+-            }
+-        }
+-        if (lastModified) {
+-            if (isNotModified()) {
+-                throw new notmodified_1.default();
+-            }
+-        }
+-        else {
+-            throw new notfound_1.default();
+-        }
+-        const stream = new stream_1.PassThrough();
+-        const rs = stream;
+-        client.downloadTo(stream, filepath).then((result) => {
+-            debug(result.message);
+-            client.close();
+-        });
+-        rs.lastModified = lastModified;
+-        return rs;
+-    }
+-    catch (err) {
+-        client.close();
+-        throw err;
+-    }
+-    // called when `lastModified` is set, and a "cache" stream was provided
+-    function isNotModified() {
+-        if (cache?.lastModified && lastModified) {
+-            return +cache.lastModified === +lastModified;
+-        }
+-        return false;
+-    }
+-};
+-exports.ftp = ftp;
+-//# sourceMappingURL=ftp.js.map
+\ No newline at end of file
+diff --git a/dist/ftp.d.ts b/dist/ftp.d.ts
+--- a/dist/ftp.d.ts
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/// <reference types="node" />
+-import { AccessOptions } from 'basic-ftp';
+-import { Readable } from 'stream';
+-import { GetUriProtocol } from '.';
+-export interface FTPReadable extends Readable {
+-    lastModified?: Date;
+-}
+-export interface FTPOptions extends AccessOptions {
+-    cache?: FTPReadable;
+-}
+-/**
+- * Returns a Readable stream from an "ftp:" URI.
+- */
+-export declare const ftp: GetUriProtocol<FTPOptions>;
+diff --git a/dist/ftp.js.map b/dist/ftp.js.map
+--- a/dist/ftp.js.map
++++ /dev/null
+@@ -1 +0,0 @@
+-{"version":3,"file":"ftp.js","sourceRoot":"","sources":["../src/ftp.ts"],"names":[],"mappings":"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"}
+\ No newline at end of file
