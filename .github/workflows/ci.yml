@@ -59,6 +59,7 @@ jobs:
       - name: UI checks
         working-directory: desktop
         run: |
+          pnpm run check:security
           pnpm test
           pnpm build
           pnpm run check:api

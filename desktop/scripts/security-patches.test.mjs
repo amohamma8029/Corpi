@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import net from "node:net";
@@ -13,23 +14,40 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const desktop = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(new URL("../package.json", import.meta.url));
-// Follow real consumer edges, not pnpm's generated peer/patch directory names.
-const cli = require.resolve("@wdio/cli");
-// WDIO already depends on this resolver for import-only package exports.
-const { resolve } = await import(pathToFileURL(createRequire(cli).resolve("import-meta-resolve")).href);
-const from = (name, parent) => fileURLToPath(resolve(name, pathToFileURL(parent).href));
-const config = from("@wdio/config", cli);
-const glob = createRequire(config).resolve("glob");
-const minimatch9 = createRequire(glob).resolve("minimatch");
-const webdriver = from("webdriverio", cli);
-const archiver = from("archiver", webdriver);
-const readdirGlob = createRequire(archiver).resolve("readdir-glob");
-const minimatch10 = createRequire(readdirGlob).resolve("minimatch");
-const utils = from("@wdio/utils", cli);
-const browsers = createRequire(utils).resolve("@puppeteer/browsers");
-const proxy = createRequire(browsers).resolve("proxy-agent");
-const pac = createRequire(proxy).resolve("pac-proxy-agent");
-const getUriEntry = createRequire(pac).resolve("get-uri");
+
+function installationError(detail, cause) {
+  return new Error(
+    `Security checks require the locked, patched dependencies: ${detail}\n` +
+    "From the repository root, run: pnpm --dir desktop install --frozen-lockfile\n" +
+    "No amplification tests were started.", { cause });
+}
+
+async function resolveTestTools() {
+  try {
+    // Follow real consumer edges, not pnpm's generated peer/patch directory names.
+    const cli = require.resolve("@wdio/cli");
+    // WDIO already depends on this resolver for import-only package exports.
+    const { resolve } = await import(pathToFileURL(createRequire(cli).resolve("import-meta-resolve")).href);
+    const from = (name, parent) => fileURLToPath(resolve(name, pathToFileURL(parent).href));
+    const config = from("@wdio/config", cli);
+    const glob = createRequire(config).resolve("glob");
+    const minimatch9 = createRequire(glob).resolve("minimatch");
+    const webdriver = from("webdriverio", cli);
+    const archiver = from("archiver", webdriver);
+    const readdirGlob = createRequire(archiver).resolve("readdir-glob");
+    const minimatch10 = createRequire(readdirGlob).resolve("minimatch");
+    const utils = from("@wdio/utils", cli);
+    const browsers = createRequire(utils).resolve("@puppeteer/browsers");
+    const proxy = createRequire(browsers).resolve("proxy-agent");
+    const pac = createRequire(proxy).resolve("pac-proxy-agent");
+    const getUriEntry = createRequire(pac).resolve("get-uri");
+    return { cli, glob, minimatch9, minimatch10, webdriver, browsers, pac, getUriEntry };
+  } catch (cause) {
+    throw installationError("could not resolve the test-tool dependencies", cause);
+  }
+}
+
+const { cli, glob, minimatch9, minimatch10, webdriver, browsers, pac, getUriEntry } = await resolveTestTools();
 
 function moduleFile(entry, format) {
   return format === "commonjs" ? entry : path.join(path.dirname(entry), "../esm/index.js");
@@ -38,6 +56,78 @@ function moduleFile(entry, format) {
 async function moduleAt(entry, format) {
   return format === "commonjs" ? require(entry) : import(pathToFileURL(moduleFile(entry, format)).href);
 }
+
+// Reviewed patched-file fingerprints, not a substitute for the behavioral tests.
+// Update these alongside patch changes; see patches/README.md.
+const patchedFiles = [
+  ["glob@10.5.0 CommonJS", path.join(path.dirname(glob), "walker.js"),
+    "8dc8d70dda5219f6351d8267acf30bc17b0a97b353862db7edb8e234c4a38479"],
+  ["glob@10.5.0 ESM", path.join(path.dirname(moduleFile(glob, "esm")), "walker.js"),
+    "9e07bcdb1fe1ad47fd593cd9c89a1dc4e91d49e21392f19f9b62797e010852dd"],
+  ["minimatch@9.0.9 CommonJS", minimatch9,
+    "fe0b8b021737a57cb80467d261eb5da6fa8f4a2fa27ea230ee656591e6557df6"],
+  ["minimatch@9.0.9 ESM", moduleFile(minimatch9, "esm"),
+    "d07c175c5575980682c90950a1209cd126ebe9069eb7fc5b7b533080c3a75ad9"],
+  ["minimatch@10.2.6 CommonJS", minimatch10,
+    "287848814812667e45c2b3a8998ab7d50a5509b4c1bd3a05167f6bc1a84e0a71"],
+  ["minimatch@10.2.6 ESM", moduleFile(minimatch10, "esm"),
+    "e75554b52846ddbe3976cf3e75741e22b19d9e30b75918e32825b23adc300acf"],
+  ["get-uri@6.0.5 dispatch", getUriEntry,
+    "b88be9661ff8e441742d435ad892c6aef8842ec5095a7d1ec9153b64eea60cd1"],
+  ["get-uri@6.0.5 file reader", path.join(path.dirname(getUriEntry), "file.js"),
+    "eea3451fcc97c38ee0e204802877130266e04d0170496ab08943c09b5c24a9b8"],
+  ["get-uri@6.0.5 public types", path.join(path.dirname(getUriEntry), "index.d.ts"),
+    "e5b0c24ed5e120acfad397f41217bcd224ca6ce544eedb2389692c8ba0cdc171"],
+];
+
+function assertPatchedInstall() {
+  for (const [label, filename, expected] of patchedFiles) {
+    let source;
+    try {
+      source = fs.readFileSync(filename, "utf8").replaceAll("\r\n", "\n");
+    } catch (cause) {
+      throw installationError(`could not read ${label}`, cause);
+    }
+    if (createHash("sha256").update(source).digest("hex") !== expected) {
+      throw installationError(`${label} does not match the reviewed patch`);
+    }
+  }
+}
+
+// Stop stale installs before importing the affected code or registering stress tests.
+assertPatchedInstall();
+
+for (const failure of ["stale", "missing"]) {
+  test(`installation preflight: each ${failure} patched file fails promptly`, (t) => {
+    const readFile = fs.readFileSync;
+    for (const [index, [label, filename]] of patchedFiles.entries()) {
+      let reads = 0;
+      const missing = Object.assign(new Error("synthetic missing patched file"), { code: "ENOENT" });
+      t.mock.method(fs, "readFileSync", (file, ...options) => {
+        reads++;
+        if (file === filename) {
+          if (failure === "missing") throw missing;
+          return "synthetic stale dependency source\n";
+        }
+        return readFile(file, ...options);
+      });
+      assert.throws(assertPatchedInstall, (error) =>
+        error.message.includes(label) &&
+        error.message.includes("pnpm --dir desktop install --frozen-lockfile") &&
+        error.message.includes("No amplification tests were started.") &&
+        (failure !== "missing" || error.cause === missing));
+      assert.equal(reads, index + 1, "A failed preflight must not read later files");
+      t.mock.restoreAll();
+    }
+  });
+}
+
+test("installation preflight: CRLF-normalized reviewed sources are accepted", (t) => {
+  const readFile = fs.readFileSync;
+  t.mock.method(fs, "readFileSync", (...args) =>
+    readFile(...args).replaceAll("\r\n", "\n").replaceAll("\n", "\r\n"));
+  assert.doesNotThrow(assertPatchedInstall);
+});
 
 function fixture() {
   const parent = path.join(os.tmpdir(), "opencode");

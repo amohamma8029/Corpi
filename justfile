@@ -7,8 +7,8 @@ default:
 dev:
     Set-Location desktop; $env:CORPI_CORE_DIR = (Resolve-Path ..\core).Path; pnpm tauri dev
 
-# Run every fast suite: core tests/lint/types, UI unit tests, schema drift check.
-test: core ui schema-check
+# Run every fast suite: core checks, tooling patches, UI tests, schema drift.
+test: core security-patches ui schema-check
 
 # Core: pytest + Ruff (lint and format) + Pyright.
 [working-directory: 'core']
@@ -17,6 +17,11 @@ core:
     uv run ruff check .
     uv run ruff format --check .
     uv run pyright
+
+# Verify the installed tooling security patches before running stress tests.
+[working-directory: 'desktop']
+security-patches:
+    pnpm run check:security
 
 # UI unit tests (Vitest).
 [working-directory: 'desktop']
