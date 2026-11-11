@@ -8,6 +8,12 @@ a PDF sandbox or a security certification of Corpi. Run from the repository root
 pnpm --dir desktop run check:security
 ```
 
+This check also runs through `just test` and CI. Before importing the patched
+libraries or starting amplification tests, it verifies the resolved patched-file
+fingerprints, ignoring CRLF versus LF line endings. A stale or missing install
+fails with `pnpm --dir desktop install --frozen-lockfile` as the recovery command.
+The stress tests do not run when this preflight fails.
+
 Use the repository's pinned tools and a frozen lockfile. `pnpm-workspace.yaml`
 selects the four patches and two dependency removals; `pnpm-lock.yaml` records
 their hashes. Do not disable supply-chain checks or lifecycle restrictions to
@@ -100,6 +106,10 @@ unbounded amplification case is intentionally not run against vulnerable code.
 After changing a patch or parent dependency, recheck upstream applicability,
 installed bytes and lock hashes, preserved surviving versions/edges, public types,
 the Node suite, UI/build/schema/E2E typing and production WebDriver isolation.
+After verifying the actual patched bytes, update the corresponding source
+fingerprints in `scripts/security-patches.test.mjs`. The preflight deliberately
+rejects changed bytes; it does not replace the behavioral regression tests or
+independently prove that a new patch is correct.
 Rescan the resulting graph and reconsider the applicability findings above. Remove
 a patch only when the replacement supplies the fix and compatible behavior is
 verified. Native-platform compatibility remains a separate required check before

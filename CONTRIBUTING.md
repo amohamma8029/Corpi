@@ -15,18 +15,23 @@ tools and dependencies already installed, run from the repository root:
 just test
 ```
 
-This runs the core tests, lint/format/type checks, UI unit tests, and API schema
-drift check. It does not replace desktop builds or native E2E checks. See the
-README's native testing instructions for the relevant platform. These require
+This runs the core tests, lint/format/type checks, tooling security-patch checks,
+UI unit tests, and API schema drift check. CI also runs the security-patch check
+before its UI tests. These checks do not replace desktop builds or native E2E
+checks. See the README's native testing instructions for the relevant platform. These require
 explicit environment setup and use a dedicated synthetic test library.
 Report the exact commands and platform used, and preserve existing resource limits
 and failed evidence rather than changing them to make a check pass.
 
-After changing desktop dependencies or their local patches, also run:
+To run the security-patch check on its own, use:
 
 ```powershell
 pnpm --dir desktop run check:security
 ```
+
+If this reports stale or missing patched dependencies, run
+`pnpm --dir desktop install --frozen-lockfile` from the repository root, then
+rerun the check. Do not increase the test heap limit to work around an old install.
 
 Read [patch provenance and limitations](desktop/patches/README.md) before changing
 the exact patch selectors or restoring a restricted download path. This bounded
