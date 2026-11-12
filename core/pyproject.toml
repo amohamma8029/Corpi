@@ -1,6 +1,7 @@
 [project]
 name = "corpi-core"
 version = "0.1.0"
+license = "MIT"
 description = "Corpi local application core: API, ingestion, search, jobs, and providers."
 requires-python = ">=3.13"
 dependencies = [

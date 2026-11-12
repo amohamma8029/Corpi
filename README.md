@@ -115,7 +115,7 @@ Run from the repository root:
 | Command | What it does |
 | --- | --- |
 | `just dev` | Launch the desktop app in dev mode; the shell spawns, monitors, and shuts down the local core. |
-| `just test` | Core tests (pytest), lint (Ruff), types (Pyright), UI unit tests (Vitest), and the OpenAPI schema drift check. |
+| `just test` | Core tests (pytest), lint (Ruff), types (Pyright), tooling security-patch checks, UI unit tests (Vitest), and the OpenAPI schema drift check. |
 | `just core` | Core tests + Ruff + Pyright. |
 | `just ui` | UI unit tests. |
 | `just e2e` | Windows WebdriverIO + tauri-driver checks against the real window, including PDF import/viewer/worker, then an orphaned-core shutdown check. |
@@ -128,11 +128,22 @@ Run from the repository root:
 
 Core setup is `uv sync` inside `core/`; desktop setup is `pnpm install` inside `desktop/`. On macOS, set `UV_PYTHON` as shown above before syncing or launching the core.
 
-## Native viewer tests in CI
+## Checks and native viewer tests in CI
 
-The existing GitHub Actions matrix runs the shared viewer suite on Ubuntu/WebKitGTK and
-macOS/WKWebView, after the core, UI, build, and launcher checks. Ubuntu launches the app under
-Xvfb and D-Bus:
+GitHub Actions is configured to run core, UI, tooling security-patch, schema,
+Rust build and launcher checks on Ubuntu, macOS and Windows. Windows selects
+uv-managed Python using `core/.python-version` and checks the same SQLite minimum.
+Shared commands use Bash so a failed earlier check cannot be hidden by a later
+successful command on Windows.
+
+The shared native viewer suite runs on Ubuntu/WebKitGTK and macOS/WKWebView after
+those checks. Windows native viewer and search-specific checks remain separate
+requirements for [PR #16](https://github.com/amohamma8029/Corpi/pull/16); the
+Windows job here does not run them. See the
+[maintainer checklist](docs/maintainer-checklist.md#before-merging-search-pr-16).
+Configuration alone does not establish a passing hosted run or native compatibility.
+
+Ubuntu launches the app under Xvfb and D-Bus:
 
 ```sh
 xvfb-run -a --server-args="-screen 0 1280x1024x24" dbus-run-session -- pnpm --dir desktop run test:e2e

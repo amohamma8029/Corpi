@@ -9,16 +9,18 @@ commit and platform so maintainers can identify the relevant source.
 Do not put exploit details, credentials, private documents, or sensitive logs in a
 public issue or pull request.
 
-If this repository's **Security** tab offers **Report a vulnerability**, use it to
-send a private report:
+The reporting channel is GitHub private vulnerability reporting. Under
+**Security → Advisories**, use **Report a vulnerability** to send a private report:
 
 https://github.com/amohamma8029/Corpi/security/advisories/new
 
-Private reporting is not guaranteed to be enabled. If that option is unavailable,
-use an existing private contact with the repository owner. If you have none, open
-an issue containing only a request for a private security contact, with no
-vulnerability details or attachments. Wait for a private channel before sharing
-the report; an ordinary GitHub issue is not private.
+GitHub makes this feature available only for public repositories. Before
+announcing public access, maintainers must enable it, verify the private reporting
+form and confirm that report notifications reach a maintainer. Follow the
+[publication checklist](docs/maintainer-checklist.md#before-announcing-public-access).
+Until that is verified, do not post vulnerability details in an issue or pull
+request. There is no separate published security email address or response-time
+guarantee.
 
 In the private report, include the commit/version, operating system, expected and
 observed behavior, and minimal reproduction steps using synthetic or public data.
@@ -44,8 +46,11 @@ The desktop test tools use four exact-version local patches and two restricted
 download paths. See [patch provenance and limitations](desktop/patches/README.md)
 for upstream fixes, exact hashes, regression checks and recheck triggers. FTP PAC
 retrieval and Puppeteer's ZIP browser-unpacking path are deliberately unavailable;
-ordinary non-FTP proxy support remains. These are test-tool restrictions, not a
-product model-download feature; local model search is not implemented on `main`.
+ordinary non-FTP proxy support remains. These restrictions cover test-tool
+downloads, not application download paths. Adding a feature that downloads
+models or changes file, network or worker access requires a fresh security review.
+The [search merge checklist](docs/maintainer-checklist.md#before-merging-search-pr-16)
+includes that review and the accompanying documentation updates.
 
 Version-only scanners can still report patched glob/minimatch versions. The same
 record also explains the current-configuration findings for Mocha's serializer
