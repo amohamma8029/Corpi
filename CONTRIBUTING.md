@@ -40,6 +40,10 @@ platform verification.
 
 ## Safe test data and review
 
+Before announcing public access or merging search PR #16, follow the
+[maintainer checklist](docs/maintainer-checklist.md). It covers private reporting,
+security-document updates and the separate Windows CI/native requirements.
+
 - Use synthetic documents or explicitly public fixtures in a dedicated test library.
   Never point a test, benchmark, or unreviewed PR at your personal Corpi library.
 - Treat contributed code, build scripts, and documents as untrusted. Review them

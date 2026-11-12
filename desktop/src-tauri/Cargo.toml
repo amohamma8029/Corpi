@@ -1,6 +1,7 @@
 [package]
 name = "corpi-desktop"
 version = "0.1.0"
+license = "MIT"
 description = "Corpi desktop shell: launches and monitors the local core."
 edition = "2021"
 
