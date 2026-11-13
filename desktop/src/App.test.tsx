@@ -477,21 +477,33 @@ it("does not let an older import poll restore a trashed history file", async () 
   expect(within(history).queryByRole("button", { name: "Remove earlier import" })).toBeNull();
 });
 
-it.each(["trash", "reopen"])("clears existing search results when the source action is %s", async action => {
+it.each([
+  { action: "trash", mode: "words" },
+  { action: "trash", mode: "meaning" },
+  { action: "reopen", mode: "words" },
+  { action: "reopen", mode: "meaning" },
+] as const)("clears existing $mode search results when the source action is $action", async ({ action, mode }) => {
   vi.mocked(listNotebookSources).mockResolvedValue([source]);
   vi.mocked(getExtraction).mockResolvedValue({ ...partialExtraction,
     review: { state: "confirmed", generation: 1, decided_at: notebook.created_at } });
   vi.mocked(reopenExtractionReview).mockResolvedValue({ state: "pending", generation: 2, decided_at: null });
-  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode: "words", revision: "a".repeat(64), ready_sources: 1, results: [searchResult] });
-  render(<App />);
-  fireEvent.change(await screen.findByRole("searchbox"), { target: { value: "rainfall" } });
+  vi.mocked(searchNotebook).mockResolvedValue({ notebook_id: notebook.id, mode, revision: "a".repeat(64), ready_sources: 1, results: [searchResult] });
+  // Settle notebook selection and its query-reset effect before entering a query.
+  // Merely finding the input can resolve before those startup effects finish.
+  await act(async () => { render(<App />); });
+  await screen.findByRole("button", { name: "Review Again" });
+  const input = screen.getByRole("searchbox");
+  fireEvent.change(screen.getByRole("combobox", { name: "Search mode" }), { target: { value: mode } });
+  fireEvent.change(input, { target: { value: "rainfall" } });
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
   await screen.findByText(searchResult.text);
+  expect(searchNotebook).toHaveBeenCalledWith(connection, notebook.id, "rainfall", mode, expect.any(AbortSignal));
   if (action === "trash") vi.mocked(listNotebookSources).mockResolvedValue([]);
   fireEvent.click(screen.getByRole("button", { name: action === "trash" ? "Move source to trash" : "Review Again" }));
   if (action === "trash") await waitFor(() => expect(trashSource).toHaveBeenCalledWith(connection, source.id));
   else await waitFor(() => expect(reopenExtractionReview).toHaveBeenCalledWith(connection, partialExtraction.extraction_id));
   await waitFor(() => expect(screen.queryByText(searchResult.text)).toBeNull());
+  expect(input).toHaveProperty("value", "rainfall");
   expect(searchNotebook).toHaveBeenCalledTimes(1);
 });
 
