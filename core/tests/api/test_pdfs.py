@@ -1323,6 +1323,31 @@ async def test_total_upload_deadline_busy_slot_and_health_responsiveness(
 def test_finalization_timeout_invalidates_the_late_writer_and_keeps_recovery_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from types import SimpleNamespace
+
+    from core.ingest import service as ingest_module
+
+    clock = SimpleNamespace(now=0.0)
+    finalizing = False
+    finalization_timeouts = []
+
+    class UploadScheduler:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def wait_for(self, awaitable, timeout):
+            if finalizing:
+                assert await asyncio.to_thread(entered.wait, 5), "finalizer did not start"
+                finalization_timeouts.append(timeout)
+                clock.now += timeout
+                awaitable.cancel()
+                raise TimeoutError
+            return await awaitable
+
+    # File/SQLite scheduling must not consume the synthetic 350 ms upload budget
+    # before the test reaches the finalizer whose late write it is checking.
+    monkeypatch.setattr(ingest_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(ingest_module, "asyncio", UploadScheduler())
     database = Database(DatabaseConfig(tmp_path / "data"))
     database.initialize()
     store = PersistenceStore(database)
@@ -1337,6 +1362,15 @@ def test_finalization_timeout_invalidates_the_late_writer_and_keeps_recovery_pla
     release = threading.Event()
     worker_returned = threading.Event()
     original_finish = store.finish_pdf_acquisition
+    original_finalize = ingest._finalize_with_deadline
+
+    async def finalize_with_controlled_timeout(*args, **kwargs):
+        nonlocal finalizing
+        finalizing = True
+        try:
+            return await original_finalize(*args, **kwargs)
+        finally:
+            finalizing = False
 
     def pause_finalization(*args, **kwargs):
         entered.set()
@@ -1347,6 +1381,7 @@ def test_finalization_timeout_invalidates_the_late_writer_and_keeps_recovery_pla
             worker_returned.set()
 
     monkeypatch.setattr(store, "finish_pdf_acquisition", pause_finalization)
+    monkeypatch.setattr(ingest, "_finalize_with_deadline", finalize_with_controlled_timeout)
     with TestClient(app, base_url="http://127.0.0.1") as client:
         acquisition = client.post(
             f"/notebooks/{notebook.id}/pdf-acquisitions",
@@ -1359,6 +1394,7 @@ def test_finalization_timeout_invalidates_the_late_writer_and_keeps_recovery_pla
             content=minimal_pdf("late finalizer"),
         )
         assert entered.is_set()
+        assert finalization_timeouts == [ingest.limits.upload_total_seconds]
         assert response.status_code == 408
         assert response.json()["detail"]["code"] == "upload_timeout"
         staged = store.load_pdf_acquisition(acquisition["id"])
@@ -1367,6 +1403,11 @@ def test_finalization_timeout_invalidates_the_late_writer_and_keeps_recovery_pla
         assert staged.outcome_source_id is None
         release.set()
         assert worker_returned.wait(5)
+        late = store.load_pdf_acquisition(acquisition["id"])
+        assert late.state == "staged"
+        assert late.outcome_source_id is None
+        with database.connect() as connection:
+            assert connection.execute("SELECT count(*) FROM sources").fetchone()[0] == 0
 
         monkeypatch.setattr(store, "finish_pdf_acquisition", original_finish)
         recovered = ingest.retry(acquisition["id"])
