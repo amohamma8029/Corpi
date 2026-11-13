@@ -7,10 +7,13 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Iterable
+from contextlib import closing
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
+from uuid import uuid4
 
 from core.persistence.errors import (
     DatabaseBusyError,
@@ -23,6 +26,7 @@ from core.persistence.models import utc_timestamp
 CORPI_APPLICATION_ID = 0x434F5250
 _MIGRATION_NAME = re.compile(r"^(\d{4})_([a-z0-9_]+)\.sql$")
 _HISTORY_TABLE = "schema_migrations"
+_SNAPSHOT_SECONDS = 300
 _HISTORY_SQL = """CREATE TABLE schema_migrations (
     revision INTEGER PRIMARY KEY CHECK (revision > 0),
     name TEXT NOT NULL UNIQUE CHECK (length(name) > 0),
@@ -57,7 +61,12 @@ def load_migrations() -> tuple[Migration, ...]:
         match = _MIGRATION_NAME.fullmatch(resource.name)
         if match:
             migrations.append(
-                Migration(int(match.group(1)), resource.name, resource.read_text(encoding="utf-8"))
+                Migration(
+                    int(match.group(1)),
+                    resource.name,
+                    resource.read_text(encoding="utf-8"),
+                    requires_backup=int(match.group(1)) == 15,
+                )
             )
     return validate_migrations(migrations)
 
@@ -213,7 +222,8 @@ def apply_migrations(
                     after_snapshot = validate_database_history(connection, migrations)
                     if after_snapshot != current:
                         connection.execute("COMMIT")
-                        _discard_snapshot(snapshot_dir, current)
+                        # Keep the owned recovery copy even if another initializer
+                        # advanced the database while SQLite was backing it up.
                         continue
                 if current != migration.revision - 1:
                     raise UnsupportedSchemaError("database revision changed unexpectedly")
@@ -280,41 +290,53 @@ def _make_recovery_snapshot(
     snapshot_dir: Path,
     revision: int,
 ) -> Path:
+    if snapshot_dir.is_symlink() or snapshot_dir.is_junction():
+        raise MigrationError("unsafe recovery snapshot directory")
     snapshot_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         snapshot_dir.chmod(0o700)
     except OSError:
         pass
-    destination_path = snapshot_dir / f"snapshot-r{revision:04d}.sqlite3"
-    temporary_path = snapshot_dir / f"snapshot-r{revision:04d}.sqlite3.pending"
-    temporary_path.unlink(missing_ok=True)
+    identifier = uuid4().hex
+    temporary_path = snapshot_dir / f"snapshot-r{revision:04d}-{identifier}.sqlite3.pending"
     descriptor = os.open(temporary_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     os.close(descriptor)
-    destination_connection = sqlite3.connect(
-        f"{temporary_path.as_uri()}?mode=rw",
-        uri=True,
-    )
+    deadline = time.monotonic() + _SNAPSHOT_SECONDS
+
+    def check_progress(_status: int, _remaining: int, _total: int) -> None:
+        if time.monotonic() >= deadline:
+            raise MigrationError("database recovery snapshot timed out")
+
     try:
-        connection.backup(destination_connection)
-    except sqlite3.Error as error:
-        destination_connection.close()
+        with closing(
+            sqlite3.connect(f"{temporary_path.as_uri()}?mode=rw", uri=True)
+        ) as destination:
+            connection.backup(destination, pages=256, progress=check_progress)
+            # Another initializer may have advanced the source before the backup.
+            # Label the copy by its own revision, not a stale caller read.
+            copied_revision = int(destination.execute("PRAGMA user_version").fetchone()[0])
+    except BaseException as error:
         temporary_path.unlink(missing_ok=True)
-        translated = translate_sqlite_error(error)
-        if isinstance(translated, DatabaseBusyError):
-            raise translated from error
-        raise MigrationError("database recovery snapshot failed") from error
-    else:
-        destination_connection.close()
+        if isinstance(error, sqlite3.Error):
+            translated = translate_sqlite_error(error)
+            if isinstance(translated, DatabaseBusyError):
+                raise translated from error
+            raise MigrationError("database recovery snapshot failed") from error
+        raise
     try:
         temporary_path.chmod(0o600)
     except OSError:
         pass
-    temporary_path.replace(destination_path)
-    for existing in snapshot_dir.glob("snapshot-r*.sqlite3"):
-        if existing != destination_path:
-            existing.unlink(missing_ok=True)
+    try:
+        # Publish without replacing a prior recovery copy, including a racing one.
+        destination_path = snapshot_dir / f"snapshot-r{copied_revision:04d}.sqlite3"
+        try:
+            os.link(temporary_path, destination_path)
+        except FileExistsError:
+            destination_path = (
+                snapshot_dir / f"snapshot-r{copied_revision:04d}-{identifier}.sqlite3"
+            )
+            os.link(temporary_path, destination_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return destination_path
-
-
-def _discard_snapshot(snapshot_dir: Path, revision: int) -> None:
-    (snapshot_dir / f"snapshot-r{revision:04d}.sqlite3").unlink(missing_ok=True)

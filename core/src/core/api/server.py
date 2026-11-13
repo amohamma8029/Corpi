@@ -17,6 +17,10 @@ from core.persistence.database import Database, DatabaseConfig, verify_sqlite_ru
 from core.persistence.errors import PersistenceError
 from core.persistence.models import new_id
 from core.persistence.store import PersistenceStore
+from core.search.handoff import SearchCoordinator
+from core.search.install import ModelSetupService
+from core.search.preparation import build_search_steps
+from core.search.switching import NotebookModelService
 
 READY_MARKER = "CORPI_CORE_READY"
 PERSISTENCE_ERROR_MARKER = "CORPI_CORE_ERROR"
@@ -95,7 +99,18 @@ def main() -> None:
         owner_instance_id = f"core-{new_id()}"
         fingerprint_locks = FingerprintLockCoordinator()
         step_sets = register_pdf_extract_steps(store)
-        runner = JobRunner(store, step_sets, owner_instance_id=owner_instance_id)
+        models_directory = database_config.data_dir / "models"
+        step_sets["pdf-search"] = build_search_steps(store, models_directory)
+        search = SearchCoordinator(store, models_directory)
+        runner = JobRunner(
+            store,
+            step_sets,
+            owner_instance_id=owner_instance_id,
+            reconcile=search.reconcile,
+            claim_blocking_reason=search.claim_blocking_reason,
+        )
+        model_setup = ModelSetupService(store, notify=runner.notify)
+        notebook_models = NotebookModelService(store, notify=runner.notify)
         pdf_ingest = PdfIngestService(
             store,
             owner_instance_id,
@@ -117,6 +132,8 @@ def main() -> None:
             pdf_ingest=pdf_ingest,
             runner=runner,
             sweeper=sweeper,
+            model_setup=model_setup,
+            notebook_models=notebook_models,
         )
         config = uvicorn.Config(
             app,

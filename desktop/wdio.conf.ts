@@ -3,8 +3,14 @@ import { launcher as TauriLauncher, type TauriServiceOptions } from "@wdio/tauri
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
-const APPLICATION = path.resolve(`./src-tauri/target/release/corpi-desktop${process.platform === "win32" ? ".exe" : ""}`);
+import { windowsAttachment } from "./scripts/windows-webdriver.mjs";
+
+const APPLICATION = process.env.CORPI_E2E_BINARY
+  ?? path.resolve(`./src-tauri/target/release/corpi-desktop${process.platform === "win32" ? ".exe" : ""}`);
+if (!path.isAbsolute(APPLICATION)) throw new Error("CORPI_E2E_BINARY must be an absolute test binary path");
 const embedded = process.env.CORPI_E2E_PROVIDER === "embedded";
+const attachment = process.platform === "win32" && !embedded ? windowsAttachment(process.env) : null;
+const modelDownloads = process.env.CORPI_RUN_MODEL_DOWNLOAD === "1";
 const results = process.env.CORPI_E2E_RESULTS ?? path.resolve("e2e-results");
 mkdirSync(results, { recursive: true });
 const launcherOptions: TauriServiceOptions = {
@@ -27,13 +33,14 @@ export const config: WebdriverIO.Config = {
   logLevel: "warn",
   outputDir: path.join(results, "logs"),
   framework: "mocha",
-  mochaOpts: { timeout: 180000, bail: true },
+  mochaOpts: { timeout: process.env.CORPI_READINESS_CASE ? 45 * 60 * 1000
+    : modelDownloads || process.env.CORPI_RUN_INSTALLED_MODEL_E2E === "1" ? 25 * 60 * 1000 : 180000, bail: true },
   reporters: ["spec"],
   waitforTimeout: 15000,
   connectionRetryCount: 3,
   connectionRetryTimeout: 30000,
   hostname: "127.0.0.1",
-  port: embedded ? 4445 : 4444,
+  port: attachment?.port ?? (embedded ? 4445 : 4444),
   // Only app/driver ownership is needed. The full worker service installs IPC
   // window-management/mocking hooks, which require an additional bridge plugin.
   services: embedded ? [launcherService] : [],
@@ -41,10 +48,16 @@ export const config: WebdriverIO.Config = {
     {
       // tauri-driver preserves browserName on Linux; WebKitWebDriver rejects
       // "wry". Let it select its native browser, as in Tauri's manual example.
-      ...(process.platform === "linux" && !embedded ? {} : { browserName: "wry" }),
-      "tauri:options": {
-        application: APPLICATION,
-      },
+      ...(attachment ? {
+        browserName: "webview2",
+        "ms:edgeOptions": { debuggerAddress: attachment.debuggerAddress },
+      } : process.platform === "linux" && !embedded ? {} : { browserName: "wry" }),
+      // EdgeDriver's BiDi mapper can replace a loaded WebView2 page with about:blank.
+      // Keep Windows external sessions on the native driver's classic protocol.
+      ...(process.platform === "win32" && !embedded ? { "wdio:enforceWebDriverClassic": true } : {}),
+      // Windows attaches directly to the runner-owned app. Never pass a binary
+      // capability that could launch a second core if session creation retries.
+      ...(attachment ? {} : { "tauri:options": { application: APPLICATION } }),
     } as WebdriverIO.Capabilities,
   ],
   afterTest: async (test, _context, result) => {

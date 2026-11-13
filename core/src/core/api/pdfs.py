@@ -11,7 +11,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from core.ingest.service import PdfImportError, PdfIngestService
-from core.persistence.errors import PersistenceError
+from core.persistence.errors import DeletedPdfAcquisitionError, PersistenceError
 from core.persistence.models import PdfAcquisition
 from core.persistence.store import PersistenceStore
 
@@ -79,7 +79,7 @@ class TrashPayload(BaseModel):
 
 
 class ProcessingActionPayload(BaseModel):
-    job_id: str
+    job_id: str | None
     status: str
 
 
@@ -135,7 +135,11 @@ def _acquisition_payload(item: PdfAcquisition) -> AcquisitionPayload:
     )
 
 
-def _raise_pdf_error(error: PdfImportError) -> NoReturn:
+def _raise_pdf_error(error: PdfImportError | DeletedPdfAcquisitionError) -> NoReturn:
+    if isinstance(error, DeletedPdfAcquisitionError):
+        raise HTTPException(
+            status_code=409, detail={"code": error.code, "message": str(error)}
+        ) from error
     raise HTTPException(
         status_code=error.status,
         detail={"code": error.code, "message": error.detail},
@@ -180,6 +184,8 @@ def list_unfinished_acquisitions(notebook_id: str, request: Request) -> list[Acq
 def get_acquisition(acquisition_id: str, request: Request) -> AcquisitionPayload:
     try:
         item = _store(request).load_pdf_acquisition(acquisition_id)
+    except DeletedPdfAcquisitionError as error:
+        _raise_pdf_error(error)
     except (PersistenceError, ValueError) as error:
         raise HTTPException(status_code=404, detail="PDF acquisition does not exist") from error
     return _acquisition_payload(item)
@@ -207,7 +213,7 @@ async def upload_pdf(acquisition_id: str, request: Request) -> AcquisitionPayloa
         )
     try:
         item = await _service(request).receive_and_finalize(acquisition_id, request)
-    except PdfImportError as error:
+    except (PdfImportError, DeletedPdfAcquisitionError) as error:
         _raise_pdf_error(error)
     return _acquisition_payload(item)
 
@@ -216,7 +222,7 @@ async def upload_pdf(acquisition_id: str, request: Request) -> AcquisitionPayloa
 def retry_pdf(acquisition_id: str, request: Request) -> AcquisitionPayload:
     try:
         item = _service(request).retry(acquisition_id)
-    except PdfImportError as error:
+    except (PdfImportError, DeletedPdfAcquisitionError) as error:
         _raise_pdf_error(error)
     return _acquisition_payload(item)
 
@@ -225,7 +231,7 @@ def retry_pdf(acquisition_id: str, request: Request) -> AcquisitionPayload:
 def cancel_pdf(acquisition_id: str, request: Request) -> AcquisitionPayload:
     try:
         item = _service(request).cancel(acquisition_id)
-    except PdfImportError as error:
+    except (PdfImportError, DeletedPdfAcquisitionError) as error:
         _raise_pdf_error(error)
     except (PersistenceError, ValueError) as error:
         raise HTTPException(

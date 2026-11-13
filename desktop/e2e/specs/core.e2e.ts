@@ -4,6 +4,8 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { pdfFixtureBytes, type PdfFixture } from "../pdf-fixtures";
+import { waitForSavedImport } from "../import-history";
+import { isStaleElementResult } from "../protocol-errors";
 
 interface ViewerSnapshot {
   filename: string;
@@ -46,8 +48,10 @@ const evidence: Record<string, unknown> = { fixtures: [], observations: [] };
 const firstPageColor = [51, 128, 204];
 const secondPageColor = [204, 51, 77];
 const rasterColor = [204, 136, 85];
+let lastObservation = "startup";
 
 function record(name: string, value: unknown) {
+  if (name !== "native-stale-command") lastObservation = name;
   (evidence.observations as unknown[]).push({ name, value });
   mkdirSync(results, { recursive: true });
   writeFileSync(path.join(results, "viewer.json"), `${JSON.stringify(evidence, null, 2)}\n`);
@@ -129,9 +133,7 @@ async function openPdf(filename: string) {
       break;
     }
   }
-  await browser.waitUntil(async () => (await $(".import-list").getText()).includes(filename), {
-    timeout: 15000, timeoutMsg: `${filename} was not listed in saved import history`,
-  });
+  await waitForSavedImport(filename);
   await $(".import-list").$("button=Open").click();
   await $("[data-testid='pdf-viewer']").waitForDisplayed();
   await $("[data-testid='pdf-viewer'] h2").waitForDisplayed();
@@ -166,8 +168,30 @@ async function closePdf(viaCancel = false) {
   }), { timeout: 5000, timeoutMsg: "Closing the viewer did not restore focus to its Open button" });
 }
 
+async function selectedNotebookMatches(title: string): Promise<boolean> {
+  // Query the live selection each time: an old option remains in the DOM, so
+  // a cached WebDriver handle to `option:checked` can keep reading old text.
+  return browser.execute((expected) => {
+    const select = document.querySelector<HTMLSelectElement>("#notebook-select");
+    return Boolean(select?.value && select.selectedOptions[0]?.textContent === expected);
+  }, title);
+}
+
 describe("Corpi native notebook and PDF workflow", () => {
   it("launches the real shell and core in the native webview", async () => {
+    // WDIO may refetch a stale handle successfully while WKWebView also reports
+    // its page-side exception globally. Retain the offending protocol operation;
+    // never clear/filter the global errors or relax the later empty-error check.
+    browser.on("result", ({ command, result }) => {
+      if (isStaleElementResult(result)) {
+        record("native-stale-command", { command, afterObservation: lastObservation });
+      }
+    });
+    if (process.platform === "win32" && process.env.CORPI_E2E_PROVIDER !== "embedded") {
+      const bidiSession = typeof browser.capabilities.webSocketUrl === "string";
+      record("native-session-protocol", { webdriverClassic: !bidiSession });
+      await expect(bidiSession).toBe(false);
+    }
     try {
       await browser.waitUntil(async () => {
         for (const handle of await browser.getWindowHandles()) {
@@ -219,9 +243,20 @@ describe("Corpi native notebook and PDF workflow", () => {
     });
     record("native-platform", { ...platform, capabilities: browser.capabilities });
     record("app-webview", { selected: await browser.getWindowHandle(), handles: await browser.getWindowHandles() });
-    await $("#new-notebook-title").setValue(`Native viewer ${randomUUID()}`);
+    const notebookTitle = `Native viewer ${randomUUID()}`;
+    // An older selection also satisfies /.+/. Prove that it is not mistaken
+    // for the newly requested notebook, then wait for the exact new selection.
+    const previousMatched = await selectedNotebookMatches(notebookTitle);
+    await expect(previousMatched).toBe(false);
+    await $("#new-notebook-title").setValue(notebookTitle);
     await $("#create-notebook").click();
+    await browser.waitUntil(() => selectedNotebookMatches(notebookTitle), {
+      timeout: 10000, timeoutMsg: "The newly created viewer notebook was not selected",
+    });
     await expect($("#notebook-select")).toHaveValue(/.+/);
+    record("created-notebook-selection", {
+      previousMatched, matchedRequested: await selectedNotebookMatches(notebookTitle),
+    });
   });
 
   it("paints distinct PDF pages, navigates, zooms, and releases the native worker", async () => {
@@ -407,4 +442,83 @@ describe("Corpi native notebook and PDF workflow", () => {
     await expect(security.workerErrors).toEqual([]);
     record("worker-and-csp", security);
   });
+  if (process.env.CORPI_RUN_MODEL_DOWNLOAD === "1" || process.env.CORPI_RUN_INSTALLED_MODEL_E2E === "1") it(
+    "prepares the default model, publishes PDF readiness, and switches the notebook model",
+    async () => {
+      const previousNotebook = await $("#notebook-select").getValue();
+      await $("#new-notebook-title").setValue(`Native search ${randomUUID()}`);
+      await $("#create-notebook").click();
+      await browser.waitUntil(async () => (await $("#notebook-select").getValue()) !== previousNotebook, {
+        timeout: 10000, timeoutMsg: "The new search notebook was not selected",
+      });
+      await browser.waitUntil(() => browser.execute(() => document.querySelectorAll(".source-list li").length === 0), {
+        timeout: 10000, timeoutMsg: "Previous notebook sources did not clear",
+      });
+      await $("#search-model").waitForDisplayed();
+      const settings = $("[aria-label='Local search models']");
+      const installed = (name: string) => browser.execute((expected) => {
+        const rows = document.querySelectorAll("[aria-label='Supported search models'] li");
+        return Array.from(rows).some((row) => row.querySelector("strong")?.textContent === expected
+          && row.querySelector("[role='status']")?.textContent === "installed");
+      }, name);
+      await expect($("#search-model")).toHaveValue("bekko-a8m-quint8-avx2");
+      const defaultName = "English, French and Arabic search";
+      if (!(await installed(defaultName))) {
+        if (process.env.CORPI_RUN_MODEL_DOWNLOAD !== "1") {
+          throw new Error("Installed-model native verification requires cached Bekko; downloads are disabled");
+        }
+        await settings.$(`li*=${defaultName}`).$("button*=Download").click();
+        record("native-model-download-started", { profile: "bekko-a8m-quint8-avx2" });
+        await browser.waitUntil(() => installed(defaultName), {
+          timeout: 620000, timeoutMsg: "Default Bekko model setup did not complete",
+        });
+      }
+      const fixture: PdfFixture = { filename: "native-search.pdf", kind: "search-text" };
+      const started = Date.now();
+      await importPdf(fixture);
+      await openPdf(fixture.filename);
+      await waitForPage(firstPageColor);
+      await closePdf();
+      const readyPdf = () => $(".import-list li[data-processing-state='ready'][data-current='true']");
+      await readyPdf().waitForDisplayed({
+        timeout: 90000, timeoutMsg: "Readable native PDF did not publish readiness",
+      });
+      await expect($("[aria-label='Search preparation']")).toHaveText(expect.stringContaining("Search data ready"));
+      record("native-search-ready", { importToUiReadyMs: Date.now() - started, fixture: fixture.filename });
+      await browser.saveScreenshot(path.join(results, "search-ready.png"));
+
+      if (process.env.CORPI_E2E_PROVIDER === "embedded") {
+        // The embedded provider's option click does not dispatch a native
+        // select change. Exercise the UI handler with an explicit DOM event.
+        await browser.execute(() => {
+          const select = document.querySelector<HTMLSelectElement>("#search-model")!;
+          select.value = "multilingual-e5";
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+      } else {
+        await $("#search-model").selectByAttribute("value", "multilingual-e5");
+      }
+      await browser.waitUntil(async () => (await settings.getText()).includes("Current search stays usable"), {
+        timeout: 10000, timeoutMsg: "Pending model choice did not explain preserved search",
+      });
+      await expect(readyPdf()).toBeDisplayed();
+      const alternative = settings.$("li*=Multilingual search");
+      if (!(await installed("Multilingual search"))) {
+        if (process.env.CORPI_RUN_MODEL_DOWNLOAD !== "1") {
+          throw new Error("Installed-model native verification requires cached E5; downloads are disabled");
+        }
+        await alternative.$("button*=Multilingual search").click();
+        record("native-model-download-started", { profile: "multilingual-e5" });
+      }
+      await browser.waitUntil(async () => (await settings.getAttribute("data-active-profile")) === "multilingual-e5", {
+        timeout: 700000, timeoutMsg: "Multilingual download and notebook rebuild did not activate",
+      });
+      await expect(readyPdf()).toBeDisplayed();
+      record("native-model-switch", { active: "multilingual-e5", originalRetained: true });
+      await browser.saveScreenshot(path.join(results, "model-switch-ready.png"));
+      await openPdf(fixture.filename);
+      await waitForPage(firstPageColor);
+      await closePdf();
+    },
+  );
 });

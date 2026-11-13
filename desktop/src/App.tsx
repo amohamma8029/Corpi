@@ -1,5 +1,8 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ModelSettings } from "./components/ModelSettings";
+import { SearchProgress } from "./components/SearchProgress";
+import { NotebookSearch } from "./components/NotebookSearch";
 
 import {
   cancelPdfAcquisition,
@@ -20,6 +23,7 @@ import {
   listPdfImports,
   Notebook,
   NotebookSource,
+  NotebookSearchResult,
   PdfAcquisition,
   PdfImport,
   reopenExtractionReview,
@@ -61,10 +65,21 @@ export function App() {
   const [acquisition, setAcquisition] = useState<PdfAcquisition | null>(null);
   const [savedAcquisitions, setSavedAcquisitions] = useState<PdfAcquisition[]>([]);
   const [extraction, setExtraction] = useState<ExtractionReport | null>(null);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const [processingBusy, setProcessingBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [viewerImport, setViewerImport] = useState<PdfImport | null>(null);
+  const [viewerPage, setViewerPage] = useState(1);
+  const [searchInvalidation, setSearchInvalidation] = useState(0);
+  const currentNotebookRef = useRef(selectedNotebookId);
+  currentNotebookRef.current = selectedNotebookId;
+  const viewerRequest = useRef(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectionSourceRef = useRef("");
+  const extractionRequest = useRef(0);
+  const reviewAction = useRef<number | null>(null);
+  const importsRequest = useRef(0);
+  const processingAction = useRef<number | null>(null);
   const nextIntentRef = useRef<{ intent: ImportIntent; sourceId?: string; acquisitionId?: string }>({ intent: "add" });
   const uploadControllerRef = useRef<AbortController | null>(null);
   const acquisitionIdRef = useRef("");
@@ -113,6 +128,8 @@ export function App() {
 
   useEffect(() => {
     setAcquisition(null);
+    ++viewerRequest.current;
+    setViewerImport(null);
     if (!connection || !selectedNotebookId) {
       setSources([]);
       setSavedAcquisitions([]);
@@ -142,18 +159,24 @@ export function App() {
   }, [connection, selectedNotebookId]);
 
   useEffect(() => {
+    selectionSourceRef.current = selectedSourceId;
+    ++extractionRequest.current;
+    ++importsRequest.current;
+    reviewAction.current = null;
+    processingAction.current = null;
+    setReviewBusy(false);
+    setProcessingBusy(false);
+    setExtraction(null);
+    setImports([]);
+  }, [selectedSourceId]);
+
+  useEffect(() => {
     if (!connection || !selectedSourceId) {
       setImports([]);
       return;
     }
     let cancelled = false;
-    void listPdfImports(connection, selectedSourceId)
-      .then((items) => {
-        if (!cancelled) setImports(items);
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled) setError(messageFor(cause));
-      });
+    void refreshImportsFor(selectedSourceId, () => cancelled);
     return () => {
       cancelled = true;
     };
@@ -170,43 +193,36 @@ export function App() {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [acquisition?.id, connection, uploading]);
 
+  // Polling returns a new array even when the underlying import state is unchanged.
+  // Refresh on actual transitions, not on every identical response object.
+  const importsRevision = imports.map((item) =>
+    `${item.id}:${item.state}:${item.is_current}:${item.is_pending}:${item.trashed}`,
+  ).join("|");
   useEffect(() => {
-    if (selectionSourceRef.current !== selectedSourceId) {
-      selectionSourceRef.current = selectedSourceId;
-      setExtraction(null);
-    }
     if (!connection || !selectedSourceId) {
       return;
     }
     let cancelled = false;
-    void getExtraction(connection, selectedSourceId)
-      .then((report) => {
-        if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(report);
-      })
-      .catch(() => {
-        if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(null);
-      });
+    void refreshExtractionFor(selectedSourceId, () => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [connection, selectedSourceId, imports]);
+  }, [connection, selectedSourceId, importsRevision]);
 
   const processingActive = imports.some((item) => !item.trashed && item.state === "pending");
   useEffect(() => {
     if (!connection || !selectedSourceId || !(processingActive || uploading)) return;
     let cancelled = false;
-    const timer = window.setInterval(() => {
-      void listPdfImports(connection, selectedSourceId)
-        .then((items) => {
-          if (!cancelled && selectionSourceRef.current === selectedSourceId) setImports(items);
-        })
-        .catch(() => undefined);
-      void getExtraction(connection, selectedSourceId)
-        .then((report) => {
-          if (!cancelled && selectionSourceRef.current === selectedSourceId) setExtraction(report);
-        })
-        .catch(() => undefined);
-    }, 2000);
+    let loading = false;
+    async function refresh() {
+      if (loading || cancelled) return;
+      loading = true;
+      try {
+        await Promise.all([refreshImportsFor(selectedSourceId, () => cancelled),
+        refreshExtractionFor(selectedSourceId, () => cancelled)]);
+      } finally { loading = false; }
+    }
+    const timer = window.setInterval(() => { void refresh(); }, 2000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -244,11 +260,7 @@ export function App() {
     setStorage(report);
     setSavedAcquisitions(attempts);
     if (nextSelected) {
-      void listPdfImports(connection, nextSelected)
-        .then((items) => {
-          if (selectionSourceRef.current === nextSelected) setImports(items);
-        })
-        .catch(() => undefined);
+      void refreshImportsFor(nextSelected);
       refreshExtractionFor(nextSelected);
     }
   }
@@ -268,45 +280,68 @@ export function App() {
     }
   }
 
-  function refreshExtractionFor(sourceId: string) {
-    if (!connection) return;
-    void getExtraction(connection, sourceId)
-      .then((report) => {
-        if (selectionSourceRef.current === sourceId) setExtraction(report);
-      })
-      .catch(() => {
-        if (selectionSourceRef.current === sourceId) setExtraction(null);
-      });
+  function applyImports(sourceId: string, items: PdfImport[]) {
+    if (selectionSourceRef.current !== sourceId) return;
+    setImports(items);
+    setSources(current => current.map(source => source.id === sourceId ? {
+      ...source,
+      current_import_id: items.find(item => item.is_current)?.id ?? null,
+      pending_import_id: items.find(item => item.is_pending)?.id ?? null,
+    } : source));
   }
 
-  async function decideReview(decision: "confirmed" | "declined") {
-    if (!connection || !extraction?.extraction_id || !extraction.review) return;
-    const targetId = extraction.extraction_id;
+  async function refreshImportsFor(sourceId: string, cancelled = () => false) {
+    if (!connection || processingAction.current !== null) return;
+    const request = ++importsRequest.current;
     try {
-      const review: ExtractionReview = await decideExtractionReview(connection, targetId, {
-        decision,
-        generation: extraction.review.generation,
-      });
-      setExtraction((current) =>
-        current?.extraction_id === targetId ? { ...current, review } : current,
-      );
-      setError(null);
+      const items = await listPdfImports(connection, sourceId);
+      if (!cancelled() && request === importsRequest.current) applyImports(sourceId, items);
     } catch (cause) {
-      setError(messageFor(cause));
+      if (!cancelled() && request === importsRequest.current && selectionSourceRef.current === sourceId) setError(messageFor(cause));
     }
   }
 
-  async function reviewAgain() {
-    if (!connection || !extraction?.extraction_id) return;
+  async function refreshExtractionFor(sourceId: string, cancelled = () => false) {
+    if (!connection || reviewAction.current !== null || processingAction.current !== null) return;
+    const request = ++extractionRequest.current;
+    await getExtraction(connection, sourceId)
+      .then((report) => {
+        if (!cancelled() && request === extractionRequest.current && selectionSourceRef.current === sourceId) setExtraction(report);
+      })
+      .catch(() => {
+        if (!cancelled() && request === extractionRequest.current && selectionSourceRef.current === sourceId) setExtraction(null);
+      });
+  }
+
+  async function updateReview(decision: "confirmed" | "declined" | "reopen") {
+    if (!connection || !extraction?.extraction_id || !extraction.review || reviewAction.current !== null || processingAction.current !== null) return;
+    // A review write owns this view until it settles. Older reads and actions
+    // cannot replace its generation, including after switching away and back.
+    const action = ++extractionRequest.current;
+    reviewAction.current = action;
+    setReviewBusy(true);
+    setSearchInvalidation(value => value + 1);
     const targetId = extraction.extraction_id;
+    const sourceId = extraction.source_id;
     try {
-      const review: ExtractionReview = await reopenExtractionReview(connection, targetId);
+      const review: ExtractionReview = decision === "reopen"
+        ? await reopenExtractionReview(connection, targetId)
+        : await decideExtractionReview(connection, targetId, { decision, generation: extraction.review.generation });
+      if (reviewAction.current !== action || selectionSourceRef.current !== sourceId) return;
       setExtraction((current) =>
         current?.extraction_id === targetId ? { ...current, review } : current,
       );
+      setSearchInvalidation(value => value + 1);
       setError(null);
     } catch (cause) {
-      setError(messageFor(cause));
+      if (reviewAction.current === action && selectionSourceRef.current === sourceId) {
+        setError(messageFor(cause));
+        reviewAction.current = null;
+        void refreshExtractionFor(sourceId);
+      }
+    } finally {
+      if (reviewAction.current === action) reviewAction.current = null;
+      if (selectionSourceRef.current === sourceId && reviewAction.current === null) setReviewBusy(false);
     }
   }
 
@@ -396,60 +431,87 @@ export function App() {
 
   async function removeEarlierImport(item: PdfImport) {
     const sourceId = selectedSourceId;
-    if (!connection || !sourceId || item.is_current || item.is_pending || item.trashed) return;
+    if (!connection || !sourceId || item.is_current || item.is_pending || item.trashed
+      || processingAction.current !== null || reviewAction.current !== null) return;
+    const action = ++importsRequest.current;
+    processingAction.current = action;
+    ++extractionRequest.current;
+    setProcessingBusy(true);
+    setSearchInvalidation(value => value + 1);
     try {
       await trashPdfImport(connection, sourceId, item.id);
-      const items = await listPdfImports(connection, sourceId);
-      setStorage(await storageReport(connection));
-      if (selectionSourceRef.current !== sourceId) return;
-      setImports(items);
-      refreshExtractionFor(sourceId);
+      if (processingAction.current !== action || selectionSourceRef.current !== sourceId) return;
+      setSearchInvalidation(value => value + 1);
+      const [items, report] = await Promise.all([listPdfImports(connection, sourceId), storageReport(connection)]);
+      if (processingAction.current !== action || selectionSourceRef.current !== sourceId) return;
+      applyImports(sourceId, items);
+      setStorage(report);
       setError(null);
     } catch (cause) {
-      setError(messageFor(cause));
+      if (processingAction.current === action && selectionSourceRef.current === sourceId) setError(messageFor(cause));
+    } finally {
+      if (processingAction.current === action) {
+        processingAction.current = null;
+        setProcessingBusy(false);
+        void refreshExtractionFor(sourceId);
+      }
     }
   }
 
-  async function retryProcessing(item: PdfImport) {
-    if (!connection) return;
+  async function updateProcessing(item: PdfImport, kind: "retry" | "cancel") {
+    if (!connection || processingAction.current !== null || reviewAction.current !== null) return;
+    const action = ++importsRequest.current;
+    processingAction.current = action;
+    ++extractionRequest.current;
+    setProcessingBusy(true);
+    if (kind === "cancel") setSearchInvalidation(value => value + 1);
     const sourceId = item.source_id;
     try {
-      await retryPdfProcessing(connection, sourceId, item.id);
+      await (kind === "cancel" ? cancelPdfProcessing : retryPdfProcessing)(connection, sourceId, item.id);
+      if (processingAction.current !== action || selectionSourceRef.current !== sourceId) return;
+      if (kind === "cancel") setSearchInvalidation(value => value + 1);
       const items = await listPdfImports(connection, sourceId);
-      if (selectionSourceRef.current !== sourceId) return;
-      setImports(items);
-      refreshExtractionFor(sourceId);
+      if (processingAction.current !== action || selectionSourceRef.current !== sourceId) return;
+      applyImports(sourceId, items);
       setError(null);
     } catch (cause) {
-      setError(messageFor(cause));
-    }
-  }
-
-  async function cancelProcessing(item: PdfImport) {
-    if (!connection) return;
-    const sourceId = item.source_id;
-    try {
-      await cancelPdfProcessing(connection, sourceId, item.id);
-      const items = await listPdfImports(connection, sourceId);
-      if (selectionSourceRef.current !== sourceId) return;
-      setImports(items);
-      refreshExtractionFor(sourceId);
-      setError(null);
-    } catch (cause) {
-      setError(messageFor(cause));
+      if (processingAction.current === action && selectionSourceRef.current === sourceId) setError(messageFor(cause));
+    } finally {
+      if (processingAction.current === action) {
+        processingAction.current = null;
+        setProcessingBusy(false);
+        void refreshExtractionFor(sourceId);
+      }
     }
   }
 
   async function removeSource(sourceId: string) {
     if (!connection || !selectedNotebookId) return;
+    setSearchInvalidation(value => value + 1);
     try {
       await trashSource(connection, sourceId);
+      setSearchInvalidation(value => value + 1);
       setViewerImport(null);
       await refreshNotebook(selectedNotebookId);
       setError(null);
     } catch (cause) {
       setError(messageFor(cause));
     }
+  }
+
+  async function openSearchResult(result: NotebookSearchResult, page: number) {
+    if (!connection || !result.import_id) return;
+    const notebook = selectedNotebookId;
+    const request = ++viewerRequest.current;
+    try {
+      const files = await listPdfImports(connection, result.source_id);
+      if (notebook !== currentNotebookRef.current || request !== viewerRequest.current) return;
+      const file = files.find((item) => item.id === result.import_id && item.source_version_id === result.source_version_id && !item.trashed);
+      if (!file) throw new Error("This saved PDF is no longer available. Search again.");
+      setViewerPage(page);
+      setViewerImport(file);
+      setError(null);
+    } catch (cause) { if (notebook === currentNotebookRef.current && request === viewerRequest.current) setError(messageFor(cause)); }
   }
 
   return (
@@ -499,6 +561,7 @@ export function App() {
               />
               <button id="create-notebook" type="submit" disabled={uploading}>Create notebook</button>
             </form>
+            <ModelSettings connection={connection} notebookId={selectedNotebookId} />
             {selectedNotebookId ? (
               <>
                 <button
@@ -540,6 +603,9 @@ export function App() {
           </aside>
 
           <section className="source-panel" aria-label="Notebook source">
+            <NotebookSearch connection={connection} notebookId={selectedNotebookId}
+              invalidationKey={searchInvalidation}
+              onOpen={(result, page) => void openSearchResult(result, page)} />
             {selectedSource ? (
               <>
                 <div className="source-heading">
@@ -560,10 +626,11 @@ export function App() {
                   </button>
                 </div>
                 <h3>Files</h3>
+                <SearchProgress connection={connection} sourceId={selectedSource.id} />
                 {imports.length ? (
                   <ul className="import-list" aria-label="PDF file history">
                     {imports.map((item) => (
-                      <li key={item.id} data-testid={`pdf-import-${item.id}`}>
+                      <li key={item.id} data-testid={`pdf-import-${item.id}`} data-processing-state={item.state} data-current={item.is_current}>
                         <div>
                           <strong>{item.filename}</strong>
                           <span>{formatBytes(item.size_bytes)} · {new Date(item.created_at).toLocaleString()}</span>
@@ -571,23 +638,23 @@ export function App() {
                         </div>
                         <button
                           type="button"
-                          onClick={(event) => { event.currentTarget.focus(); setViewerImport(item); }}
+                          onClick={(event) => { event.currentTarget.focus(); ++viewerRequest.current; setViewerPage(1); setViewerImport(item); }}
                           disabled={item.trashed}
                         >
                           Open
                         </button>
                         {!item.is_current && !item.is_pending && !item.trashed ? (
-                          <button type="button" onClick={() => void removeEarlierImport(item)}>
+                          <button type="button" disabled={processingBusy || reviewBusy} onClick={() => void removeEarlierImport(item)}>
                             Remove earlier import
                           </button>
                         ) : null}
                         {item.state === "failed" && !item.trashed ? (
-                          <button type="button" onClick={() => void retryProcessing(item)}>
+                          <button type="button" disabled={processingBusy || reviewBusy} onClick={() => void updateProcessing(item, "retry")}>
                             Retry processing
                           </button>
                         ) : null}
                         {item.state === "pending" && !item.trashed ? (
-                          <button type="button" onClick={() => void cancelProcessing(item)}>
+                          <button type="button" disabled={processingBusy || reviewBusy} onClick={() => void updateProcessing(item, "cancel")}>
                             Cancel processing
                           </button>
                         ) : null}
@@ -625,17 +692,17 @@ export function App() {
                     {extraction.review && extraction.extraction_id ? (
                       extraction.review.state === "pending" ? (
                         <div>
-                          <button type="button" onClick={() => void decideReview("confirmed")}>
+                          <button type="button" disabled={reviewBusy || processingBusy} onClick={() => void updateReview("confirmed")}>
                             Confirm
                           </button>
-                          <button type="button" onClick={() => void decideReview("declined")}>
+                          <button type="button" disabled={reviewBusy || processingBusy} onClick={() => void updateReview("declined")}>
                             Decline
                           </button>
                         </div>
                       ) : (
                         <div>
                           <p>Review: {extraction.review.state}</p>
-                          <button type="button" onClick={() => void reviewAgain()}>
+                          <button type="button" disabled={reviewBusy || processingBusy} onClick={() => void updateReview("reopen")}>
                             Review Again
                           </button>
                         </div>
@@ -687,8 +754,9 @@ export function App() {
             sourceId={viewerImport.source_id}
             importId={viewerImport.id}
             filename={viewerImport.filename}
+            initialPage={viewerPage}
             renderedPagePixelLimit={storage.rendered_page_pixel_limit}
-            onClose={() => setViewerImport(null)}
+            onClose={() => { ++viewerRequest.current; setViewerImport(null); }}
           />
         </Suspense>
       ) : null}
@@ -709,7 +777,7 @@ function formatBytes(bytes: number): string {
 function importStateLabel(item: PdfImport, source: NotebookSource): string {
   if (item.trashed) return "In trash; retained for 30 days";
   if (item.is_pending) return "Pending replacement";
-  if (item.is_current && item.state === "ready") return "Current PDF · ready for questions";
+  if (item.is_current && item.state === "ready") return "Current saved PDF · original available";
   if (item.is_current && item.state === "failed") {
     return `Current PDF · processing failed${item.failure_code ? ` (${item.failure_code})` : ""}; original is available`;
   }
@@ -736,5 +804,5 @@ function acquisitionStatus(item: PdfAcquisition, uploading: boolean): string {
   if (item.requires_upload) return "Select the PDF again; the interrupted upload did not save a complete file.";
   if (item.outcome_kind === "duplicate") return "This PDF is already in the notebook. Open the existing source.";
   if (item.outcome_kind === "unchanged") return "The selected PDF matches the current file; no replacement was needed.";
-  return "PDF saved. Text extraction will become available when M1.5 processing is connected.";
+  return "PDF saved. Text extraction and search preparation continue in the background.";
 }

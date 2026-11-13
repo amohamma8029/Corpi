@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from core.api.app import create_app
@@ -128,6 +131,70 @@ def test_report_returns_pages_outcome_and_review(tmp_path: Path) -> None:
         "decided_at": None,
     }
     assert payload["failure_code"] is None
+
+
+def test_status_poll_does_not_read_passage_text_geometry_or_visuals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = make_store(tmp_path)
+    source_id, version_id = seed_source(store)
+    extraction_id = save_partial_extraction(store, source_id, version_id)
+    client = make_client(store)
+    expected = client.get(f"/sources/{source_id}/extraction", headers=AUTH).json()
+    connect = store.database.connect
+    denied = []
+
+    def authorize(operation, table, column, _database, _trigger):
+        if operation == sqlite3.SQLITE_READ and (
+            table == "extraction_visuals"
+            or table == "passages"
+            and column in {"text", "location_json"}
+        ):
+            denied.append((table, column))
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    @contextmanager
+    def summary_only():
+        with connect() as connection:
+            connection.set_authorizer(authorize)
+            yield connection
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store.database, "connect", summary_only)
+        response = client.get(f"/sources/{source_id}/extraction", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert denied == []
+    # Search/extraction consumers still receive the original complete graph.
+    assert store.load_extraction_report(extraction_id).passages[0].text == "Readable body"
+
+
+def test_summary_tracks_review_and_newest_version_without_rewriting_passages(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    source_id, version_id = seed_source(store)
+    extraction_id = save_partial_extraction(store, source_id, version_id)
+    original = store.load_extraction_report(extraction_id)
+    summary = store.load_extraction_summary_for_source(source_id)
+    assert summary is not None and summary.review is not None
+    assert summary.extraction == original.extraction and summary.pages == original.pages
+    assert summary.passage_count == len(original.passages) == 1
+    assert summary.review.state == "pending"
+    store.record_review_decision(extraction_id, "confirmed", 1)
+    confirmed = store.load_extraction_summary_for_source(source_id)
+    assert confirmed is not None and confirmed.review is not None
+    assert confirmed.review.state == "confirmed"
+    store.reopen_review(extraction_id)
+    store.record_review_decision(extraction_id, "declined", 2)
+    declined = store.load_extraction_summary_for_source(source_id)
+    assert declined is not None and declined.review is not None
+    assert declined.review.state == "declined" and declined.review.generation == 2
+    store.create_source_version(source_id, "b" * 64)
+    assert store.load_extraction_summary_for_source(source_id) is None
+    assert store.load_extraction_report_for_source(source_id) is None
+    assert store.load_extraction_report(extraction_id).passages == original.passages
 
 
 def test_failed_extraction_surfaces_the_failure_code(tmp_path: Path) -> None:

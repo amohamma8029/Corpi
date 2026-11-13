@@ -153,9 +153,10 @@ it records a job for background execution. The job runs away from the UI thread 
 and results locally, allowing the core to report them to the UI.
 
 PDF receipt first streams bytes into durable app-data staging and records an acquisition. Once the
-original and source/import records commit, Corpi enqueues a `pdf-extract` job. The runner leaves that
-known job queued with a visible waiting reason until M1.5 registers its extraction steps; an unknown
-job kind still fails. The original remains openable during this wait or after extraction failure.
+original and source/import records commit, Corpi enqueues a `pdf-extract` job with registered
+extraction steps. Complete extraction schedules search; partial extraction waits for the exact
+review generation to be confirmed. An unknown job kind still fails. The original remains openable
+during processing or after extraction failure.
 
 When processing steps are available, import jobs parse each format, read PDF pages, split text into
 retrieval chunks, create local embeddings, and build indexes. Background execution also generates
@@ -242,6 +243,16 @@ short database transaction; filesystem unlink happens after that transaction and
 fingerprint lock. A failed unlink remains retryable. Acquisition holds, import/history links, source
 versions, jobs, and unexpired trash all block a competing removal where they own the exact file.
 
+Whole-source expiry replaces the source's PDF acquisition records with minimal deletion receipts
+in the same transaction that removes search rows, evidence ownership, and the source. Receipts
+retain the action ID/key, notebook, creation/deletion times, and a SHA-256 fingerprint of the
+original notebook/intent/target/filename tuple, not the filename, PDF hash, placement plan, or a
+live source/file reference. Exact old requests return `source_deleted`; changed requests cannot
+reuse their keys. Upload, Retry, Cancel, and status calls for a deleted action also return that
+terminal error. Receipts are not resumable acquisitions or entries in unfinished-work discovery.
+Trash journals leftover staging for completed and failed actions before expiry can discard their
+ownership; completed originals remain under shared managed-file removal, never staging cleanup.
+
 Opening an import fetches its exact managed file with the bearer header. The core rejects a reserved
 file or redirected path, verifies the opened bytes against saved size and SHA-256, and returns that
 same full byte buffer with `application/pdf` and `Cache-Control: no-store`. PDF.js 6.3.289 and its
@@ -271,8 +282,9 @@ exercise cancellation during work; the launcher checks stop/restart during an ac
 #### Import flow
 
 Read the diagram from top to bottom. The groups are phases of an import, and diamonds are decisions.
-The source remains unavailable for search throughout preparation; only the final ready step makes
-it searchable. The [format rules](#read-each-format), [PDF limits](#check-pdf-pages-and-handle-partial-imports),
+The candidate version remains unavailable for search throughout preparation; only the final ready
+step makes it searchable. During replacement, the previous eligible published version stays usable.
+The [format rules](#read-each-format), [PDF limits](#check-pdf-pages-and-handle-partial-imports),
 and [passage/chunk distinction](#citation-passages-and-retrieval-chunks) follow the diagram.
 
 ```mermaid
@@ -373,6 +385,238 @@ ID. It is not a retrieval-chunk ID.** Preserve this meaning when passing or stor
 Build local keyword and semantic indexes over retrieval chunks. Record the embedding model
 identifier and version with every set of embeddings and its index. Replacing a retrieval chunk
 must not change the passage an earlier answer cites.
+
+##### M1.6 search implementation candidate
+
+The Python core builds FTS5/BM25 word search and sqlite-vec 0.1.9 cosine-vector search
+over the same saved retrieval chunks. Both operations restrict candidates to the notebook's
+active model and explicitly selected, eligible source versions before limiting results.
+Each result carries its chunk, source version, search generation, model identity, and ordered
+passage mappings. Production question answering and rank fusion belong to Milestone 2.3.
+
+The notebook search panel submits explicit Meaning or Words queries through the authenticated
+`POST /notebooks/{notebook_id}/search` route. Meaning inference runs outside database transactions
+in a supervised singleton worker; Words uses FTS without inference. The query service resolves
+the active model and stored input representation, then rechecks eligibility and decorates
+canonical text/citation/PDF metadata in a final read snapshot. Results retain their saved PDF
+version and mapped page. Results expose the actual saved filename, current/previous PDF role and
+indexing profile, independently of the logical source name or a pending model selection.
+
+Each response carries an opaque revision of its initial searchable snapshot. The authenticated
+`GET /notebooks/{notebook_id}/search-state` reads eligible index/publication/review, active-model
+and mutable file-decoration state without reading passages/vectors or loading a model. The UI
+checks that revision before displaying a response and every 1.5 seconds afterward. Local review,
+trash and processing-cancel actions also invalidate and abort old requests immediately. Changed or
+unavailable freshness clears results but retains query text for explicit resubmission. These checks
+never run inference, download models or repeat queries. A merely pending model/PDF replacement
+does not invalidate still-eligible old search. Notebook/request guards reject late replies.
+
+The desktop's extraction-status read uses a compact `ExtractionSummary`: current extraction
+metadata, passage count, page classifications and current review. It does not load passage text,
+location geometry or visual records merely to display progress. Full extraction readers retain
+those original records for preparation and citation consumers. Background UI polling allows only
+one outstanding import/report polling pair per effect, and an unchanged import-list response does
+not independently trigger another report request. Selection/effect lifetime guards still reject
+late replies; processing actions keep their explicit refreshes. Review writes additionally fence
+older extraction reads and serialize the review controls, so a delayed report cannot restore a
+pre-reopen generation or decision. Failed writes refresh the current review and expose the error.
+
+Complete extraction records follow-on work in the extraction transaction. Partial extraction
+does so only after confirmation of the exact review generation. The existing single-job runner
+plans chunks, embeds bounded batches, finishes both search components, and publishes readiness.
+Only extracted pages contribute search text. Chunks retain immutable passage IDs and exact
+half-open Unicode-code-point slices, with recorded separators for reconstruction.
+
+Review Again invalidates the old handoff/readiness and increments its review generation. Confirm
+schedules a new exact-generation handoff, including after prior successful publication. Publication
+marks the extraction job superseded by its own search output; that specific ownership relationship
+does not block an unpublished, newer confirmed generation. A still-published version does not
+enqueue another import merely because a notebook model switch finished. Unrelated supersession, failed/cancelled origins,
+obsolete reviews and old jobs' publication fences still reject. Matching saved vectors can be reused.
+
+PDF-processing cancellation owns pending import work, not a ready PDF's model-switch job. It can
+cancel active jobs or an import waiting between jobs, marks only that import `processing_cancelled`
+and clears its pending pointer. A between-jobs cancellation returns a null `job_id`, rather than
+rewriting completed extraction history. Repeating it is harmless, and failed-import currency checks
+prevent later confirmation/startup from silently resurrecting the candidate. Previous ready PDF and
+search data remain in place. An older import's exact live job may still be stopped without changing
+the successor; an obsolete review-waiting import with no live work is rejected.
+
+Search progress reports the exact job, saved filename/PDF role and preparation profile, along with
+existing waiting/failure details and current Cancel/Resume eligibility. The piece counter counts
+embedded chunks only. Finishing word/vector components, final validation and readiness publication
+remain distinct from completing those chunks; a full counter on a running job is not a ready label.
+
+FastEmbed 0.8.1 runs CPU inference in a supervised child. The parent owns guarded database
+writes, stops and reaps the child on cancellation, and persists batch completion and spent time.
+Publication proves actual word/vector membership, matching batch output, and reconstructable
+passage mappings inside its write transaction; metadata completion flags alone do not suffice.
+
+The preparation budget includes input/review checks, planning, model load, inference, native
+index writes, worker-to-database handoff, intervening runner bookkeeping and checkpoint commits.
+Runtime-only monotonic timestamps connect each run to its commit and the following step; they
+are not saved as model inputs or reused across process restarts. Durable time reservations still
+survive interruptions conservatively, and a stale attempt cannot refund them. A build's run and
+commit share its existing 300-second attempt allowance, rather than each receiving a new one.
+Waiting for a missing model or human review happens before claim and does not spend preparation
+time; import-to-ready measurements report those waits separately.
+
+Before fallible review/input/generation reads, preparation commits a guarded metadata
+reservation in the existing job or exact-generation ledger. Failed reads spend their elapsed
+time; cancellation, process exit or an unavailable settlement cannot refund the saved lease.
+Batch-input reads, attempt bookkeeping and retry backoff also reserve time before work.
+This prevents an early metadata exception from becoming a zero-cost automatic retry.
+
+New jobs save `budget_policy: batch-reservation-v1`. Each batch attempt uses one
+reservation across input validation, durable attempt admission, optional worker load,
+inference and guarded vector commit. The reservation is committed before input reads;
+no database transaction or borrowed connection spans inference. Vector writes check
+the remaining deadline inside their transaction and roll back if it expires. Fewer
+ledger writes do not change the model, output proofs, time limits or two-attempt cap.
+An interruption in this longer reservation can retain more allowance, even before
+inference starts. Saved jobs without the policy field keep the previous separate
+reservations and generation identity; restart and explicit Resume do not upgrade them.
+
+The admission transaction must first read the immutable job settings, resolve the ledger and
+save that reservation. If SQLite cannot complete this first write, no review/extraction/model
+processing is admitted. Time spent waiting on a completely unavailable budget writer cannot
+itself be durably recorded there; existing runner attempt limits still apply. This is a stated
+recovery boundary, not proof that every pre-admission database-outage second is charged, and
+not an exemption for ordinary metadata work after the reservation has committed.
+
+Plan/checkpoint writes check the remaining deadline inside their transaction. Final readiness
+publication (including model-switch activation) and its completion checkpoint share a transaction
+and its final deadline check, so an expired checkpoint rolls back publication as well. Exhaustion
+in the commit phase records a permanent `search_time_limit` failure, not a silent running job or
+an automatic fresh allowance. These are application deadline checks, not a guarantee that the OS
+can interrupt an arbitrarily stalled SQLite/disk commit at an exact wall-clock instant.
+
+Each runner step owns one cancellation reader on its processing thread. Its connection is
+fully configured and verified once, then made query-only; each poll reads the latest committed
+job status without retaining a transaction or cursor between polls. This reuses connection setup,
+not cancellation decisions. The connection closes when that worker actually exits, including
+failure and retry. Writes and readiness publication still use separate, freshly guarded transactions.
+Callbacks on another thread, such as extraction's stop watcher, retain independent fresh-connection
+reads rather than borrowing the worker's connection. Embedding preparation additionally opts
+into same-thread, attempt-local connection reuse. Each borrow verifies database identity and
+runtime policy, ends its transaction and closes its cursors before inference. Other callers
+retain fresh connections; failed scopes cannot silently reuse an unsafe handle.
+
+Embedding errors cross the child boundary as finite, shared failure codes, never arbitrary native
+diagnostic strings. The parent independently checks those codes and validates response shape before
+decoding vectors; malformed replies become stable protocol/vector errors. Native tokenizer failures
+in parent-side planning are reduced to `tokenizer_failed` without their diagnostic payload. Normal
+source/query text and vectors travel over owned pipes, not application logs or temporary IPC files.
+
+New notebooks default to Bekko A8M quint8 AVX2 for English, French and Arabic same-language
+search. Existing saved choices and ready generations remain unchanged; all-MiniLM-L6-v2 and
+multilingual E5 small stay selectable. Corpi-owned manifests pin
+upstream revisions, required assets, hashes, tokenizer settings, pooling, prefixes, and vector format.
+An explicit setup action downloads assets into attempt-owned staging. Verified installation
+promotion makes one local copy available to several notebooks; inference never downloads implicitly.
+
+New source settings and runner policy share a 1,200-second preparation default. Recorded old
+settings/policies still govern interrupted jobs. The selected Bekko profile uses singleton input,
+two inference threads, the CPU memory arena and stop-spinning-after-run session option. Saved
+runtime flags are passed explicitly to the worker, so resuming an old job does not silently
+change its effective settings. Both the desktop core launcher and inference child use UTF-8.
+
+New E5 preparation saves `cpu_memory_arena=false` to reduce retained worker memory;
+Bekko and MiniLM continue saving true. This is a new-preparation-only default in the
+existing settings and fingerprint, not a migration or new schema field. Old jobs/indexes
+retain their recorded arena choice and charges, including on Resume. Old arena-enabled
+E5 work can therefore retain its earlier failure; it is not silently rewritten or reset.
+
+New preparation also saves integer `openblas_threads=1` in its existing settings/fingerprint.
+The supervisor sets `OPENBLAS_NUM_THREADS=1` only when that saved choice is passed explicitly;
+the default worker environment still omits it. A missing saved field retains legacy behavior,
+including on Resume. Present null, Boolean, floating-point, string and unsupported integer
+values reject rather than coerce or fall back. Parent OpenBLAS/OMP/MKL settings are not inherited.
+Meaning queries group indexes by compatible saved arena/spinning/OpenBLAS options, then input
+representation. One session closes before the next begins; the query admission lock covers
+all groups, with no database borrow spanning inference. Mixed old/new notebooks can therefore
+need another serial model load. Words queries do not interpret worker-only settings.
+
+The existing notebook-model response projects `failed_sources` and `cancelled_sources`
+for the pending selection's current ready sources. It excludes historical selections,
+other notebooks, import work and stale extraction/review/source versions without
+changing job state, retries, settings or budgets. The panel displays terminal counts
+instead of “Rebuilding” and retains the exact-generation Cancel model change action.
+Pre-action polling responses cannot restore old pending state after that action. The panel always
+names the active model and separately labels a requested model until activation completes.
+
+Terminal job failure/cancellation also checks the exact job's handoff purpose before
+updating PDF import state. A `model-switch` rebuild does not own the saved PDF's
+import outcome, even after its handoff is cancelled. Import and legacy no-handoff
+jobs retain their existing failure behavior, as does explicit cancellation of pending PDF
+processing. Search-result decoration still requires a ready, nontrashed import;
+no query-eligibility relaxation or old-library migration is used to preserve links.
+
+The pinned FastEmbed 0.8.1 adapter parses one tokenizer before importing NumPy/FastEmbed
+and allocating the ONNX session, avoiding overlapping temporary parse allocations with
+backend/session memory. It applies the pinned loader's same configuration, then shares
+that tokenizer with inference and input validation. Validation disables truncation and
+counts attended tokens without removing inference padding. Standalone planning and older
+constructor-replacing benchmark tokenizers retain their unpadded counting behavior.
+The adapter preserves the pinned model, prefixes, pooling arithmetic and vector bytes,
+and applies the recorded session options.
+The adapter's pinned session-loader integration and serialized-tokenizer parity tests must
+be reviewed together when updating FastEmbed.
+
+Bekko's versioned derived input folds Arabic presentation forms and removes tatweel for both
+documents and queries. Immutable canonical chunks and passage mappings remain authoritative.
+Derived text hashes and ordered batch-input hashes bind each committed vector to its canonical
+source. Legacy generations without representation fields remain canonical. The additive revision
+14 migration preserves existing rows and adds derived-input proofs and immutable generation inputs.
+
+Source-bound Cancel/Resume actions identify the exact current preparation job. Cancellation
+persists across startup; explicit resumption reuses the generation and batch ledgers, original
+settings/policy and conservative charges. It rejects stale source/review/model selections and
+exhausted allowances rather than resetting them. Model-switch cancellation remains separate.
+
+The production safeguard remains a sampled 1-GiB child-memory cutoff. Native Windows
+verification uses separate 1-GiB application-tree and 256-MiB controller-tree Job Objects,
+which bound committed memory, not strict aggregate resident/cache usage or swap. Cached
+Bekko search/saved pages, repeated original-paper/exact-200-page preparation, long cancellation
+and following import now pass that boundary. The complete original near-capacity fixture
+publishes in 1,019.90 seconds in the latest saved-setting run, with exact persisted
+vectors/mappings. New arena-off E5 preparation passes switching/publication, both search
+modes and exact saved-page navigation in two fresh copied native libraries. All 36 E5
+chunk/vector outputs match their original references, old generations/batches/charges
+remain exact and no job memory-limit event occurs. A matched worker pair reduces sampled
+peak private memory from about 895 to 581 MiB at a 9.4% document-inference cost. These are
+limited observations, not broad reliability or strict resident/cache/no-swap proof.
+Old arena-enabled E5 work is unchanged. Terminal switch failures/cancellations now show
+their actual status, and explicit cancellation keeps the active model. Those terminal
+jobs no longer mark the saved PDF import failed or remove its search-result PDF/page
+shortcuts. Genuine import failures remain distinct. Old failed import states are not
+reset or migrated. Copied real-API/browser checks retain the exact saved PDF bytes and
+page navigation. Native verification must use a binary built from the source being checked;
+browser/API checks are not a substitute for WebView page drawing. Strict Windows resource
+acceptance and dedicated default-Bekko coverage remain separate obligations.
+
+Setup uses a private anonymous HTTP opener, not Python's global cookie/auth opener. Initial URLs
+must exactly match the pinned Hugging Face repository/revision/file; every redirect is checked
+before contact and creates a fresh GET without application headers. The current transport allowlist
+is HTTPS on `huggingface.co` and the observed `us.aws.cdn.hf.co` asset CDN, on the default TLS port.
+HTTP/FTP, other hosts/ports, URL credentials, fragments and malformed locations fail closed. Signed
+asset-query grants from the CDN are permitted but are not persisted as model identity or diagnostics.
+Redirect bodies are closed without downloading, and at most ten redirects share the original
+deadline/cancellation checks. An upstream routing-host change needs review, not a broad host wildcard.
+
+Download staging rejects redirected path components before creating child directories, then
+rechecks after network waits. An opened destination must be a regular, single-link file before a
+previous partial is truncated. Cleanup remains tied to recorded attempt ownership and waits for
+the child lock; it does not remove unexplained staging or follow redirected owners. These checks
+do not establish an OS-wide firewall or complete protection against hostile concurrent filesystem
+replacement by another process running as the same user.
+
+A notebook model choice records a pending selection generation. Its replacement indexes coexist
+with active search until one activation transaction checks the current ready-source set, complete
+matching outputs, and still-valid rebuild handoffs. A newer choice, cancellation, or changed review
+cannot activate stale work. A model-only rebuild targets the current ready PDF even when a newer
+replacement is pending, without changing which PDF is current. Search cleanup follows source and
+import expiry; deleting a source does not delete shared model installations.
 
 #### Make a source version ready
 
@@ -805,8 +1049,8 @@ Choose and record each open implementation detail before building the component 
 
 | Area | Status | What remains open |
 | --- | --- | --- |
-| Local keyword/FTS and vector search | **Needs Decision** | Both search implementations. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
-| Local embeddings | **Needs Decision** | Supported model and runtime; benchmark them before selection. Local-by-default processing is decided. |
+| Local keyword/FTS and vector search | **Partially Decided** | M1.6 implements SQLite FTS5 and sqlite-vec with ready-source/model eligibility applied before top K. Meaning and Words are separate app modes; production fusion/Q&A remains later work. Native-platform and resource acceptance remains open. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
+| Local embeddings | **Partially Decided** | New notebooks use pinned Bekko A8M quint8 AVX2 for English/French/Arabic same-language search. Explicit saved choices remain unchanged; all-MiniLM-L6-v2 and multilingual E5 small stay selectable. New preparation saves its OpenBLAS choice and disables the arena only for new E5 work; missing fields and recorded old choices preserve legacy behavior, and mixed query groups load serially. Current backend/default-model native checks and complete original near-capacity preparation pass the adopted twenty-minute recipe. New arena-off E5 switching/search/saved pages pass in fresh copied native libraries; old work is not migrated. Failed-switch UI status and the PDF-import failure side effect are repaired; result links preserve the exact saved PDF/page. Whole M1.6 still needs fresh native setup/verification, current Linux/macOS execution and strict aggregate memory/no-swap proof. Benchmark-combined quality is not either separate UI mode's measured success rate. Local-by-default processing is decided. |
 | Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
 | Local file layout | **Partially Decided** | PDF original/staging paths, safe copy, integrity verification, and shared-original removal are set by M1.4. Layouts for other file types remain open. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
 | Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |

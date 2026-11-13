@@ -33,12 +33,27 @@ other people's accounts, documents, or systems.
   encryption against someone who can read your operating-system account's files.
 - The core uses a per-launch bearer token on loopback HTTP. Do not share that token
   in reports, screenshots, or logs; loopback binding alone is not authentication.
-- PDF parsing uses a supervised process and resource limits.
+- PDF parsing and model inference use supervised processes and resource limits.
   This is not an OS security sandbox or proof that arbitrary hostile files are safe.
 - Keep private libraries and credentials out of test environments and unreviewed
   PR runs. See [CONTRIBUTING.md](CONTRIBUTING.md) for safe test-data practices.
 - Third-party dependency advisories and release-verification gaps remain under
   review. Public source availability or an MIT license is not a security guarantee.
+
+### Local search on the feature branch
+
+PR #16 adds explicit model setup and local Words/Meaning search. Download or Retry
+setup fetches pinned HTTPS assets from `huggingface.co` and the reviewed
+`us.aws.cdn.hf.co` CDN; unexpected redirect hosts reject. Model installation checks
+file sizes and hashes and does not forward application credentials or cookies.
+Installed-model Meaning queries run locally; Words queries do not load a model.
+Background freshness checks neither run inference nor download assets.
+
+Imported PDFs, model files and search state are stored locally. Existing jobs and
+indexes retain their saved settings, vector provenance, attempts and charges across
+runtime upgrades; these controls do not encrypt the data or sandbox hostile files.
+The README describes download, worker and preparation limits. Current-head native,
+capacity and strict aggregate memory/no-swap acceptance remain separate obligations.
 
 ## Dependency patches and current findings
 
@@ -47,8 +62,8 @@ download paths. See [patch provenance and limitations](desktop/patches/README.md
 for upstream fixes, exact hashes, regression checks and recheck triggers. FTP PAC
 retrieval and Puppeteer's ZIP browser-unpacking path are deliberately unavailable;
 ordinary non-FTP proxy support remains. These restrictions cover test-tool
-downloads, not application download paths. Adding a feature that downloads
-models or changes file, network or worker access requires a fresh security review.
+downloads, not Corpi's explicit model-download flow. Changes to model downloads,
+file, network or worker access require a fresh security review.
 The [search merge checklist](docs/maintainer-checklist.md#before-merging-search-pr-16)
 includes that review and the accompanying documentation updates.
 

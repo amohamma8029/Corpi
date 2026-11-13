@@ -340,11 +340,42 @@ def test_cooperative_cancel_during_step_stops_run_and_rejects_late_commits(
         )
 
 
-def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
+def test_stuck_pool_is_reported_and_recovers(
+    store: PersistenceStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from core.jobs import runner as runner_module
+
     records: dict[str, list[int]] = {}
+    clock = SimpleNamespace(now=0.0)
+    entered = threading.Event()
     release = threading.Event()
+    worker_timeouts = []
+
+    class StepScheduler:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def wait_for(self, awaitable, timeout):
+            if not asyncio.isfuture(awaitable):
+                return await asyncio.wait_for(awaitable, timeout)
+            worker_timeouts.append(timeout)
+            if len(worker_timeouts) == 1:
+                assert await asyncio.to_thread(entered.wait, 5), "stuck worker did not start"
+                clock.now += timeout
+                awaitable.cancel()
+                raise TimeoutError
+            assert release.is_set(), "queued job ran before the worker was released"
+            return await awaitable
+
+    # Trigger only the stuck attempt's synthetic deadline. Real thread/SQLite
+    # scheduling must not independently time out the recovery job at 150 ms.
+    monkeypatch.setattr(runner_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(runner_module, "asyncio", StepScheduler())
 
     def stuck(context: StepContext) -> StepOutcome:
+        entered.set()
         release.wait(10)
         return StepOutcome(1, {"stuck": True})
 
@@ -393,6 +424,9 @@ def test_stuck_pool_is_reported_and_recovers(store: PersistenceStore) -> None:
     finally:
         release.set()
         runner.stop()
+
+    assert worker_timeouts == [0.15, 0.15]
+    assert records == {"stuck": [1], "quick": [1]}
 
 
 def test_runner_error_leaves_a_truthful_failed_job(store: PersistenceStore) -> None:

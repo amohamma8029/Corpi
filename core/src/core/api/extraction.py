@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from core.persistence.errors import ConflictingWriteError, PersistenceError
-from core.persistence.models import ExtractionReport
+from core.persistence.models import ExtractionReport, ExtractionSummary
 from core.persistence.store import PersistenceStore
 
 router = APIRouter()
@@ -63,7 +63,7 @@ def _store(request: Request) -> PersistenceStore:
 
 def _report_payload(
     source_id: str,
-    report: ExtractionReport | None,
+    report: ExtractionSummary | None,
     failure_reason: str | None,
     failure_code: str | None,
 ) -> ExtractionReportPayload:
@@ -90,7 +90,7 @@ def _report_payload(
         parser_name=report.extraction.parser_name,
         parser_version=report.extraction.parser_version,
         normalization_version=report.extraction.normalization_version,
-        passage_count=len(report.passages),
+        passage_count=report.passage_count,
         pages=[
             ExtractionPagePayload(
                 page_number=page.page_number,
@@ -132,7 +132,7 @@ def _require_source(store: PersistenceStore, source_id: str) -> None:
 def get_extraction(source_id: str, request: Request) -> ExtractionReportPayload:
     store = _store(request)
     _require_source(store, source_id)
-    report = store.load_extraction_report_for_source(source_id)
+    report = store.load_extraction_summary_for_source(source_id)
     status = store.load_latest_extraction_job_status(source_id)
     return _report_payload(
         source_id,
@@ -162,6 +162,9 @@ def decide_review(
         raise HTTPException(status_code=409, detail=str(error)) from error
     except (PersistenceError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    notify = getattr(getattr(request.app.state, "runner", None), "notify", None)
+    if notify is not None:
+        notify()
     return _review_payload(store.load_extraction_report(report.extraction.id))
 
 

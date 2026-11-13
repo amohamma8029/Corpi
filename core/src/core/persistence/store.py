@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import closing, contextmanager
 from pathlib import PurePosixPath, PureWindowsPath
 
 from core.persistence.database import Database
 from core.persistence.errors import (
     ConflictingWriteError,
+    DeletedPdfAcquisitionError,
     PersistenceError,
     translate_sqlite_error,
 )
@@ -21,6 +24,7 @@ from core.persistence.models import (
     ExtractionPage,
     ExtractionReport,
     ExtractionReview,
+    ExtractionSummary,
     ExtractionVersion,
     IndexGraph,
     IndexVersion,
@@ -194,6 +198,17 @@ class PersistenceStore:
                         "retry key already identifies a different PDF action"
                     )
                 return _pdf_acquisition(existing)
+            deleted = _fetchone(
+                connection, "SELECT * FROM deleted_pdf_acquisitions WHERE retry_key=?", (retry_key,)
+            )
+            if deleted is not None:
+                if deleted["request_sha256"] != _pdf_action_fingerprint(
+                    notebook_id, intent, target_source_id, display_filename
+                ):
+                    raise ConflictingWriteError(
+                        "retry key already identifies a different PDF action"
+                    )
+                raise DeletedPdfAcquisitionError()
             if target_source_id is not None:
                 target = _fetchone(
                     connection,
@@ -253,6 +268,15 @@ class PersistenceStore:
                 connection, "SELECT * FROM pdf_acquisitions WHERE id=?", (acquisition_id,)
             )
             if row is None:
+                if (
+                    _fetchone(
+                        connection,
+                        "SELECT 1 FROM deleted_pdf_acquisitions WHERE id=?",
+                        (acquisition_id,),
+                    )
+                    is not None
+                ):
+                    raise DeletedPdfAcquisitionError()
                 raise PersistenceError("PDF acquisition does not exist")
             return _pdf_acquisition(row)
 
@@ -958,6 +982,11 @@ class PersistenceStore:
                 )
                 if removal is not None and removal["removed_at"] is None:
                     raise PersistenceError("PDF original removal is still pending")
+            from core.search.storage import purge_search
+
+            purge_search(
+                connection, source_id=item["source_id"], version_id=item["source_version_id"]
+            )
             jobs = [
                 row[0]
                 for row in connection.execute(
@@ -1168,7 +1197,12 @@ class PersistenceStore:
             )
             return job_id
 
-    def cancel_pdf_import_processing(self, import_id: str) -> str:
+    def cancel_pdf_import_processing(self, import_id: str) -> str | None:
+        """Cancel the selected pending import, including its between-jobs review wait.
+
+        No job ID means only the import was cancelled; completed jobs stay completed.
+        Ready-PDF model rebuilds belong to model selection, not this action.
+        """
         validate_id(import_id)
         timestamp = utc_timestamp()
         with self._transaction() as connection:
@@ -1182,34 +1216,57 @@ class PersistenceStore:
                 is not None
             ):
                 raise ConflictingWriteError("PDF import is in trash")
-            job = _fetchone(
+            if item["state"] == "failed" and item["failure_code"] == "processing_cancelled":
+                return None
+            state = _fetchone(
                 connection,
-                """SELECT jobs.id FROM jobs JOIN job_status ON job_status.job_id=jobs.id
-                   WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
-                   ORDER BY jobs.created_at DESC,jobs.id DESC LIMIT 1""",
-                (item["source_version_id"],),
+                "SELECT * FROM source_pdf_state WHERE source_id=?",
+                (item["source_id"],),
             )
-            if job is None:
-                raise ConflictingWriteError("PDF import has no active processing job")
-            connection.execute(
-                """UPDATE job_status SET status='cancelled',
+            jobs = connection.execute(
+                """SELECT jobs.id FROM jobs JOIN job_status ON job_status.job_id=jobs.id
+                    WHERE jobs.source_version_id=? AND job_status.status IN ('queued','running')
+                      AND jobs.kind IN ('pdf-extract','pdf-search')
+                      AND NOT EXISTS(SELECT 1 FROM search_handoffs h
+                                     WHERE h.job_id=jobs.id AND h.purpose='model-switch')
+                    ORDER BY jobs.created_at DESC,jobs.rowid DESC""",
+                (item["source_version_id"],),
+            ).fetchall()
+            if item["state"] != "pending" or (
+                not jobs
+                and (
+                    state is None
+                    or import_id not in (state["current_import_id"], state["pending_import_id"])
+                )
+            ):
+                raise ConflictingWriteError("PDF import has no current processing to cancel")
+            from core.search.handoff import invalidate_handoffs
+
+            invalidate_handoffs(
+                connection,
+                source_version_id=item["source_version_id"],
+                reason="user cancelled PDF processing",
+            )
+            for job in jobs:
+                connection.execute(
+                    """UPDATE job_status SET status='cancelled',
                           failure_reason='user cancelled PDF processing',updated_at=?
                    WHERE job_id=? AND status IN ('queued','running')""",
-                (timestamp, job["id"]),
-            )
-            connection.execute(
-                """DELETE FROM source_readiness_indexes WHERE source_id IN (
+                    (timestamp, job["id"]),
+                )
+                connection.execute(
+                    """DELETE FROM source_readiness_indexes WHERE source_id IN (
                        SELECT source_id FROM source_readiness WHERE published_by_job_id=?
                    )""",
-                (job["id"],),
-            )
-            connection.execute(
-                "DELETE FROM source_readiness WHERE published_by_job_id=?", (job["id"],)
-            )
+                    (job["id"],),
+                )
+                connection.execute(
+                    "DELETE FROM source_readiness WHERE published_by_job_id=?", (job["id"],)
+                )
             _mark_pdf_import_failed(
                 connection, item["source_version_id"], "processing_cancelled", timestamp
             )
-            return str(job["id"])
+            return str(jobs[0]["id"]) if jobs else None
 
     def load_source_pdf_state(self, source_id: str) -> SourcePdfState | None:
         validate_id(source_id)
@@ -1870,6 +1927,10 @@ class PersistenceStore:
             if generation > review.generation:
                 raise ValueError("review generation does not exist")
             if review.state == decision:
+                if decision == "confirmed":
+                    from core.search.handoff import record_handoff
+
+                    record_handoff(connection, extraction_version_id)
                 return review
             if review.state != "pending":
                 raise ConflictingWriteError("review was already decided differently")
@@ -1887,6 +1948,10 @@ class PersistenceStore:
                 (extraction_version_id,),
             )
             assert updated is not None
+            if decision == "confirmed":
+                from core.search.handoff import record_handoff
+
+                record_handoff(connection, extraction_version_id)
             return _extraction_review(updated)
 
     def reopen_review(self, extraction_version_id: str) -> ExtractionReview:
@@ -1905,6 +1970,21 @@ class PersistenceStore:
             )
             if row is None:
                 raise PersistenceError("extraction has no review state")
+            from core.search.handoff import invalidate_handoffs
+
+            invalidate_handoffs(
+                connection, extraction_id=extraction_version_id, reason="review reopened"
+            )
+            affected = connection.execute(
+                "SELECT source_id FROM source_readiness_indexes WHERE index_version_id IN "
+                "(SELECT id FROM index_versions WHERE extraction_version_id=?)",
+                (extraction_version_id,),
+            ).fetchall()
+            for source in affected:
+                connection.execute(
+                    "DELETE FROM source_readiness_indexes WHERE source_id=?", (source[0],)
+                )
+                connection.execute("DELETE FROM source_readiness WHERE source_id=?", (source[0],))
             connection.execute(
                 """UPDATE extraction_reviews
                    SET state='pending', generation=generation+1, decided_at=NULL, updated_at=?
@@ -2054,6 +2134,10 @@ class PersistenceStore:
                 inputs_sha256,
                 output_extraction_version_id=extraction.id,
             )
+            if outcome is not None:
+                from core.search.handoff import record_handoff
+
+                record_handoff(connection, extraction.id, origin_job_id=job_id)
             return _load_job_step(connection, job_id, step_key)
 
     def commit_index_step(
@@ -2068,6 +2152,7 @@ class PersistenceStore:
         *,
         guard: AttemptGuard,
         inputs_sha256: str | None = None,
+        search_deadline: float | None = None,
     ) -> JobStep:
         with self._transaction() as connection:
             _verify_attempt_current(connection, job_id, step_key, guard)
@@ -2081,7 +2166,10 @@ class PersistenceStore:
                 inputs_sha256,
                 output_index_version_id=index.id,
             )
-            return _load_job_step(connection, job_id, step_key)
+            result = _load_job_step(connection, job_id, step_key)
+            if search_deadline is not None and time.monotonic() >= search_deadline:
+                raise TimeoutError("search checkpoint deadline expired")
+            return result
 
     # --- Runner and lifecycle records (subproblem 1.3) ---
 
@@ -2094,6 +2182,7 @@ class PersistenceStore:
         *,
         guard: AttemptGuard,
         inputs_sha256: str | None = None,
+        search_deadline: float | None = None,
     ) -> JobStep:
         """Commit a step completion that has no database version output.
 
@@ -2113,7 +2202,10 @@ class PersistenceStore:
                 checkpoint,
                 inputs_sha256,
             )
-            return _load_job_step(connection, job_id, step_key)
+            result = _load_job_step(connection, job_id, step_key)
+            if search_deadline is not None and time.monotonic() >= search_deadline:
+                raise TimeoutError("search checkpoint deadline expired")
+            return result
 
     def load_source_version(self, source_version_id: str) -> SourceVersion:
         validate_id(source_version_id)
@@ -2159,6 +2251,53 @@ class PersistenceStore:
             if row is None:
                 return None
             return _load_extraction_report(connection, row["id"])
+
+    def load_extraction_summary_for_source(self, source_id: str) -> ExtractionSummary | None:
+        """Newest current-version page status; never materialize passage/location payloads."""
+        validate_id(source_id)
+        with self.database.connect() as connection:
+            current = connection.execute(
+                "SELECT id FROM source_versions WHERE source_id=? "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            row = connection.execute(
+                "SELECT * FROM extraction_versions WHERE source_id=? AND source_version_id=? "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                (source_id, current[0]),
+            ).fetchone()
+            if row is None:
+                return None
+            extraction = _extraction(row)
+            pages = tuple(
+                _extraction_page(item)
+                for item in connection.execute(
+                    "SELECT * FROM extraction_pages WHERE extraction_version_id=? "
+                    "ORDER BY page_number,id",
+                    (extraction.id,),
+                )
+            )
+            outcome = connection.execute(
+                "SELECT * FROM extraction_outcomes WHERE extraction_version_id=?",
+                (extraction.id,),
+            ).fetchone()
+            review = connection.execute(
+                "SELECT * FROM extraction_reviews WHERE extraction_version_id=?",
+                (extraction.id,),
+            ).fetchone()
+            count = connection.execute(
+                "SELECT count(*) FROM passages WHERE extraction_version_id=?",
+                (extraction.id,),
+            ).fetchone()[0]
+            return ExtractionSummary(
+                extraction,
+                count,
+                pages,
+                None if outcome is None else _extraction_outcome(outcome),
+                None if review is None else _extraction_review(review),
+            )
 
     def load_latest_extraction_job_status(self, source_id: str) -> JobStatus | None:
         """The newest `pdf-extract` job status for a source (carries failure codes)."""
@@ -2238,11 +2377,10 @@ class PersistenceStore:
             )
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not cancellable in its current status")
-            job = _fetchone(connection, "SELECT source_version_id FROM jobs WHERE id=?", (job_id,))
-            if job is not None and job["source_version_id"] is not None:
-                _mark_pdf_import_failed(
-                    connection, job["source_version_id"], "processing_cancelled", timestamp
-                )
+            from core.search.handoff import invalidate_handoffs
+
+            invalidate_handoffs(connection, job_id=job_id, reason=failure_reason)
+            _mark_job_pdf_import_failed(connection, job_id, "processing_cancelled", timestamp)
             # Hide exactly what this job published; a newer job's readiness
             # remains untouched.
             connection.execute(
@@ -2309,6 +2447,27 @@ class PersistenceStore:
         with self.database.connect() as connection:
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return None if row is None else _job_status(row)
+
+    @contextmanager
+    def job_cancellation_reader(self, job_id: str) -> Iterator[Callable[[], bool]]:
+        """Own one verified read-only connection on the polling thread until step exit.
+
+        Every call reads committed status afresh, without a cached decision or an
+        open transaction/cursor between polls. The caller receives only a boolean
+        reader, never the connection. Writes still use their own guarded transactions.
+        """
+        validate_id(job_id)
+        with self.database.connect() as connection:
+            connection.execute("PRAGMA query_only=ON")
+
+            def cancelled() -> bool:
+                with closing(
+                    connection.execute("SELECT status FROM job_status WHERE job_id=?", (job_id,))
+                ) as cursor:
+                    row = cursor.fetchone()
+                return row is None or row["status"] == "cancelled"
+
+            yield cancelled
 
     def claim_job(
         self,
@@ -2396,16 +2555,9 @@ class PersistenceStore:
             if cursor.rowcount != 1:
                 raise ConflictingWriteError("job is not active; finish rejected")
             if status in ("failed", "cancelled"):
-                job = _fetchone(
-                    connection, "SELECT source_version_id FROM jobs WHERE id=?", (job_id,)
+                _mark_job_pdf_import_failed(
+                    connection, job_id, failure_code or "processing_failed", timestamp
                 )
-                if job is not None and job["source_version_id"] is not None:
-                    _mark_pdf_import_failed(
-                        connection,
-                        job["source_version_id"],
-                        failure_code or "processing_failed",
-                        timestamp,
-                    )
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return _job_status(_require_row(row))
 
@@ -2530,6 +2682,8 @@ class PersistenceStore:
         index_version_ids: Sequence[str],
         *,
         guard: AttemptGuard,
+        search_deadline: float | None = None,
+        search_checkpoint: tuple[int, JSONValue, str] | None = None,
     ) -> SourceReadiness:
         """Publish readiness only after verifying the publishing job in-transaction.
 
@@ -2588,6 +2742,18 @@ class PersistenceStore:
             if trash_row is not None:
                 raise ConflictingWriteError("source is deleted; publication rejected")
             _verify_extraction_decision(connection, cleaned_indexes)
+            from core.search.storage import verify_generation
+
+            for identity in cleaned_indexes:
+                row = connection.execute(
+                    "SELECT index_kind FROM index_versions WHERE id=?", (identity,)
+                ).fetchone()
+                if row is not None and row[0] == "hybrid-search":
+                    verify_generation(connection, identity)
+            if search_deadline is not None and time.monotonic() >= search_deadline:
+                raise ConflictingWriteError(
+                    "search preparation deadline expired before publication"
+                )
             committed_outputs = {
                 row[0]
                 for row in connection.execute(
@@ -2686,7 +2852,22 @@ class PersistenceStore:
                      )""",
                 (job_id, timestamp, job_id, source_id, job_row["created_at"]),
             )
-            return _load_readiness(connection, source_id)
+            readiness = _load_readiness(connection, source_id)
+            if search_checkpoint is not None:
+                checkpoint_version, checkpoint, inputs_sha256 = search_checkpoint
+                _save_job_step(
+                    connection,
+                    job_id,
+                    guard.step_key,
+                    checkpoint_version,
+                    checkpoint,
+                    inputs_sha256,
+                )
+            if search_deadline is not None and time.monotonic() >= search_deadline:
+                raise ConflictingWriteError(
+                    "search preparation deadline expired during publication"
+                )
+            return readiness
 
     def load_readiness(self, source_id: str) -> SourceReadiness | None:
         with self.database.connect() as connection:
@@ -2709,10 +2890,8 @@ class PersistenceStore:
         timestamp = utc_timestamp()
         with self._transaction() as connection:
             acquisitions = connection.execute(
-                """SELECT * FROM pdf_acquisitions WHERE target_source_id=?
-                   AND state IN ('awaiting_upload','receiving','staged','finalizing',
-                                 'waiting_cleanup')""",
-                (source_id,),
+                "SELECT * FROM pdf_acquisitions WHERE target_source_id=? OR outcome_source_id=?",
+                (source_id, source_id),
             ).fetchall()
             for acquisition in acquisitions:
                 connection.execute(
@@ -2730,7 +2909,13 @@ class PersistenceStore:
                         timestamp,
                     ),
                 )
-                if acquisition["planned_relative_path"] is not None:
+                # Completed placement belongs to managed-file sharing/removal,
+                # not acquisition cleanup. Its leftover staging still needs a
+                # journal if finalization crashed before recording that cleanup.
+                if (
+                    acquisition["planned_relative_path"] is not None
+                    and acquisition["state"] != "completed"
+                ):
                     connection.execute(
                         """INSERT INTO acquisition_file_cleanup(
                                id,acquisition_id,relative_path,file_kind,expected_sha256,
@@ -2762,9 +2947,9 @@ class PersistenceStore:
                    SET state='cancelled',failure_code='source_deleted',
                        finalization_generation=finalization_generation+1,
                        planned_reuse_managed_file_id=NULL,updated_at=?
-                   WHERE target_source_id=?
-                     AND state IN ('awaiting_upload','receiving','staged','finalizing',
-                                   'waiting_cleanup')""",
+                    WHERE target_source_id=?
+                      AND state IN ('awaiting_upload','receiving','staged','finalizing',
+                                    'waiting_cleanup','failed')""",
                 (timestamp, source_id),
             )
             connection.execute(
@@ -2847,6 +3032,9 @@ class PersistenceStore:
             )
             if pending_cleanup is not None:
                 raise PersistenceError("PDF acquisition cleanup is still pending")
+            from core.search.storage import purge_search
+
+            purge_search(connection, source_id=source_id)
             managed_file_ids = [
                 row[0]
                 for row in connection.execute(
@@ -2896,10 +3084,34 @@ class PersistenceStore:
             connection.execute("DELETE FROM extraction_pages WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM extraction_versions WHERE source_id=?", (source_id,))
             connection.execute("DELETE FROM source_versions WHERE source_id=?", (source_id,))
+            # Keep replay protection without retaining a replacement's live FK
+            # (which cannot be nulled under its original ownership constraint).
+            acquisitions = connection.execute(
+                "SELECT * FROM pdf_acquisitions WHERE target_source_id=? OR outcome_source_id=?",
+                (source_id, source_id),
+            ).fetchall()
+            timestamp = utc_timestamp()
+            for acquisition in acquisitions:
+                connection.execute(
+                    """INSERT INTO deleted_pdf_acquisitions(
+                           id,retry_key,notebook_id,request_sha256,created_at,deleted_at
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        acquisition["id"],
+                        acquisition["retry_key"],
+                        acquisition["notebook_id"],
+                        _pdf_action_fingerprint(
+                            acquisition["notebook_id"],
+                            acquisition["intent"],
+                            acquisition["target_source_id"],
+                            acquisition["display_filename"],
+                        ),
+                        acquisition["created_at"],
+                        timestamp,
+                    ),
+                )
             connection.execute(
-                """UPDATE pdf_acquisitions SET target_source_id=NULL,outcome_source_id=NULL,
-                          outcome_import_id=NULL,expected_current_import_id=NULL
-                   WHERE target_source_id=? OR outcome_source_id=?""",
+                "DELETE FROM pdf_acquisitions WHERE target_source_id=? OR outcome_source_id=?",
                 (source_id, source_id),
             )
             for managed_file_id in managed_file_ids:
@@ -3150,6 +3362,25 @@ def _verify_pdf_acquisition_attempt(
         raise ConflictingWriteError("PDF acquisition attempt was superseded")
     if row["state"] != expected_state:
         raise ConflictingWriteError("PDF acquisition is not in the expected state")
+
+
+def _mark_job_pdf_import_failed(
+    connection: sqlite3.Connection,
+    job_id: str,
+    failure_code: str,
+    timestamp: str,
+) -> None:
+    # A model switch rebuilds an already-ready version. Its failure belongs to
+    # the switch job, not the saved PDF import, even after handoff cancellation.
+    job = _fetchone(
+        connection,
+        """SELECT source_version_id FROM jobs WHERE id=?
+           AND NOT EXISTS(SELECT 1 FROM search_handoffs h
+                          WHERE h.job_id=jobs.id AND h.purpose='model-switch')""",
+        (job_id,),
+    )
+    if job is not None and job["source_version_id"] is not None:
+        _mark_pdf_import_failed(connection, job["source_version_id"], failure_code, timestamp)
 
 
 def _mark_pdf_import_failed(
@@ -4267,6 +4498,14 @@ def _managed_file_from_join(row: sqlite3.Row) -> ManagedFile:
         row["managed_sha256"],
         row["managed_created_at"],
     )
+
+
+def _pdf_action_fingerprint(
+    notebook_id: str, intent: str, target_source_id: str | None, display_filename: str
+) -> str:
+    return hashlib.sha256(
+        encode_json([notebook_id, intent, target_source_id, display_filename]).encode("utf-8")
+    ).hexdigest()
 
 
 def _pdf_acquisition(row: sqlite3.Row) -> PdfAcquisition:

@@ -5,6 +5,7 @@ on:
     branches: ["main", "feat/**"]
   pull_request:
 
+# CI needs repository reads, not permission to change code or approve PRs.
 permissions:
   contents: read
 
@@ -75,6 +76,29 @@ jobs:
           uv run ruff format --check .
           uv run pyright
 
+      - name: Windows memory and process-object controls (no skips)
+        if: runner.os == 'Windows'
+        working-directory: core
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpi-search-evidence"
+          uv run pytest tests/search/test_memory.py tests/search/test_embedding_supervisor.py --junitxml "$RUNNER_TEMP/corpi-search-evidence/windows-controls.xml" -q
+          uv run python -c 'import sys, xml.etree.ElementTree as ET; cases = ET.parse(sys.argv[1]).getroot().findall(".//testcase"); assert cases and not any(c.find("skipped") is not None for c in cases), "Windows controls must execute without skips"' "$RUNNER_TEMP/corpi-search-evidence/windows-controls.xml"
+
+      - name: Managed search model setup (both supported profiles)
+        working-directory: core
+        timeout-minutes: 25
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/corpi-search-evidence"
+          uv run pytest tests/search/test_live_model_setup.py --model-setup-export-directory "$RUNNER_TEMP/corpi-search-models" --junitxml "$RUNNER_TEMP/corpi-search-evidence/setup.xml" -q
+
+      - name: Offline inference and automatic PDF readiness/model switch
+        working-directory: core
+        timeout-minutes: 10
+        run: |
+          uv run pytest 'tests/search/test_runtime.py::test_real_installed_inference_is_offline_and_does_not_truncate[minilm-en]' 'tests/search/test_runtime.py::test_real_installed_inference_is_offline_and_does_not_truncate[multilingual-e5]' tests/search/test_automatic_import.py --models-directory "$RUNNER_TEMP/corpi-search-models" --junitxml "$RUNNER_TEMP/corpi-search-evidence/integration.xml" -q
+
       - name: UI setup
         run: pnpm --dir desktop install --frozen-lockfile
 
@@ -108,12 +132,16 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo install tauri-driver --version 2.1.0 --locked
 
-      - name: Native viewer E2E (Linux / WebKitGTK)
+      - name: Native viewer and search setup E2E (Linux / WebKitGTK)
         if: runner.os == 'Linux'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: xvfb-run -a --server-args="-screen 0 1280x1024x24" dbus-run-session -- pnpm --dir desktop run test:e2e
 
-      - name: Native viewer E2E (macOS / WKWebView)
+      - name: Native viewer and search setup E2E (macOS / WKWebView)
         if: runner.os == 'macOS'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
         run: pnpm --dir desktop run test:e2e
 
       - name: Upload native viewer evidence
@@ -122,5 +150,98 @@ jobs:
         with:
           name: native-viewer-${{ matrix.os }}-${{ github.sha }}
           path: desktop/e2e-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload search model/platform evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: search-platform-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/corpi-search-evidence/
+            ${{ runner.temp }}/corpi-search-models/*-setup.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Native model setup gets its own existing-size job budget, rather than the
+  # few minutes left after Windows core/model checks and the debug shell build.
+  # Keep this independent: unavailable macOS runners must not block Windows E2E.
+  windows-native:
+    name: Native checks (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+
+      - name: Select Windows managed Python
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (Get-Content core/.python-version -Raw).Trim()
+          uv python install $version
+          $python = uv python find --managed-python --no-project $version
+          "UV_PYTHON=$python" >> $env:GITHUB_ENV
+
+      - name: Core setup
+        run: uv sync --directory core
+
+      - name: Check loaded SQLite version
+        working-directory: core
+        run: |
+          uv run python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 51, 3), "SQLite 3.51.3 or newer is required"'
+
+      - name: UI setup
+        run: pnpm --dir desktop install --frozen-lockfile
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Fetch locked Windows shell dependencies
+        working-directory: desktop/src-tauri
+        # Provisioning reads the loader from the locked crate's source. No debug
+        # shell build is needed here; the native runner builds the release app.
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify Windows driver provisioning controls
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.Tests.ps1
+
+      - name: Provision Microsoft-signed driver matching WebView2 (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./.github/scripts/Setup-WindowsWebDriver.ps1
+
+      - name: Native viewer and search setup E2E (Windows / WebView2)
+        if: runner.os == 'Windows'
+        env:
+          CORPI_RUN_MODEL_DOWNLOAD: "1"
+        run: pnpm --dir desktop run test:e2e
+
+      - name: Upload native viewer evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-viewer-windows-latest-${{ github.sha }}
+          path: desktop/e2e-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload native driver evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-driver-windows-latest-${{ github.sha }}
+          path: ${{ runner.temp }}/corpi-search-evidence/windows-webdriver.json
           if-no-files-found: warn
           retention-days: 14

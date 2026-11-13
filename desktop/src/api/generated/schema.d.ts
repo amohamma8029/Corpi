@@ -369,6 +369,177 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sources/{source_id}/search/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel Search Preparation */
+        post: operations["cancel_search_preparation_sources__source_id__search_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sources/{source_id}/search/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume Search Preparation */
+        post: operations["resume_search_preparation_sources__source_id__search_resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sources/{source_id}/search-progress": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Source Search Progress */
+        get: operations["source_search_progress_sources__source_id__search_progress_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notebooks/{notebook_id}/model": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Notebook Model */
+        get: operations["get_notebook_model_notebooks__notebook_id__model_get"];
+        put?: never;
+        /** Choose Notebook Model */
+        post: operations["choose_notebook_model_notebooks__notebook_id__model_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notebooks/{notebook_id}/model/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel Notebook Model */
+        post: operations["cancel_notebook_model_notebooks__notebook_id__model_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Models */
+        get: operations["list_models_models_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models/{profile_id}/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Setup Model */
+        post: operations["setup_model_models__profile_id__setup_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models/{profile_id}/setup/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel Model Setup */
+        post: operations["cancel_model_setup_models__profile_id__setup_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notebooks/{notebook_id}/search-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search State */
+        get: operations["search_state_notebooks__notebook_id__search_state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notebooks/{notebook_id}/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search Notebook */
+        post: operations["search_notebook_notebooks__notebook_id__search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -559,12 +730,85 @@ export interface components {
             checkpoint: components["schemas"]["JsonValue"];
         };
         JsonValue: unknown;
+        /** ModelGenerationRequest */
+        ModelGenerationRequest: {
+            /** Generation */
+            generation: number;
+        };
+        /** ModelSetupPayload */
+        ModelSetupPayload: {
+            /** Profile Id */
+            profile_id: string;
+            /** Manifest Id */
+            manifest_id: string;
+            /** Model */
+            model: string;
+            /** Language Scope */
+            language_scope: string;
+            /** Is Default */
+            is_default: boolean;
+            /** Download Bytes */
+            download_bytes: number;
+            /** State */
+            state: string;
+            /** Generation */
+            generation: number;
+            /** Received Bytes */
+            received_bytes: number;
+            /** Failure Code */
+            failure_code: string | null;
+            /** Can Cancel */
+            can_cancel: boolean;
+            /** Can Retry */
+            can_retry: boolean;
+        };
+        /** ModelSetupRequest */
+        ModelSetupRequest: {
+            /** Request Key */
+            request_key: string;
+            /** Generation */
+            generation: number;
+        };
         /** NotebookCreate */
         NotebookCreate: {
             /** Title */
             title: string;
             /** Notebook Id */
             notebook_id?: string | null;
+        };
+        /** NotebookModelChoice */
+        NotebookModelChoice: {
+            /** Request Key */
+            request_key: string;
+            /** Generation */
+            generation: number;
+            /** Profile Id */
+            profile_id: string;
+        };
+        /** NotebookModelPayload */
+        NotebookModelPayload: {
+            /** Notebook Id */
+            notebook_id: string;
+            /** Active Profile Id */
+            active_profile_id: string;
+            /** Pending Profile Id */
+            pending_profile_id: string | null;
+            /** Generation */
+            generation: number;
+            /** Ready Sources */
+            ready_sources: number;
+            /** Rebuilt Sources */
+            rebuilt_sources: number;
+            /**
+             * Failed Sources
+             * @default 0
+             */
+            failed_sources: number;
+            /**
+             * Cancelled Sources
+             * @default 0
+             */
+            cancelled_sources: number;
         };
         /** NotebookPayload */
         NotebookPayload: {
@@ -577,12 +821,24 @@ export interface components {
             /** Updated At */
             updated_at: string;
         };
+        /** PreparationAction */
+        PreparationAction: {
+            /** Job Id */
+            job_id: string;
+        };
         /** ProcessingActionPayload */
         ProcessingActionPayload: {
             /** Job Id */
-            job_id: string;
+            job_id: string | null;
             /** Status */
             status: string;
+        };
+        /** ResumePreparation */
+        ResumePreparation: {
+            /** Job Id */
+            job_id: string;
+            /** Request Key */
+            request_key: string;
         };
         /** ReviewDecisionRequest */
         ReviewDecisionRequest: {
@@ -590,6 +846,87 @@ export interface components {
             decision: string;
             /** Generation */
             generation: number;
+        };
+        /** SearchCitation */
+        SearchCitation: {
+            /** Passage Id */
+            passage_id: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Start Offset */
+            start_offset: number | null;
+            /** End Offset */
+            end_offset: number | null;
+            /** Page Number */
+            page_number: number | null;
+        };
+        /** SearchRequest */
+        SearchRequest: {
+            /** Query */
+            query: string;
+            /**
+             * Mode
+             * @default meaning
+             * @enum {string}
+             */
+            mode: "meaning" | "words";
+            /**
+             * Limit
+             * @default 10
+             */
+            limit: number;
+        };
+        /** SearchResponse */
+        SearchResponse: {
+            /** Notebook Id */
+            notebook_id: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "meaning" | "words";
+            /** Revision */
+            revision: string;
+            /** Ready Sources */
+            ready_sources: number;
+            /** Results */
+            results: components["schemas"]["SearchResult"][];
+        };
+        /** SearchResult */
+        SearchResult: {
+            /** Source Id */
+            source_id: string;
+            /** Source Version Id */
+            source_version_id: string;
+            /** Index Version Id */
+            index_version_id: string;
+            /** Chunk Id */
+            chunk_id: string;
+            /** Manifest Id */
+            manifest_id: string;
+            /** Source Name */
+            source_name: string;
+            /** Text */
+            text: string;
+            /** Score */
+            score: number;
+            /** Import Id */
+            import_id: string | null;
+            /** Filename */
+            filename: string | null;
+            /** Profile Id */
+            profile_id: string | null;
+            /** Pdf Role */
+            pdf_role: ("current" | "previous") | null;
+            /** Citations */
+            citations: components["schemas"]["SearchCitation"][];
+        };
+        /** SearchState */
+        SearchState: {
+            /** Notebook Id */
+            notebook_id: string;
+            /** Revision */
+            revision: string;
         };
         /** SourcePayload */
         SourcePayload: {
@@ -607,6 +944,43 @@ export interface components {
             current_import_id: string | null;
             /** Pending Import Id */
             pending_import_id: string | null;
+        };
+        /** SourceSearchProgress */
+        SourceSearchProgress: {
+            /** Source Id */
+            source_id: string;
+            /** Status */
+            status: string;
+            /** Step */
+            step: string | null;
+            /** Waiting Reason */
+            waiting_reason: string | null;
+            /** Failure Code */
+            failure_code: string | null;
+            /** Failure Reason */
+            failure_reason?: string | null;
+            /** Profile Id */
+            profile_id?: string | null;
+            /** Filename */
+            filename?: string | null;
+            /** Pdf Role */
+            pdf_role?: ("current" | "pending" | "previous") | null;
+            /** Completed Chunks */
+            completed_chunks: number;
+            /** Total Chunks */
+            total_chunks: number;
+            /** Job Id */
+            job_id?: string | null;
+            /**
+             * Can Cancel
+             * @default false
+             */
+            can_cancel: boolean;
+            /**
+             * Can Resume
+             * @default false
+             */
+            can_resume: boolean;
         };
         /** StoragePayload */
         StoragePayload: {
@@ -1331,6 +1705,364 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExtractionReviewPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_search_preparation_sources__source_id__search_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PreparationAction"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreparationAction"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resume_search_preparation_sources__source_id__search_resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResumePreparation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreparationAction"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    source_search_progress_sources__source_id__search_progress_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                source_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceSearchProgress"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_notebook_model_notebooks__notebook_id__model_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotebookModelPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    choose_notebook_model_notebooks__notebook_id__model_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotebookModelChoice"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotebookModelPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_notebook_model_notebooks__notebook_id__model_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelGenerationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotebookModelPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_models_models_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSetupPayload"][];
+                };
+            };
+        };
+    };
+    setup_model_models__profile_id__setup_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelSetupRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSetupPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_model_setup_models__profile_id__setup_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                profile_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModelGenerationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelSetupPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_state_notebooks__notebook_id__search_state_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_notebook_notebooks__notebook_id__search_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                notebook_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResponse"];
                 };
             };
             /** @description Validation Error */

@@ -8,10 +8,13 @@ from core.api.auth import AuthMiddleware
 from core.api.extraction import router as extraction_router
 from core.api.identity import APP_VERSION
 from core.api.jobs import router as jobs_router
+from core.api.models import router as models_router
 from core.api.notebooks import router as notebooks_router
 from core.api.pdfs import router as pdfs_router
 from core.api.routes import router
+from core.api.search import router as search_router
 from core.persistence.store import PersistenceStore
+from core.search.query import QueryService
 
 
 class LifecycleService(Protocol):
@@ -38,6 +41,9 @@ def create_app(
     pdf_ingest: LifecycleService | None = None,
     runner: LifecycleService | None = None,
     sweeper: LifecycleService | None = None,
+    model_setup: LifecycleService | None = None,
+    notebook_models: object | None = None,
+    search_queries: QueryService | None = None,
 ) -> FastAPI:
     """Build the core FastAPI app.
 
@@ -50,7 +56,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        services = (pdf_ingest, runner, sweeper)
+        services = (pdf_ingest, model_setup, runner, sweeper)
         started: list[LifecycleService] = []
         try:
             for service in services:
@@ -78,6 +84,12 @@ def create_app(
     )
     app.state.store = store
     app.state.pdf_ingest = pdf_ingest
+    app.state.runner = runner
+    app.state.model_setup = model_setup
+    app.state.notebook_models = notebook_models
+    app.state.search_queries = search_queries or (
+        QueryService(store, store.database.config.data_dir / "models") if store else None
+    )
     app.add_middleware(AuthMiddleware, token=token, allowed_origins=origins)
     app.include_router(router)
     # Mounted unconditionally so the API contract (and its generated types)
@@ -86,4 +98,6 @@ def create_app(
     app.include_router(notebooks_router)
     app.include_router(pdfs_router)
     app.include_router(extraction_router)
+    app.include_router(models_router)
+    app.include_router(search_router)
     return app

@@ -7,6 +7,20 @@ use tauri::{Manager, RunEvent, State};
 
 use core_process::{log_spawn_event, CoreConnection, CoreState, READ_TIMEOUT_POLL_MILLIS};
 
+// Only the existing native-test feature can redirect its isolated test library.
+// Production binaries do not read this environment variable.
+#[cfg(feature = "webdriver")]
+fn webdriver_data_dir(
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<std::path::PathBuf>, &'static str> {
+    match value.map(std::path::PathBuf::from) {
+        Some(path) if !path.is_absolute() => {
+            Err("CORPI_E2E_DATA_DIR must be an absolute test path")
+        }
+        path => Ok(path),
+    }
+}
+
 /// Waits (bounded) until the background spawn finishes, so the first UI render
 /// already knows whether the core is available.
 #[tauri::command]
@@ -44,6 +58,15 @@ pub fn run() {
                     let message = "core user app-data directory is unavailable".to_string();
                     log_spawn_event(&message);
                     state.set_failure(message);
+                    return Ok(());
+                }
+            };
+            #[cfg(feature = "webdriver")]
+            let data_dir = match webdriver_data_dir(std::env::var_os("CORPI_E2E_DATA_DIR")) {
+                Ok(Some(path)) => path,
+                Ok(None) => data_dir,
+                Err(message) => {
+                    state.set_failure(message.to_string());
                     return Ok(());
                 }
             };
@@ -85,4 +108,20 @@ pub fn run() {
                 state.stop();
             }
         });
+}
+
+#[cfg(all(test, feature = "webdriver"))]
+mod tests {
+    use super::webdriver_data_dir;
+
+    #[test]
+    fn test_library_override_requires_an_absolute_path_and_is_optional() {
+        assert!(webdriver_data_dir(None).unwrap().is_none());
+        assert!(webdriver_data_dir(Some("relative-test-library".into())).is_err());
+        let absolute = std::env::temp_dir().join("corpi-native-test-library");
+        assert_eq!(
+            webdriver_data_dir(Some(absolute.clone().into_os_string())).unwrap(),
+            Some(absolute)
+        );
+    }
 }

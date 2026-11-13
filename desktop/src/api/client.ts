@@ -30,9 +30,67 @@ export type PdfImport = components["schemas"]["ImportPayload"];
 export type StorageReport = components["schemas"]["StoragePayload"];
 export type PdfImportTrash = components["schemas"]["TrashPayload"];
 export type ProcessingAction = components["schemas"]["ProcessingActionPayload"];
+export type SourceSearchProgress = components["schemas"]["SourceSearchProgress"];
 export type ExtractionPageReport = components["schemas"]["ExtractionPagePayload"];
 export type ExtractionReview = components["schemas"]["ExtractionReviewPayload"];
 export type ExtractionReport = components["schemas"]["ExtractionReportPayload"];
+export type SupportedModel = components["schemas"]["ModelSetupPayload"];
+export type NotebookModel = components["schemas"]["NotebookModelPayload"];
+export type NotebookSearchResult = components["schemas"]["SearchResult"];
+export type NotebookSearchResponse = components["schemas"]["SearchResponse"];
+export type NotebookSearchState = components["schemas"]["SearchState"];
+
+export function getNotebookSearchState(
+  connection: CoreConnection, notebookId: string, signal?: AbortSignal,
+): Promise<NotebookSearchState> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebookId)}/search-state`, { signal });
+}
+
+export function searchNotebook(
+  connection: CoreConnection, notebookId: string, query: string,
+  mode: "meaning" | "words", signal?: AbortSignal,
+): Promise<NotebookSearchResponse> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebookId)}/search`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, mode, limit: 10 }), signal,
+  });
+}
+
+export function listModels(connection: CoreConnection): Promise<SupportedModel[]> {
+  return coreRequest(connection, "/models");
+}
+
+export function getNotebookModel(connection: CoreConnection, notebookId: string): Promise<NotebookModel> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebookId)}/model`);
+}
+
+export function setupModel(connection: CoreConnection, model: SupportedModel): Promise<SupportedModel> {
+  return coreRequest(connection, `/models/${encodeURIComponent(model.profile_id)}/setup`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request_key: crypto.randomUUID(), generation: model.generation }),
+  });
+}
+
+export function cancelModelSetup(connection: CoreConnection, model: SupportedModel): Promise<SupportedModel> {
+  return coreRequest(connection, `/models/${encodeURIComponent(model.profile_id)}/setup/cancel`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation: model.generation }),
+  });
+}
+
+export function chooseNotebookModel(connection: CoreConnection, notebook: NotebookModel, profileId: string): Promise<NotebookModel> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebook.notebook_id)}/model`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile_id: profileId, request_key: crypto.randomUUID(), generation: notebook.generation }),
+  });
+}
+
+export function cancelNotebookModel(connection: CoreConnection, notebook: NotebookModel): Promise<NotebookModel> {
+  return coreRequest(connection, `/notebooks/${encodeURIComponent(notebook.notebook_id)}/model/cancel`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ generation: notebook.generation }),
+  });
+}
 export type CoreHealth = paths["/health"]["get"]["responses"][200]["content"]["application/json"];
 
 export async function coreRequest<T>(

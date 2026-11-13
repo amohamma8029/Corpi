@@ -6,6 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { WindowsWebDriver } from "./windows-webdriver.mjs";
+
 const desktop = fileURLToPath(new URL("../", import.meta.url));
 const repo = path.dirname(desktop);
 const windows = process.platform === "win32";
@@ -20,6 +22,7 @@ const provider = process.platform === "darwin" || process.argv.includes("--embed
 const results = path.join(desktop, "e2e-results", provider);
 const binary = path.join(desktop, `src-tauri/target/release/corpi-desktop${windows ? ".exe" : ""}`);
 const reuseBuild = process.argv.includes("--reuse-build");
+const modelDownloads = process.env.CORPI_RUN_MODEL_DOWNLOAD === "1";
 let previousBuild = null;
 if (reuseBuild) {
   try {
@@ -58,6 +61,7 @@ const evidence = {
   tauriServiceVersion: packageJson.devDependencies["@wdio/tauri-service"],
   provider,
   reusedBuild: reuseBuild,
+  modelDownloads,
   startedAt: new Date().toISOString(),
   stage: "setup",
   status: "running",
@@ -133,6 +137,7 @@ async function waitForDriver(child) {
 
 const existingCorePids = new Set();
 let driver;
+let windowsDriver;
 let failure;
 try {
   for (const pid of corePids()) existingCorePids.add(pid);
@@ -150,36 +155,63 @@ try {
   await run("pnpm", ["run", "check:e2e"], 120_000);
   evidence.stage = "build";
   saveEvidence();
+  let windowsConfiguration;
+  if (windows && provider === "external") {
+    const edgeDriver = process.env.CORPI_EDGE_DRIVER ?? execFileSync("powershell.exe", ["-NoProfile", "-Command",
+      "$driver = (Get-Command msedgedriver.exe -ErrorAction SilentlyContinue).Source; if (-not $driver) { $driver = Get-ChildItem \"$env:LOCALAPPDATA\\Microsoft\\WinGet\\Packages\" -Recurse -Filter msedgedriver.exe | Select-Object -First 1 -ExpandProperty FullName }; if (-not $driver) { throw 'Microsoft Edge WebDriver was not found' }; $driver"],
+    { encoding: "utf8", timeout: 15_000 }).trim();
+    const lock = readFileSync(path.join(desktop, "src-tauri/Cargo.lock"), "utf8");
+    const versions = [...lock.matchAll(/\[\[package\]\]\r?\nname = "wry"\r?\nversion = "([^"]+)"/g)];
+    if (versions.length !== 1) throw new Error("Windows E2E requires exactly one locked Wry version.");
+    if (reuseBuild && !previousBuild.windowsBuild) {
+      throw new Error("The previous Windows binary has no direct-API test settings; rebuild without --reuse-build.");
+    }
+    windowsDriver = new WindowsWebDriver({ application: binary, driver: edgeDriver, cwd: desktop, env });
+    const prepared = await windowsDriver.prepare({
+      baseConfig: JSON.parse(readFileSync(path.join(desktop, "src-tauri/tauri.conf.json"), "utf8")),
+      e2eConfig: JSON.parse(readFileSync(path.join(desktop, "src-tauri/tauri.e2e.conf.json"), "utf8")),
+      wryVersion: versions[0][1],
+    }, reuseBuild ? previousBuild.windowsBuild : undefined);
+    windowsConfiguration = JSON.stringify(prepared.configuration);
+    evidence.windowsBuild = prepared.binding;
+    saveEvidence();
+  }
   const buildArgs = ["tauri", "build", "--no-bundle", "--config",
-    `src-tauri/tauri.${provider === "embedded" ? "webdriver" : "e2e"}.conf.json`];
+    windowsConfiguration ?? `src-tauri/tauri.${provider === "embedded" ? "webdriver" : "e2e"}.conf.json`];
   if (provider === "embedded") buildArgs.push("--features", "webdriver");
   if (!reuseBuild) await run("pnpm", buildArgs);
   evidence.testBinarySha256 = createHash("sha256").update(readFileSync(binary)).digest("hex");
 
   if (provider === "external") {
-    const driverArgs = ["--port", "4444"];
     if (windows) {
-      const edgeDriver = process.env.CORPI_EDGE_DRIVER ?? execFileSync("powershell.exe", ["-NoProfile", "-Command",
-        "$driver = (Get-Command msedgedriver.exe -ErrorAction SilentlyContinue).Source; if (-not $driver) { $driver = Get-ChildItem \"$env:LOCALAPPDATA\\Microsoft\\WinGet\\Packages\" -Recurse -Filter msedgedriver.exe | Select-Object -First 1 -ExpandProperty FullName }; if (-not $driver) { throw 'Microsoft Edge WebDriver was not found' }; $driver"],
-      { encoding: "utf8", timeout: 15_000 }).trim();
-      driverArgs.push("--native-driver", edgeDriver);
+      evidence.stage = "native-startup";
+      saveEvidence();
+      Object.assign(env, await windowsDriver.start());
+      evidence.windowsSession = { mode: "prelaunched-classic", loopbackOnly: true };
+    } else {
+      driver = spawn("tauri-driver", ["--port", "4444"], { cwd: desktop, env, stdio: "inherit", detached: true });
+      // Capture spawn failure before polling, avoiding an unhandled child-process error.
+      let spawnError;
+      driver.once("error", (error) => { spawnError = error; });
+      await delay(50);
+      if (spawnError) throw spawnError;
+      await waitForDriver(driver);
     }
-    driver = spawn("tauri-driver", driverArgs, { cwd: desktop, env, stdio: "inherit", detached: !windows });
-    // Capture spawn failure before polling, avoiding an unhandled child-process error.
-    let spawnError;
-    driver.once("error", (error) => { spawnError = error; });
-    await delay(50);
-    if (spawnError) throw spawnError;
-    await waitForDriver(driver);
   }
   evidence.stage = "viewer";
   saveEvidence();
-  await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], 300_000);
+  // Allow the bounded setup test plus the ordinary viewer/startup checks.
+  await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], modelDownloads ? 1_800_000 : 300_000);
 } catch (error) {
   failure = error;
 } finally {
-  try { await stopProcess(driver); }
-  catch (error) { failure ??= error; }
+  try {
+    if (windowsDriver) await windowsDriver.stop();
+    else await stopProcess(driver);
+  } catch (error) {
+    evidence.cleanupErrors = (error.errors ?? [error]).map((item) => item.message);
+    failure ??= error;
+  }
   // Observe shutdown before any core cleanup. Never kill a core to make this pass.
   let orphans = [];
   const deadline = Date.now() + 10_000;
