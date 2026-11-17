@@ -17,7 +17,7 @@ function bytes(value: number) { return `${(value / 1_000_000).toFixed(1)} MB`; }
 export function ModelSettings({ connection, notebookId }: { connection: CoreConnection; notebookId: string }) {
   const [models, setModels] = useState<SupportedModel[]>([]);
   const [notebook, setNotebook] = useState<NotebookModel | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ source: "poll" | "action"; message: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const epoch = useRef(0);
   const revision = useRef(0);
@@ -43,9 +43,14 @@ export function ModelSettings({ connection, notebookId }: { connection: CoreConn
         if (!stopped && epoch.current === current && read === revision.current && selection.notebook_id === notebookId) {
           setModels(available);
           setNotebook(selection);
+          setError(previous => previous?.source === "poll" ? null : previous);
         }
       } catch (cause) {
-        if (!stopped && epoch.current === current && read === revision.current) setError(cause instanceof Error ? cause.message : String(cause));
+        if (!stopped && epoch.current === current && read === revision.current) {
+          setError(previous => previous?.source === "action" ? previous : {
+            source: "poll", message: cause instanceof Error ? cause.message : String(cause),
+          });
+        }
       } finally { loading = false; }
     }
     void refresh();
@@ -67,7 +72,7 @@ export function ModelSettings({ connection, notebookId }: { connection: CoreConn
       ]);
       if (epoch.current === current && selection.notebook_id === notebookId) { setModels(available); setNotebook(selection); }
     } catch (cause) {
-      if (epoch.current === current) setError(cause instanceof Error ? cause.message : String(cause));
+      if (epoch.current === current) setError({ source: "action", message: cause instanceof Error ? cause.message : String(cause) });
     } finally { if (epoch.current === current) { acting.current = false; setBusy(false); } }
   }
 
@@ -80,7 +85,7 @@ export function ModelSettings({ connection, notebookId }: { connection: CoreConn
       <h3>Local search</h3>
       <p>Models prepare search on your device. Originals stay accessible during setup.</p>
       <p>Large sources may take up to twenty minutes to prepare. Search in the same language as your documents.</p>
-      {error ? <p role="alert">{error}</p> : null}
+      {error ? <p role="alert">{error.message}</p> : null}
       {notebook ? <>
         <label htmlFor="search-model">Notebook model</label>
         <select id="search-model" value={notebook.pending_profile_id ?? notebook.active_profile_id}
