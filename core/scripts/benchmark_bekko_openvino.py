@@ -1,4 +1,8 @@
-"""Temporary official Bekko OpenVINO IR diagnostics under original resource limits."""
+"""Temporary official Bekko OpenVINO IR diagnostics under original resource limits.
+
+The shared historical OpenVINO worker does not accept the current protocol's
+runtime options. Its replay is unsupported; saved results are not a fresh pass.
+"""
 
 import argparse
 import hashlib
@@ -31,6 +35,12 @@ from core.search.supervisor import (
 )
 
 MANIFEST = Path(__file__).resolve().parents[1] / "benchmarks/bekko_openvino_model.json"
+UNSUPPORTED_REPLAY = (
+    "Historical OpenVINO worker replay is unsupported: the shared experimental adapter does "
+    "not accept the current memory_arena/stop_spinning protocol. Saved model identities and "
+    "measurements are unchanged. Do not bypass runtime options or treat retained results "
+    "as a fresh replay."
+)
 WHEELS = {
     "openvino": (
         "2026.4.1",
@@ -463,6 +473,8 @@ def main():
         elif args.prepare:
             backend_tools.prepare(args.directory)
         elif args.worker:
+            if args.backend == "openvino":
+                parser.error(UNSUPPORTED_REPLAY)
             catalog = {**contextual.profiles(), "bekko-a8m-openvino": load_profile(MANIFEST)}
             contextual.profiles = lambda: catalog
             args.profile_operators = args.float_integer_matrices = False
@@ -470,7 +482,9 @@ def main():
         else:
             if args.models_directory is None or args.capacity_run is None:
                 parser.error("comparison requires models-directory and capacity-run")
-            smoke(args)
+            # The paired screen would otherwise run its ORT half before reaching
+            # the unsupported OpenVINO worker. Refuse it before any inference.
+            parser.error(UNSUPPORTED_REPLAY)
 
 
 if __name__ == "__main__":

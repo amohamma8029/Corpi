@@ -1,4 +1,8 @@
-"""Pinned temporary Bekko Q8_0 CPU experiment; no application/runtime adoption."""
+"""Pinned temporary Bekko Q8_0 CPU experiment; no application/runtime adoption.
+
+Fresh model setup is unsupported by the current single-repository downloader.
+The mixed-source manifest, cached-asset verification and old measurements remain.
+"""
 
 import argparse
 import ctypes as ct
@@ -11,7 +15,6 @@ import socket
 import stat
 import statistics
 import struct
-import subprocess
 import sys
 import time
 import zipfile
@@ -23,9 +26,7 @@ from benchmark_contextual_multilingual import profiles
 from benchmark_static_multilingual import load_profile
 from pin_search_models import fetch
 
-from core.search.download import download_profile
 from core.search.profiles import ModelFile, verify_installation
-from core.search.supervisor import stop_owned_process_tree, worker_environment
 
 if "--worker" in sys.argv:
     os.environ.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="2", MKL_NUM_THREADS="1")
@@ -147,7 +148,11 @@ class GGufRuntime:
     metadata: Path | None = None
     physical_batch = 1
 
-    def __init__(self, path, profile):
+    def __init__(self, path, profile, *, memory_arena=True, stop_spinning=True):
+        # Defaults retain the inspected llama.cpp implementation. Its pinned ABI
+        # has no ONNX arena/spinning equivalents; reject non-default requests.
+        if not memory_arena or not stop_spinning:
+            raise ValueError("runtime_mismatch")
         from benchmark_contextual_multilingual import UTF8InputTokenizer
 
         self.profile = profile
@@ -968,9 +973,9 @@ def main():
         GGufRuntime.physical_batch = args.native_passages
 
         class TracedRuntime(GGufRuntime):
-            def __init__(self, *parameters):
+            def __init__(self, *parameters, **options):
                 try:
-                    super().__init__(*parameters)
+                    super().__init__(*parameters, **options)
                 except Exception as error:
                     if args.metadata:
                         args.metadata.write_text(
@@ -1019,38 +1024,16 @@ def main():
             parser.error("models-directory required")
         profile = load_profile(MANIFEST)
         target = args.models_directory / profile.identity
-        if args.download_child:
-            print(json.dumps({"received_bytes": download_profile(target, profile)}))
-        elif target.exists():
-            verify_installation(target, profile)
-            print("Existing GGUF model verified")
-        else:
-            started = time.monotonic()
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "--download-child",
-                    "--models-directory",
-                    str(args.models_directory),
-                ],
-                env=worker_environment(),
+        if args.download_child or not target.exists():
+            parser.error(
+                "Fresh GGUF setup is unsupported: its historical manifest combines GGUF assets "
+                "with reference ONNX tokenizer/configuration assets from another repository. "
+                "The downloader requires one exact repository/revision/path. Keep the manifest "
+                "and saved measurements unchanged; --download can verify an already complete "
+                "cached installation."
             )
-            try:
-                if process.wait(timeout=600) != 0:
-                    raise RuntimeError("GGUF setup failed; incomplete staging retained")
-            finally:
-                stop_owned_process_tree(process)
-            result = {
-                "manifest": profile.identity,
-                "bytes": profile.download_bytes,
-                "seconds": time.monotonic() - started,
-                "launcher_reaped": process.poll() is not None,
-            }
-            (args.models_directory / "bekko-gguf-setup.json").write_text(
-                json.dumps(result, indent=2) + "\n", encoding="utf-8"
-            )
-            print(json.dumps(result, indent=2))
+        verify_installation(target, profile)
+        print("Existing GGUF model verified")
     elif args.inspect_model:
         if args.models_directory is None or args.directory is None:
             parser.error("model inspection needs model and owned result directories")
