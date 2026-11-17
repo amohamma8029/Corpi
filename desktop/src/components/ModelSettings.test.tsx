@@ -117,3 +117,73 @@ it("retains the failure and allows another explicit cancel attempt after an acti
   expect(screen.getByText(/Model change could not finish/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Cancel model change" }).hasAttribute("disabled")).toBe(false);
 });
+
+it.each(["models", "notebook"] as const)("clears a failed %s poll after a successful current poll", async target => {
+  vi.useFakeTimers();
+  const failure = new Error("Model settings temporarily unavailable");
+  if (target === "models") vi.mocked(listModels).mockRejectedValueOnce(failure);
+  else vi.mocked(getNotebookModel).mockRejectedValueOnce(failure);
+  await act(async () => { render(<ModelSettings connection={connection} notebookId="one" />); });
+  expect(screen.getByRole("alert").textContent).toBe(failure.message);
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  expect(screen.getByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Download Fast English search" })).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(listModels).toHaveBeenCalledTimes(2);
+  expect(getNotebookModel).toHaveBeenCalledTimes(2);
+  expect(setupModel).not.toHaveBeenCalled();
+});
+
+it("keeps an unresolved action error through failed and successful polls until an explicit retry", async () => {
+  vi.useFakeTimers();
+  vi.mocked(setupModel).mockRejectedValueOnce(new Error("Controlled setup failure"));
+  await act(async () => { render(<ModelSettings connection={connection} notebookId="one" />); });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Download Fast English search" })); });
+  expect(screen.getByRole("alert").textContent).toBe("Controlled setup failure");
+
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  expect(screen.getByRole("alert").textContent).toBe("Controlled setup failure");
+  vi.mocked(listModels).mockRejectedValueOnce(new Error("Temporary polling failure"));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  expect(screen.getByRole("alert").textContent).toBe("Controlled setup failure");
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  expect(screen.getByRole("alert").textContent).toBe("Controlled setup failure");
+
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Download Fast English search" })); });
+  expect(setupModel).toHaveBeenCalledTimes(2);
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it.each(["success", "failure"] as const)("ignores a pre-action poll's late %s without erasing the action error", async reply => {
+  vi.useFakeTimers();
+  await act(async () => { render(<ModelSettings connection={connection} notebookId="one" />); });
+  let finish!: (value: NotebookModel) => void;
+  let fail!: (cause: Error) => void;
+  vi.mocked(getNotebookModel).mockImplementationOnce(() => new Promise((resolve, reject) => {
+    finish = resolve; fail = reject;
+  }));
+  await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
+  vi.mocked(setupModel).mockRejectedValueOnce(new Error("Current action failed"));
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Download Fast English search" })); });
+  expect(screen.getByRole("alert").textContent).toBe("Current action failed");
+
+  await act(async () => {
+    if (reply === "success") finish({ ...selection, active_profile_id: "multilingual-e5" });
+    else fail(new Error("Obsolete polling failure"));
+  });
+  expect(screen.getByRole("alert").textContent).toBe("Current action failed");
+  expect(screen.getByText(/Active: MiniLM-L6-v2/)).toBeTruthy();
+});
+
+it("does not let an old notebook's late poll clear the current notebook's polling error", async () => {
+  let finish!: (value: NotebookModel) => void;
+  vi.mocked(getNotebookModel).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const view = render(<ModelSettings connection={connection} notebookId="one" />);
+  await waitFor(() => expect(getNotebookModel).toHaveBeenCalledWith(connection, "one"));
+  vi.mocked(getNotebookModel).mockRejectedValueOnce(new Error("Current notebook unavailable"));
+  view.rerender(<ModelSettings connection={connection} notebookId="two" />);
+  expect((await screen.findByRole("alert")).textContent).toBe("Current notebook unavailable");
+  await act(async () => finish(selection));
+  expect(screen.getByRole("alert").textContent).toBe("Current notebook unavailable");
+  expect(screen.queryByText(/Active: MiniLM-L6-v2/)).toBeNull();
+});
