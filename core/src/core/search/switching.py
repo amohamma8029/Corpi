@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 
@@ -9,6 +10,7 @@ from core.persistence.errors import ConflictingWriteError
 from core.persistence.models import AttemptGuard, JSONValue, utc_timestamp
 from core.persistence.store import (
     PersistenceStore,
+    _complete_search_publication,
     _save_job_step,
     _verify_attempt_current,
     _verify_extraction_decision,
@@ -74,6 +76,108 @@ def switch_current(connection: sqlite3.Connection, handoff: sqlite3.Row) -> bool
             not handoff["review_generation"]
             or (review and review[0] == "confirmed" and review[1] == handoff["review_generation"])
         )
+    )
+
+
+def committed_activation_current(connection: sqlite3.Connection, handoff: sqlite3.Row) -> bool:
+    """Recover an exact pre-finalization activation, not new work for an active model.
+
+    Older running jobs can have committed activation and all checkpoints before
+    exiting. The original active request and exact ready ownership prove acceptance.
+    A later choice may remain pending, select that same active model, or be cancelled
+    (which advances the generation without creating another request). Require that
+    latest receipt to explain the current selection; an unrecorded increment is not
+    recovery authority. Only checkpoint reuse is admitted, never new publication.
+    Unactivated/cancelled original requests and failed/cancelled jobs or attempts
+    never qualify.
+    """
+    row = connection.execute(
+        """SELECT i.id AS index_id,final.checkpoint_json,a.started_at,final.committed_at,
+                  a.failure_reason,a.outcome
+           FROM search_handoffs h JOIN jobs j ON j.id=h.job_id
+           JOIN job_status status ON status.job_id=j.id
+           JOIN search_job_inputs inputs ON inputs.job_id=j.id
+           JOIN sources s ON s.id=j.source_id
+           JOIN notebook_profiles n ON n.notebook_id=s.notebook_id
+           JOIN notebook_model_requests activation_request
+             ON activation_request.notebook_id=n.notebook_id
+             AND activation_request.manifest_id=h.manifest_id
+             AND activation_request.generation=h.selection_generation
+             AND activation_request.state='active'
+           JOIN notebook_model_requests latest_request
+             ON latest_request.notebook_id=n.notebook_id
+             AND latest_request.generation=(SELECT MAX(request.generation)
+                 FROM notebook_model_requests request WHERE request.notebook_id=n.notebook_id)
+           JOIN source_readiness ready ON ready.source_id=j.source_id
+             AND ready.source_version_id=j.source_version_id
+             AND ready.published_by_job_id=j.id
+           JOIN source_readiness_indexes ri ON ri.source_id=ready.source_id
+           JOIN index_versions i ON i.id=ri.index_version_id
+             AND i.source_id=j.source_id AND i.source_version_id=j.source_version_id
+             AND i.extraction_version_id=j.extraction_version_id
+           JOIN search_generations g ON g.index_version_id=i.id AND g.manifest_id=h.manifest_id
+           JOIN profile_search_publications p ON p.source_id=j.source_id
+             AND p.source_version_id=j.source_version_id AND p.index_version_id=i.id
+             AND p.published_by_job_id=j.id AND p.manifest_id=h.manifest_id
+             AND p.selection_generation=h.selection_generation
+           JOIN job_steps plan ON plan.job_id=j.id AND plan.step_key='plan-search'
+             AND plan.output_index_version_id=i.id
+           JOIN job_steps final ON final.job_id=j.id AND final.step_key='publish-search'
+           JOIN job_step_attempts a ON a.job_id=j.id AND a.step_key=final.step_key
+             AND a.attempt_number=(SELECT MAX(latest.attempt_number) FROM job_step_attempts latest
+                 WHERE latest.job_id=j.id AND latest.step_key=a.step_key)
+           JOIN extraction_outcomes o ON o.extraction_version_id=i.extraction_version_id
+           LEFT JOIN extraction_reviews review
+             ON review.extraction_version_id=i.extraction_version_id
+           LEFT JOIN pdf_imports pdf ON pdf.source_version_id=j.source_version_id
+           LEFT JOIN source_pdf_state saved ON saved.source_id=j.source_id
+           WHERE h.job_id=? AND h.purpose='model-switch' AND h.state<>'cancelled'
+             AND h.extraction_version_id=? AND h.manifest_id=? AND h.selection_generation=?
+             AND h.review_generation=? AND j.extraction_version_id=h.extraction_version_id
+             AND j.kind='pdf-search' AND status.status IN ('queued','running')
+             AND status.superseded_by_job_id IS NULL AND status.current_step_key='publish-search'
+              AND n.active_manifest_id=h.manifest_id
+              AND (
+                  (n.selection_generation=latest_request.generation AND (
+                      (latest_request.state='active' AND n.pending_manifest_id IS NULL
+                          AND latest_request.manifest_id=n.active_manifest_id)
+                      OR (latest_request.state='pending'
+                          AND latest_request.manifest_id=n.pending_manifest_id
+                          AND latest_request.manifest_id<>n.active_manifest_id)))
+                  OR (n.selection_generation=latest_request.generation+1
+                      AND latest_request.state='cancelled' AND n.pending_manifest_id IS NULL
+                      AND latest_request.manifest_id<>n.active_manifest_id))
+             AND inputs.review_generation=h.review_generation
+             AND COALESCE(review.generation,0)=h.review_generation
+             AND (o.outcome='complete' OR (o.outcome='partial' AND review.state='confirmed'))
+             AND i.extraction_version_id=(SELECT e.id FROM extraction_versions e
+                 WHERE e.source_version_id=j.source_version_id
+                 ORDER BY e.created_at DESC,e.rowid DESC LIMIT 1)
+             AND NOT EXISTS(SELECT 1 FROM source_trash t WHERE t.source_id=j.source_id)
+             AND (pdf.id IS NULL OR (pdf.state='ready' AND saved.current_import_id=pdf.id
+                 AND NOT EXISTS(SELECT 1 FROM pdf_import_trash t WHERE t.import_id=pdf.id)))
+             AND (SELECT count(*) FROM job_steps steps WHERE steps.job_id=j.id
+                 AND steps.step_key IN (
+                     'plan-search','embed-search','build-search','publish-search'))=4""",
+        (
+            handoff["job_id"],
+            handoff["extraction_version_id"],
+            handoff["manifest_id"],
+            handoff["selection_generation"],
+            handoff["review_generation"],
+        ),
+    ).fetchone()
+    if row is None or (
+        row["failure_reason"] is not None
+        or row["outcome"] not in (None, "ok")
+        or row["committed_at"] < row["started_at"]
+    ):
+        return False
+    checkpoint = json.loads(row["checkpoint_json"])
+    return (
+        isinstance(checkpoint, dict)
+        and checkpoint.get("index_id") == row["index_id"]
+        and checkpoint.get("ready") is True
     )
 
 
@@ -301,6 +405,7 @@ def publish_replacement(
                 payload,
                 inputs_sha256,
             )
+            _complete_search_publication(connection, job_id, guard)
         if deadline is not None and time.monotonic() >= deadline:
             raise ConflictingWriteError("model replacement publication deadline expired")
 

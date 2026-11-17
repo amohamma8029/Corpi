@@ -299,9 +299,11 @@ class SearchCoordinator:
             if row["state"] == "cancelled":
                 return "search_handoff_cancelled"
             if row["purpose"] == "model-switch":
-                from core.search.switching import switch_current
+                from core.search.switching import committed_activation_current, switch_current
 
-                if not switch_current(connection, row):
+                if not switch_current(connection, row) and not committed_activation_current(
+                    connection, row
+                ):
                     invalidate_handoffs(connection, job_id=job.id, reason="model selection changed")
                     return "search_input_changed"
                 reason = None if row["model_state"] == "installed" else "model_not_installed"

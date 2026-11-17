@@ -27,7 +27,11 @@ from core.jobs.runner import (
 )
 from core.persistence.errors import ConflictingWriteError
 from core.persistence.models import AttemptGuard, JSONValue, new_id, utc_timestamp
-from core.persistence.store import PersistenceStore, _verify_attempt_current
+from core.persistence.store import (
+    PersistenceStore,
+    _search_publication_completed,
+    _verify_attempt_current,
+)
 from core.search.chunking import CHUNKER_VERSION, eligible_passages, make_chunks
 from core.search.profiles import ModelProfile, profiles
 from core.search.provenance import validate_runtime_versions
@@ -324,7 +328,13 @@ def _settle_budget(
     elapsed = time.monotonic() - start
     try:
         with store._transaction() as connection:
-            _verify_attempt_current(connection, context.job_id, context.step_key, _guard(context))
+            # Final publication closes the job/attempt atomically with readiness.
+            # Its own accepted attempt may still refund unused time; failures keep
+            # the reservation and cannot change that committed success into failure.
+            if not _search_publication_completed(connection, context.job_id, _guard(context)):
+                _verify_attempt_current(
+                    connection, context.job_id, context.step_key, _guard(context)
+                )
             elapsed = time.monotonic() - start
             connection.execute(
                 f"UPDATE {table} SET spent_seconds=spent_seconds+? WHERE {column}=?",
