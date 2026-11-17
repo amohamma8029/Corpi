@@ -14,7 +14,11 @@ from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 
 from core.persistence.corelock import DataDirectoryLock
-from core.persistence.errors import ConflictingWriteError, CoreAlreadyRunningError
+from core.persistence.errors import (
+    ConflictingWriteError,
+    CoreAlreadyRunningError,
+    DatabaseBusyError,
+)
 from core.persistence.models import new_id, utc_timestamp, validate_id
 from core.persistence.store import PersistenceStore
 from core.search.handoff import SUPPORTED_PROFILE_IDS
@@ -42,6 +46,7 @@ class ModelSetupService:
         self._mutex = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     @property
     def data_dir(self) -> Path:
@@ -98,6 +103,16 @@ class ModelSetupService:
 
     async def start(self) -> None:
         await asyncio.to_thread(self.recover)
+        self._cleanup_task = asyncio.create_task(self._retry_cleanup())
+
+    async def _retry_cleanup(self) -> None:
+        # A surviving transfer may release its lock after startup recovery.
+        # Retry only recorded cleanup, outside read-only status polls.
+        while not await asyncio.to_thread(self._stop.wait, 1):
+            try:
+                await asyncio.to_thread(self.cleanup)
+            except DatabaseBusyError:
+                continue  # Keep pending evidence and retry after transient writer contention.
 
     async def stop(self) -> None:
         self._stop.set()
@@ -105,16 +120,32 @@ class ModelSetupService:
             await asyncio.to_thread(self._thread.join, 20)
             if self._thread.is_alive():
                 raise RuntimeError("model_setup_writer_did_not_stop")
+        if self._cleanup_task is not None:
+            await self._cleanup_task
 
     def state(self, profile_id: str) -> dict:
         profile = self.profile(profile_id)
         self._ensure(profile)
-        with self.store.database.connect() as connection:
-            return dict(
+        with self._mutex, self.store.database.connect() as connection:
+            row = dict(
                 connection.execute(
                     "SELECT * FROM model_installations WHERE manifest_id=?", (profile.identity,)
                 ).fetchone()
             )
+            # Terminal state invalidates a writer before its process/cleanup has
+            # necessarily stopped. Offer setup only when begin() can admit it.
+            row["can_retry"] = (
+                row["state"] in ("missing", "failed", "cancelled")
+                and not self._stop.is_set()
+                and (self._thread is None or not self._thread.is_alive())
+                and connection.execute(
+                    "SELECT 1 FROM model_setup_attempts"
+                    " WHERE cleanup_pending=1 AND manifest_id=? LIMIT 1",
+                    (profile.identity,),
+                ).fetchone()
+                is None
+            )
+            return row
 
     def recover(self) -> None:
         for profile_id in SUPPORTED_PROFILE_IDS:
