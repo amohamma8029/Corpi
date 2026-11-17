@@ -52,8 +52,11 @@ Background freshness checks neither run inference nor download assets.
 Imported PDFs, model files and search state are stored locally. Existing jobs and
 indexes retain their saved settings, vector provenance, attempts and charges across
 runtime upgrades; these controls do not encrypt the data or sandbox hostile files.
-The README describes download, worker and preparation limits. Current-head native,
-capacity and strict aggregate memory/no-swap acceptance remain separate obligations.
+The README describes download, worker and preparation limits. Final-candidate platform,
+capacity and integrated-workflow evidence remain required for milestone acceptance.
+Exhaustive physical-memory/GPU/cache certification and an absolute no-swapping guarantee
+remain unproved limitations, not Milestone 1 gates. The existing numerical limits and
+tested failure controls are unchanged.
 
 ## Dependency patches and current findings
 

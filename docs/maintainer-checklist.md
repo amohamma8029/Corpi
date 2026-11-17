@@ -1,8 +1,8 @@
 # Maintainer checklist
 
-Public source access is not release acceptance. Keep missing hosted, native,
-capacity and installer evidence visible rather than treating these checklists as
-proof that the app is ready to ship.
+Public source access, development-milestone acceptance and distribution are separate.
+Keep missing hosted, native, capacity and installer evidence visible. Passing a
+development milestone does not mean an installer or supported stable release is ready.
 
 ## Before announcing public access
 
@@ -44,9 +44,9 @@ proof that the app is ready to ship.
 
 ## Before merging search PR #16
 
-- [ ] Reconcile `README.md` and `SECURITY.md` with the final merged functionality.
-  Remove obsolete statements that search is absent. Describe explicit model
-  setup, offline queries, file/network access, worker supervision, saved settings
+- [ ] Reconcile `README.md` and `SECURITY.md` with the candidate's functionality;
+  update their `main`/merged-search status only when integration actually happens.
+  Describe explicit model setup, offline queries, file/network access, worker supervision, saved settings
   and their real limits without claiming that resource caps are a PDF sandbox.
 - [ ] Recheck `desktop/patches/README.md` against the merged dependency graph and
   callers, including FTP/PAC/ZIP restrictions, serializer configuration and the
@@ -69,3 +69,26 @@ proof that the app is ready to ship.
 - [ ] Record the documentation, dependency and platform rechecks in PR #16 before
   merging it. Do not close its remaining acceptance requirements on the strength
   of this publication PR.
+
+## Milestone 1: searchable-notebook acceptance
+
+- [ ] Link evidence to [M1.6 S1–S16](https://github.com/amohamma8029/Corpi/issues/15)
+  and the parent [A1–A8](https://github.com/amohamma8029/Corpi/issues/2), noting later
+  accepted model, runtime and limit changes. Reuse unchanged source-bound evidence;
+  do not call a missing or skipped check passed.
+- [ ] Check the integrated desktop journey: create a notebook, import and inspect
+  its saved PDF, reach ready, explicitly submit both Words and Meaning searches,
+  open the exact saved result page, restart and continue with the same saved work.
+- [ ] Cover partial/unreadable PDFs and input limits, interruption/retry,
+  cancellation near publication, safe replacement, deletion/trash/expiry, stable
+  citation/version identities and local/private operation. Component passes alone
+  do not establish the connected journey.
+- [ ] Record ordinary-paper import-to-ready timings and the original full-capacity
+  result against the accepted limits. Preserve failures and actual measurements.
+  Tested timeout, resource-cutoff, retry, stop/reap and cleanup controls stay required.
+  Exhaustive physical-memory/GPU/cache certification and an absolute no-swapping
+  guarantee are unproved limitations, not milestone gates or passed checks.
+- [ ] Complete required final-candidate platform checks and review before integration.
+  Prepare a demo from verified behavior afterward; a recording is not a substitute
+  for acceptance evidence. Installer delivery, OCR and provider-generated answers
+  remain outside Milestone 1.

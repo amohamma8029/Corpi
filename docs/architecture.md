@@ -552,14 +552,15 @@ jobs retain their existing failure behavior, as does explicit cancellation of pe
 processing. Search-result decoration still requires a ready, nontrashed import;
 no query-eligibility relaxation or old-library migration is used to preserve links.
 
-The pinned FastEmbed 0.8.1 adapter parses one tokenizer before importing NumPy/FastEmbed
+The pinned FastEmbed 0.9.1 adapter parses one tokenizer before importing NumPy/FastEmbed
 and allocating the ONNX session, avoiding overlapping temporary parse allocations with
 backend/session memory. It applies the pinned loader's same configuration, then shares
 that tokenizer with inference and input validation. Validation disables truncation and
 counts attended tokens without removing inference padding. Standalone planning and older
 constructor-replacing benchmark tokenizers retain their unpadded counting behavior.
-The adapter preserves the pinned model, prefixes, pooling arithmetic and vector bytes,
-and applies the recorded session options.
+The adapter preserves the pinned model, prefixes and the original FastEmbed 0.8.1 numerical
+contract, including pooling arithmetic and vector bytes, while applying recorded session options.
+Actual worker-library versions are recorded separately from immutable model/generation settings.
 The adapter's pinned session-loader integration and serialized-tokenizer parity tests must
 be reviewed together when updating FastEmbed.
 
@@ -576,12 +577,17 @@ exhausted allowances rather than resetting them. Model-switch cancellation remai
 
 The production safeguard remains a sampled 1-GiB child-memory cutoff. Native Windows
 verification uses separate 1-GiB application-tree and 256-MiB controller-tree Job Objects,
-which bound committed memory, not strict aggregate resident/cache usage or swap. Cached
-Bekko search/saved pages, repeated original-paper/exact-200-page preparation, long cancellation
-and following import now pass that boundary. The complete original near-capacity fixture
-publishes in 1,019.90 seconds in the latest saved-setting run, with exact persisted
-vectors/mappings. New arena-off E5 preparation passes switching/publication, both search
-modes and exact saved-page navigation in two fresh copied native libraries. All 36 E5
+which bound committed memory, not all physical, graphics or file-cache memory. Exhaustive
+physical-memory accounting and an absolute no-swapping guarantee remain unproved and are not
+Milestone 1 gates. The limits and tested failure controls remain required; data loss, privacy
+leaks, stale results, broken recovery, runaway work and materially unacceptable performance
+still block acceptance. Cached Bekko search/saved pages, repeated original-paper/exact-200-page
+preparation, long cancellation and following import have recorded passes at their tested
+source versions. The complete original near-capacity fixture
+publishes in 732.56 seconds on the current core/runtime, with all 9,950 persisted vectors
+and canonical mappings matching the original references. That measures core preparation,
+not desktop-visible import time. New arena-off E5 preparation passes switching/publication,
+both search modes and exact saved-page navigation in two fresh copied native libraries. All 36 E5
 chunk/vector outputs match their original references, old generations/batches/charges
 remain exact and no job memory-limit event occurs. A matched worker pair reduces sampled
 peak private memory from about 895 to 581 MiB at a 9.4% document-inference cost. These are
@@ -592,8 +598,9 @@ jobs no longer mark the saved PDF import failed or remove its search-result PDF/
 shortcuts. Genuine import failures remain distinct. Old failed import states are not
 reset or migrated. Copied real-API/browser checks retain the exact saved PDF bytes and
 page navigation. Native verification must use a binary built from the source being checked;
-browser/API checks are not a substitute for WebView page drawing. Strict Windows resource
-acceptance and dedicated default-Bekko coverage remain separate obligations.
+browser/API checks are not a substitute for WebView page drawing. Relevant final-candidate
+platform checks and the integrated notebook/import/search/saved-page/restart journey remain
+required. Existing evidence is reusable only where its source and runtime bindings still apply.
 
 Setup uses a private anonymous HTTP opener, not Python's global cookie/auth opener. Initial URLs
 must exactly match the pinned Hugging Face repository/revision/file; every redirect is checked
@@ -610,6 +617,11 @@ previous partial is truncated. Cleanup remains tied to recorded attempt ownershi
 the child lock; it does not remove unexplained staging or follow redirected owners. These checks
 do not establish an OS-wide firewall or complete protection against hostile concurrent filesystem
 replacement by another process running as the same user.
+
+The setup API offers Retry only after the owned writer stops and the selected model has no
+recorded pending cleanup. A lifecycle task retries recorded cleanup after startup, including
+transient database contention; status polling itself does not perform cleanup. Shutdown waits
+for that lifecycle task and the writer rather than reporting completion while they still run.
 
 A notebook model choice records a pending selection generation. Its replacement indexes coexist
 with active search until one activation transaction checks the current ready-source set, complete
