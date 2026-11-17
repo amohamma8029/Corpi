@@ -447,7 +447,7 @@ existing waiting/failure details and current Cancel/Resume eligibility. The piec
 embedded chunks only. Finishing word/vector components, final validation and readiness publication
 remain distinct from completing those chunks; a full counter on a running job is not a ready label.
 
-FastEmbed 0.8.1 runs CPU inference in a supervised child. The parent owns guarded database
+FastEmbed 0.9.1 runs CPU inference in a supervised child. The parent owns guarded database
 writes, stops and reaps the child on cancellation, and persists batch completion and spent time.
 Publication proves actual word/vector membership, matching batch output, and reconstructable
 passage mappings inside its write transaction; metadata completion flags alone do not suffice.
@@ -485,11 +485,15 @@ recovery boundary, not proof that every pre-admission database-outage second is 
 not an exemption for ordinary metadata work after the reservation has committed.
 
 Plan/checkpoint writes check the remaining deadline inside their transaction. Final readiness
-publication (including model-switch activation) and its completion checkpoint share a transaction
-and its final deadline check, so an expired checkpoint rolls back publication as well. Exhaustion
-in the commit phase records a permanent `search_time_limit` failure, not a silent running job or
-an automatic fresh allowance. These are application deadline checks, not a guarantee that the OS
-can interrupt an arbitrarily stalled SQLite/disk commit at an exact wall-clock instant.
+publication, its checkpoint, the successful attempt and the completed search job share one
+transaction and final deadline check. This also covers model-switch publication and any activation
+it completes. Expiry before acceptance rolls back publication and records a permanent
+`search_time_limit` failure, not a fresh allowance. Once accepted, later accounting/bookkeeping
+failure cannot mark that output failed; unavailable settlement retains the conservative reservation.
+Cancellation before acceptance rejects publication; afterward the search job is already complete.
+Generic job publication/cancellation keeps its existing semantics. These are application deadline
+checks, not a guarantee that the OS can interrupt an arbitrarily stalled SQLite/disk commit at an
+exact wall-clock instant.
 
 Each runner step owns one cancellation reader on its processing thread. Its connection is
 fully configured and verified once, then made query-only; each poll reads the latest committed
@@ -544,6 +548,8 @@ changing job state, retries, settings or budgets. The panel displays terminal co
 instead of “Rebuilding” and retains the exact-generation Cancel model change action.
 Pre-action polling responses cannot restore old pending state after that action. The panel always
 names the active model and separately labels a requested model until activation completes.
+Successful current polling clears a recovered polling error, but does not erase an unresolved
+setup or model-choice action error. Older notebook/action replies cannot restore stale state.
 
 Terminal job failure/cancellation also checks the exact job's handoff purpose before
 updating PDF import state. A `model-switch` rebuild does not own the saved PDF's
@@ -584,7 +590,7 @@ leaks, stale results, broken recovery, runaway work and materially unacceptable 
 still block acceptance. Cached Bekko search/saved pages, repeated original-paper/exact-200-page
 preparation, long cancellation and following import have recorded passes at their tested
 source versions. The complete original near-capacity fixture
-publishes in 732.56 seconds on the current core/runtime, with all 9,950 persisted vectors
+publishes in 732.56 seconds on its recorded core/runtime, with all 9,950 persisted vectors
 and canonical mappings matching the original references. That measures core preparation,
 not desktop-visible import time. New arena-off E5 preparation passes switching/publication,
 both search modes and exact saved-page navigation in two fresh copied native libraries. All 36 E5
@@ -618,10 +624,14 @@ the child lock; it does not remove unexplained staging or follow redirected owne
 do not establish an OS-wide firewall or complete protection against hostile concurrent filesystem
 replacement by another process running as the same user.
 
-The setup API offers Retry only after the owned writer stops and the selected model has no
-recorded pending cleanup. A lifecycle task retries recorded cleanup after startup, including
-transient database contention; status polling itself does not perform cleanup. Shutdown waits
-for that lifecycle task and the writer rather than reporting completion while they still run.
+The setup API offers Retry only after the owned writer stops, its terminal outcome is durable
+and the selected model has no recorded pending cleanup. If database contention defeats the
+writer's terminal write, the service retains that exact transition until the same writer exits.
+Its existing lifecycle task then retries the terminal write and cleanup, preserving generation,
+attempts, received bytes, cancellation evidence and charges. Initial terminal lock waits are charged
+once; maintenance retries replay the frozen charge rather than add idle waiting time. Status polling
+does not drive recovery. Shutdown joins the writer and drains pending finalization; persistent
+contention or another persistence failure remains visible instead of claiming a successful stop.
 
 A notebook model choice records a pending selection generation. Its replacement indexes coexist
 with active search until one activation transaction checks the current ready-source set, complete
@@ -629,6 +639,13 @@ matching outputs, and still-valid rebuild handoffs. A newer choice, cancellation
 cannot activate stale work. A model-only rebuild targets the current ready PDF even when a newer
 replacement is pending, without changing which PDF is current. Search cleanup follows source and
 import expiry; deleting a source does not delete shared model installations.
+
+For older interrupted publishers whose activation and complete checkpoints already committed,
+recovery verifies exact active readiness, source/review/index ownership and the original activated
+selection receipt. The latest legitimate pending, same-active or cancelled choice must explain the
+notebook's current generation. It can then finish the accepted publisher without re-embedding,
+resetting charges or changing the newer choice. Missing receipts, changed ownership and failed or
+cancelled work fail closed. This recovery path never grants stale work permission to publish again.
 
 #### Make a source version ready
 
@@ -1061,8 +1078,8 @@ Choose and record each open implementation detail before building the component 
 
 | Area | Status | What remains open |
 | --- | --- | --- |
-| Local keyword/FTS and vector search | **Partially Decided** | M1.6 implements SQLite FTS5 and sqlite-vec with ready-source/model eligibility applied before top K. Meaning and Words are separate app modes; production fusion/Q&A remains later work. Native-platform and resource acceptance remains open. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
-| Local embeddings | **Partially Decided** | New notebooks use pinned Bekko A8M quint8 AVX2 for English/French/Arabic same-language search. Explicit saved choices remain unchanged; all-MiniLM-L6-v2 and multilingual E5 small stay selectable. New preparation saves its OpenBLAS choice and disables the arena only for new E5 work; missing fields and recorded old choices preserve legacy behavior, and mixed query groups load serially. Current backend/default-model native checks and complete original near-capacity preparation pass the adopted twenty-minute recipe. New arena-off E5 switching/search/saved pages pass in fresh copied native libraries; old work is not migrated. Failed-switch UI status and the PDF-import failure side effect are repaired; result links preserve the exact saved PDF/page. Whole M1.6 still needs fresh native setup/verification, current Linux/macOS execution and strict aggregate memory/no-swap proof. Benchmark-combined quality is not either separate UI mode's measured success rate. Local-by-default processing is decided. |
+| Local keyword/FTS and vector search | **Partially Decided** | M1.6 implements SQLite FTS5 and sqlite-vec with ready-source/model eligibility applied before top K. Meaning and Words are separate app modes; production fusion/Q&A remains later work. Search remains unmerged: recovery repairs pass local checks, but the repaired publication candidate still needs new-head platform CI before merge. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
+| Local embeddings | **Partially Decided** | New notebooks use pinned Bekko A8M quint8 AVX2 for English/French/Arabic same-language search. Explicit saved choices remain unchanged; all-MiniLM-L6-v2 and multilingual E5 small stay selectable. New preparation saves its OpenBLAS choice and disables the arena only for new E5 work; missing fields and recorded old choices preserve legacy behavior, and mixed query groups load serially. The retained original near-capacity result passes the adopted twenty-minute recipe. Earlier candidate `4139df1` passed supported-model setup, offline inference, automatic readiness and native checks on Windows, macOS and Linux, but later review found recovery defects. Those repairs now pass 862 local core tests with 24 unchanged gated skips, 152 frontend tests, static checks and a current-source native viewer/search/page/restart/trash journey. Post-publication failures, activation restart with later model choices and contended setup terminal writes have discriminating regression coverage. The repaired commit still needs fresh hosted CI; earlier green runs do not verify it. Strict aggregate physical/shared/GPU/cache/no-swap proof remains unproved, not a milestone gate. Benchmark-combined quality is not either separate UI mode's measured success rate. Local-by-default processing is decided. |
 | Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
 | Local file layout | **Partially Decided** | PDF original/staging paths, safe copy, integrity verification, and shared-original removal are set by M1.4. Layouts for other file types remain open. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
 | Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |

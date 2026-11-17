@@ -338,7 +338,14 @@ sentence vector, or restores LEALLA's trained pooler from its pinned reference c
 It loads compiled tokenizer JSON directly as UTF-8 and retains the existing CPU, memory,
 token and deadline controls. These profiles are available only to the benchmark scripts.
 
+**Historical LEALLA setup:** its saved manifest combines the ONNX export and trained
+pooler from different repositories. Fresh setup is unsupported by the current
+single-repository downloader and fails explicitly before transfer. The manifest and
+original measurements are unchanged. `--download` can still verify a complete cached
+installation; offline comparisons require those already verified assets.
+
 ```powershell
+# Historical LEALLA recipe; now verifies complete cached assets only, not fresh setup:
 uv run python scripts/benchmark_contextual_multilingual.py --download --profile lealla-small --directory <model-directory>
 uv run python scripts/benchmark_contextual_multilingual.py --download --profile mmbert-student --directory <model-directory>
 uv run python scripts/benchmark_shared_search.py --directory <comparison-directory> --models-directory <model-directory> --profile lealla-small
@@ -444,15 +451,19 @@ from normal timing. Output checks, memory failures and package/environment clean
 experiment evidence, not application adoption. Project dependencies remain as configured
 in the component manifests.
 
-`benchmark_bekko_openvino.py` tests Bekko's official pinned default OpenVINO IR.
-Its Windows experiment requires the owned `corpi-bekko-openvino-experiment` root,
+`benchmark_bekko_openvino.py` retains diagnostics for Bekko's official pinned default OpenVINO IR.
+The retained replay recipe below is historical: its shared experimental OpenVINO
+worker does not accept the current runtime-option protocol. The paired screen and
+OpenVINO worker now refuse replay explicitly. Downloading or verifying the model
+assets alone does not repair that worker or establish a fresh result.
+Its original Windows experiment required the owned `corpi-bekko-openvino-experiment` root,
 an ownership marker with `task: m1-6-local-search` and `experiment: bekko-openvino`,
 and `localappdata/Intel Corporation/openvino_telemetry` containing `0` before import.
 `--inspect-packages` downloads/hash-checks the previously inspected wheels without
-executing their code. After separate temporary-runtime approval, use an owned uv
+executing their code. The separately approved temporary runtime used an owned uv
 cache/overlay with OpenVINO 2026.4.1, telemetry 2025.2.0 and existing NumPy 2.5.3;
 `--prepare` records their versions/origins without importing the backend. It does
-not install packages itself. All backend workers use CPU/two threads/one stream/F32.
+not install packages itself. Recorded workers used CPU/two threads/one stream/F32.
 
 ```powershell
 uv run python scripts/benchmark_bekko_openvino.py --download --models-directory <model-directory>
@@ -460,14 +471,15 @@ uv run python scripts/benchmark_bekko_openvino.py --directory <owned-runtime-roo
 uv run python scripts/benchmark_bekko_openvino.py --directory <owned-runtime-root> --models-directory <model-directory> --export --output-directory <new-evidence-directory>
 ```
 
-Repeat the paired screen with batches 8 and 32 for the export. Each screen has a
+The historical export required paired screens at batches 8, 16 and 32; these
+screens cannot currently be replayed. Each recorded screen retained a
 600-second cumulative deadline, supervised per-call deadlines and sampled child
 RSS cutoff. Preserve each failure rather than overwrite it. Evidence export verifies
 model/package hashes and declined consent. After checking that owned runtime
 processes have stopped, `--cleanup --output-directory <exported-evidence-directory>`
 reverifies the exports and removes only the exact owned temporary runtime root.
 Independently check its absence afterward. Verified benchmark model assets remain
-available for reproduction; no permanent application dependency is added.
+available for inspection; no permanent application dependency is added.
 
 `benchmark_bekko_gguf.py` is an explicitly approved temporary Windows CPU experiment
 for the official Bekko Q8_0 export. It pins llama.cpp b11429 and verifies its CPU archive,
@@ -478,8 +490,15 @@ Native execution uses inspected DLLs through a supervised child, CPU Haswell/AVX
 two compute threads, non-causal mean pooling and the original HF token IDs. Only
 explicitly checked space/tab token-display aliases are allowed; no text is rewritten.
 
+**Historical GGUF setup:** the saved manifest combines the GGUF export with reference
+tokenizer/configuration assets from another repository. Fresh `--download` and
+`--download-child` setup are unsupported and fail explicitly before transfer.
+`--download` can verify a complete cached installation. Keep the original manifest,
+model identities and measured results; no relaxed downloader or replacement pin is implied.
+
 ```powershell
 uv run python scripts/benchmark_bekko_gguf.py --inspect --directory <owned-runtime-root>
+# Historical model recipe; now verifies complete cached assets only:
 uv run python scripts/benchmark_bekko_gguf.py --download --models-directory <model-directory>
 uv run python scripts/benchmark_bekko_gguf.py --inspect-model --directory <owned-runtime-root> --models-directory <model-directory>
 uv run python scripts/benchmark_bekko_gguf.py --source-proof --directory <owned-runtime-root>
