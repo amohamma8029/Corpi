@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { PdfViewer } from "./PdfViewer";
 
@@ -26,9 +26,16 @@ vi.mock("pdfjs-dist/legacy/build/pdf.mjs", () => ({
 
 const originalShowModal = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
 const originalClose = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "close");
+beforeEach(() => {
+  // JSDOM has no layout/resize observer. Give the real tile effect a visible region.
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(300);
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(300);
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+});
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   if (originalShowModal) Object.defineProperty(HTMLDialogElement.prototype, "showModal", originalShowModal);
   else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
   if (originalClose) Object.defineProperty(HTMLDialogElement.prototype, "close", originalClose);
@@ -47,7 +54,9 @@ it("keeps the canvas usable after a page error and clears the error when another
     onClose={() => {}} />);
   expect((await screen.findByRole("alert")).textContent).toContain("Page one cannot render");
   const canvas = document.querySelector("canvas")!;
-  expect(canvas.parentElement!.hidden).toBe(false);
+  const surface = canvas.parentElement!;
+  const page = surface.parentElement!;
+  expect(page.hidden).toBe(false);
   const close = screen.getByRole("button", { name: "Close PDF" });
   const pageInput = screen.getByRole("spinbutton", { name: "Page number" });
   close.focus();
@@ -56,9 +65,12 @@ it("keeps the canvas usable after a page error and clears the error when another
   fireEvent.keyDown(pageInput, { key: "Tab", shiftKey: true });
   expect(document.activeElement).toBe(close);
   fireEvent.click(screen.getByRole("button", { name: "Next page" }));
-  await waitFor(() => expect(canvas.parentElement!.getAttribute("aria-busy")).toBe("false"));
+  await waitFor(() => expect(page.getAttribute("aria-busy")).toBe("false"));
   expect(screen.queryByRole("alert")).toBeNull();
-  expect(document.querySelector("canvas")).toBe(canvas);
+  expect(document.querySelector("canvas")!.parentElement).toBe(surface);
+  expect(document.querySelector("canvas")!.dataset.ready).toBe("true");
+  expect(canvas.width).toBe(0);
+  expect(canvas.height).toBe(0);
 });
 
 it("opens the exact initial citation page rather than page one", async () => {

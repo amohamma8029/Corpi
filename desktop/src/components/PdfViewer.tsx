@@ -8,6 +8,7 @@ import {
 import PdfJsWorker from "pdfjs-dist/legacy/build/pdf.worker.mjs?worker";
 
 import { CoreConnection, coreBinary } from "../api/client";
+import { pageLayout, visibleTiles, type Tile } from "./pdfTiles";
 
 interface PdfViewerProps {
   connection: CoreConnection;
@@ -40,8 +41,12 @@ export function PdfViewer({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDialogElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const renderRef = useRef<RenderTask | null>(null);
+  const renderQueue = useRef<Promise<void>>(Promise.resolve());
+  const workerRelease = useRef<Promise<void>>(Promise.resolve());
+  const documentOwner = useRef<PDFDocumentProxy | null>(null);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -55,13 +60,24 @@ export function PdfViewer({
 
   useEffect(() => {
     let current = true;
-    // React clears refs before passive unmount cleanup; keep the owned canvas.
-    const canvas = canvasRef.current;
     const controller = new AbortController();
     let loadingTask: ReturnType<typeof getDocument> | undefined;
     let pdfWorker: PDFWorker | undefined;
     let nativeWorker: Worker | undefined;
+    let release: Promise<void> | undefined;
 
+    function releaseDocument() {
+      // A cancelled task must settle before PDF.js destroys its transport/worker.
+      const drain = renderQueue.current;
+      return release ??= (async () => {
+        await drain;
+        await loadingTask?.destroy().catch(() => undefined);
+        pdfWorker?.destroy();
+        nativeWorker?.terminate();
+      })();
+    }
+
+    documentOwner.current = null;
     setDocument(null);
     setRenderedPage(null);
     setPageNumber(1);
@@ -73,6 +89,9 @@ export function PdfViewer({
       try {
         const path = `/sources/${encodeURIComponent(sourceId)}/imports/${encodeURIComponent(importId)}/pdf`;
         const bytes = await coreBinary(connection, path, controller.signal);
+        // The same mounted dialog can receive a new saved import/citation.
+        // Finish the previous document's worker release before creating its successor.
+        await workerRelease.current;
         if (!current) return;
 
         nativeWorker = new PdfJsWorker();
@@ -94,12 +113,11 @@ export function PdfViewer({
             throw new Error("The saved citation page is outside this PDF.");
           }
           setPageNumber(initialPage);
+          documentOwner.current = loaded;
           setDocument(loaded);
         }
       } catch (cause) {
-        await loadingTask?.destroy().catch(() => undefined);
-        pdfWorker?.destroy();
-        nativeWorker?.terminate();
+        await releaseDocument();
         if (current && !(cause instanceof DOMException && cause.name === "AbortError")) {
           const message = cause instanceof Error ? cause.message : String(cause);
           setLoadError(`Couldn't open ${filename}: ${message}`);
@@ -112,68 +130,153 @@ export function PdfViewer({
     void loadPdf();
     return () => {
       current = false;
+      documentOwner.current = null;
       controller.abort();
       renderRef.current?.cancel();
-      if (canvas) {
-        canvas.width = 0;
-        canvas.height = 0;
-      }
-      void (async () => {
-        await loadingTask?.destroy().catch(() => undefined);
-        pdfWorker?.destroy();
-        nativeWorker?.terminate();
-      })();
+      workerRelease.current = releaseDocument();
     };
   }, [connection, filename, importId, initialPage, sourceId]);
 
   useEffect(() => {
-    if (!document) return;
+    if (!document || documentOwner.current !== document) return;
     const activeDocument = document;
+    const surface = surfaceRef.current!;
+    const scroller = scrollRef.current!;
     setRenderedPage(null);
     setRenderError(null);
-    let cancelled = false;
-    let renderTask: RenderTask | undefined;
+    let stopped = false;
+    let failed = false;
+    let frame: number | undefined;
+    let queued = false;
+    let activeTile: string | undefined;
+    let task: RenderTask | undefined;
+    let desired: Tile[] = [];
+    const entries = new Map<string, { canvas: HTMLCanvasElement; ready: boolean }>();
+    const current = () => !stopped && documentOwner.current === activeDocument;
 
-    async function renderPage() {
+    function releaseTile(id: string) {
+      const entry = entries.get(id);
+      if (!entry) return;
+      if (activeTile === id) task?.cancel();
+      // Removing a DOM node alone does not free its backing storage.
+      entry.canvas.width = entry.canvas.height = 0;
+      entry.canvas.remove();
+      entries.delete(id);
+    }
+
+    async function preparePage() {
       try {
         const page = await activeDocument.getPage(pageNumber);
-        if (cancelled) return;
-        const canvas = canvasRef.current;
-        const context = canvas?.getContext("2d", { alpha: false });
-        if (!canvas || !context) throw new Error("This webview couldn't allocate a PDF canvas.");
-
-        const deviceScale = window.devicePixelRatio || 1;
+        if (!current()) return;
         const cssViewport = page.getViewport({ scale: zoom });
-        const maxScale = Math.sqrt(
-          renderedPagePixelLimit / (cssViewport.width * cssViewport.height),
-        );
-        const outputScale = Math.min(deviceScale, maxScale * 0.999);
-        const viewport = page.getViewport({ scale: zoom * outputScale });
-        canvas.width = Math.max(1, Math.ceil(viewport.width));
-        canvas.height = Math.max(1, Math.ceil(viewport.height));
-        canvas.style.width = `${viewport.width / outputScale}px`;
-        canvas.style.height = `${viewport.height / outputScale}px`;
-        renderTask = page.render({ canvas, viewport });
-        renderRef.current = renderTask;
-        await renderTask.promise;
-        if (!cancelled) {
-          setRenderError(null);
-          setRenderedPage({ document: activeDocument, pageNumber, zoom });
+        const layout = pageLayout(cssViewport.width, cssViewport.height,
+          window.devicePixelRatio || 1, renderedPagePixelLimit);
+        const viewport = page.getViewport({ scale: zoom * layout.outputScale });
+        surface.style.width = `${layout.cssWidth}px`;
+        surface.style.height = `${layout.cssHeight}px`;
+        Object.assign(surface.dataset, { pageWidth: String(layout.width), pageHeight: String(layout.height),
+          pageNumber: String(pageNumber), zoom: String(zoom), outputScale: String(layout.outputScale) });
+
+        function pump() {
+          if (queued || !current() || failed) return;
+          queued = true;
+          // The queue also spans page/zoom changes: cancellation cannot overlap a
+          // new render with the previous PDF.js task that is still settling.
+          renderQueue.current = renderQueue.current.then(async () => {
+            while (current() && !failed) {
+              const tile = desired.find((item) => !entries.get(item.id)?.ready);
+              if (!tile) break;
+              let entry = entries.get(tile.id);
+              if (!entry) {
+                const canvas = window.document.createElement("canvas");
+                canvas.width = tile.width;
+                canvas.height = tile.height;
+                canvas.dataset.tile = tile.id;
+                canvas.setAttribute("aria-label", `${filename}, page ${pageNumber}, tile ${tile.id}`);
+                Object.assign(canvas.style, { position: "absolute", display: "block", boxShadow: "none",
+                  left: `${tile.x * layout.cssWidth / layout.width}px`,
+                  top: `${tile.y * layout.cssHeight / layout.height}px`,
+                  width: `${tile.width * layout.cssWidth / layout.width}px`,
+                  height: `${tile.height * layout.cssHeight / layout.height}px` });
+                if (!canvas.getContext("2d", { alpha: false, willReadFrequently: true })) {
+                  throw new Error("This webview couldn't allocate a PDF tile.");
+                }
+                entry = { canvas, ready: false };
+                entries.set(tile.id, entry);
+                surface.append(entry.canvas);
+              }
+              activeTile = tile.id;
+              task = page.render({ canvas: entry.canvas, viewport,
+                transform: [1, 0, 0, 1, -tile.x, -tile.y] });
+              renderRef.current = task;
+              try {
+                await task.promise;
+                if (current() && entries.get(tile.id) === entry) {
+                  entry.ready = true;
+                  entry.canvas.dataset.ready = "true";
+                }
+              } catch (cause) {
+                if (current() && entries.get(tile.id) === entry) throw cause;
+              } finally {
+                if (renderRef.current === task) renderRef.current = null;
+                task = undefined;
+                activeTile = undefined;
+              }
+            }
+            if (current() && !failed) setRenderedPage({ document: activeDocument, pageNumber, zoom });
+          }).catch((cause: unknown) => {
+            if (current()) {
+              failed = true;
+              setRenderError(cause instanceof Error ? cause.message : "The selected page could not be rendered.");
+            }
+          }).finally(() => { queued = false; });
         }
+
+        function updateVisible() {
+          if (!current() || failed) return;
+          const region = scroller.getBoundingClientRect();
+          const bounds = surface.getBoundingClientRect();
+          const next = visibleTiles(layout, { left: region.left + scroller.clientLeft - bounds.left,
+            top: region.top + scroller.clientTop - bounds.top,
+            width: scroller.clientWidth, height: scroller.clientHeight });
+          if (desired.map((tile) => tile.id).join() === next.map((tile) => tile.id).join()) return;
+          desired = next;
+          const keep = new Set(next.map((tile) => tile.id));
+          for (const id of entries.keys()) if (!keep.has(id)) releaseTile(id);
+          setRenderedPage(null);
+          pump();
+        }
+        refresh = () => {
+          if (frame !== undefined || !current()) return;
+          frame = requestAnimationFrame(() => { frame = undefined; updateVisible(); });
+        };
+        updateVisible();
       } catch (cause) {
-        if (!cancelled && !(cause instanceof Error && cause.name === "RenderingCancelledException")) {
+        if (current()) {
+          failed = true;
           setRenderError(cause instanceof Error ? cause.message : "The selected page could not be rendered.");
         }
       }
     }
 
-    void renderPage();
+    let refresh = () => {};
+    const schedule = () => refresh();
+    scroller.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    const observer = new ResizeObserver(schedule);
+    observer.observe(scroller);
+    void preparePage();
     return () => {
-      cancelled = true;
-      renderTask?.cancel();
-      renderRef.current = null;
+      stopped = true;
+      if (frame !== undefined) cancelAnimationFrame(frame);
+      scroller.removeEventListener("scroll", schedule);
+      window.removeEventListener("resize", schedule);
+      observer.disconnect();
+      task?.cancel();
+      for (const id of entries.keys()) releaseTile(id);
+      for (const key of ["pageWidth", "pageHeight", "pageNumber", "zoom", "outputScale"]) delete surface.dataset[key];
     };
-  }, [document, pageNumber, renderedPagePixelLimit, zoom]);
+  }, [document, filename, pageNumber, renderedPagePixelLimit, zoom]);
 
   const pageCount = document?.numPages ?? 0;
 
@@ -249,12 +352,14 @@ export function PdfViewer({
         {loading ? <p className="pdf-viewer__message" role="status">Verifying and opening the saved copy…</p> : null}
         {renderError ? <p className="pdf-viewer__message" role="alert">{renderError}</p> : null}
         <div
+          ref={scrollRef}
           className="pdf-viewer__page"
           hidden={loading || loadError !== null}
           aria-label={`Page ${pageNumber}`}
           aria-busy={document !== null && (renderedPage?.document !== document || renderedPage?.pageNumber !== pageNumber || renderedPage?.zoom !== zoom)}
         >
-          <canvas ref={canvasRef} aria-label={`${filename}, page ${pageNumber}`} />
+          <div ref={surfaceRef} data-testid="pdf-tile-surface"
+            style={{ position: "relative", margin: "0 auto", textAlign: "left" }} />
         </div>
       </div>
     </dialog>
