@@ -15,6 +15,9 @@ interface ViewerSnapshot {
   height: number;
   rendering: boolean;
   pixels: number[][];
+  tiles: { id: string; width: number; height: number; ready: boolean }[];
+  visibleCoverage: boolean;
+  allocatedPixels: number;
   activeWorkers: number;
   startedWorkers: number;
   terminatedWorkers: number;
@@ -29,7 +32,7 @@ declare global {
       activeWorkers: Set<Worker>;
       startedWorkers: number;
       terminatedWorkers: number;
-      canvas: HTMLCanvasElement | null;
+      canvases: Set<HTMLCanvasElement>;
       errors: string[];
       cspViolations: string[];
       fetchHeld: boolean;
@@ -60,26 +63,68 @@ function record(name: string, value: unknown) {
 async function viewerSnapshot(): Promise<ViewerSnapshot> {
   return browser.execute(() => {
     const viewer = document.querySelector("[data-testid='pdf-viewer']");
-    const canvas = viewer?.querySelector<HTMLCanvasElement>("canvas");
-    const context = canvas?.getContext("2d");
+    const surface = viewer?.querySelector<HTMLElement>("[data-testid='pdf-tile-surface']");
+    const region = surface?.parentElement;
+    const width = Number(surface?.dataset.pageWidth ?? 0);
+    const height = Number(surface?.dataset.pageHeight ?? 0);
     const observation = window.__corpiE2E;
-    if (canvas) observation.canvas = canvas;
-    const pixels = canvas && context && canvas.width && canvas.height
-      ? [[0.1, 0.1], [0.5, 0.1], [0.9, 0.9]].map(([x, y]) =>
-          Array.from(context.getImageData(Math.floor(canvas.width * x), Math.floor(canvas.height * y), 1, 1).data))
-      : [];
+    const canvases = Array.from(surface?.querySelectorAll<HTMLCanvasElement>("canvas") ?? []);
+    const pixels: number[][] = [];
+    const tiles = canvases.map((canvas) => {
+      observation.canvases.add(canvas);
+      const context = canvas.getContext("2d");
+      if (context && canvas.width && canvas.height) {
+        for (const [x, y] of [[0.1, 0.1], [0.5, 0.1], [0.9, 0.9]]) {
+          pixels.push(Array.from(context.getImageData(Math.floor(canvas.width * x), Math.floor(canvas.height * y), 1, 1).data));
+        }
+      }
+      return { id: canvas.dataset.tile ?? "", width: canvas.width, height: canvas.height, ready: canvas.dataset.ready === "true" };
+    });
+    const expected: string[] = [];
+    let positioned = false;
+    if (surface && region && width > 0 && height > 0) {
+      const bounds = surface.getBoundingClientRect();
+      const clip = region.getBoundingClientRect();
+      if (bounds.width > 0 && bounds.height > 0) {
+        const left = Math.max(0, (clip.left + region.clientLeft - bounds.left) * width / bounds.width);
+        const top = Math.max(0, (clip.top + region.clientTop - bounds.top) * height / bounds.height);
+        const right = Math.min(width, (clip.left + region.clientLeft + region.clientWidth - bounds.left) * width / bounds.width);
+        const bottom = Math.min(height, (clip.top + region.clientTop + region.clientHeight - bounds.top) * height / bounds.height);
+        for (let y = Math.floor(top / 512) * 512; y < bottom; y += 512) {
+          for (let x = Math.floor(left / 512) * 512; x < right; x += 512) expected.push(`${x}:${y}`);
+        }
+        positioned = canvases.every((canvas) => {
+          const [x, y] = (canvas.dataset.tile ?? "").split(":").map(Number);
+          const tile = canvas.getBoundingClientRect();
+          return Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0
+            && canvas.width === Math.min(512, width - x) && canvas.height === Math.min(512, height - y)
+            && Math.abs(tile.left - bounds.left - x * bounds.width / width) < 0.1
+            && Math.abs(tile.top - bounds.top - y * bounds.height / height) < 0.1
+            && Math.abs(tile.width - canvas.width * bounds.width / width) < 0.1
+            && Math.abs(tile.height - canvas.height * bounds.height / height) < 0.1;
+        });
+      }
+    }
+    const visibleCoverage = positioned && expected.length > 0 && expected.length === tiles.length
+      && new Set(tiles.map((tile) => tile.id)).size === tiles.length
+      && expected.every((id) => tiles.some((tile) => tile.id === id && tile.ready));
     return {
       filename: viewer?.querySelector("h2")?.textContent ?? "",
       page: Number(viewer?.querySelector<HTMLInputElement>("[aria-label='Page number']")?.value ?? 0),
       zoom: Number(viewer?.querySelector("[aria-live='polite']")?.textContent?.replace("%", "") ?? 0),
-      width: canvas?.width ?? 0,
-      height: canvas?.height ?? 0,
+      // Full-page physical geometry retains the original resolution/cap check;
+      // the separate tile evidence proves that real visible content is painted.
+      width,
+      height,
       rendering: viewer?.querySelector(".pdf-viewer__page")?.getAttribute("aria-busy") !== "false",
       pixels,
+      tiles,
+      visibleCoverage,
+      allocatedPixels: tiles.reduce((sum, tile) => sum + tile.width * tile.height, 0),
       activeWorkers: observation.activeWorkers.size,
       startedWorkers: observation.startedWorkers,
       terminatedWorkers: observation.terminatedWorkers,
-      clearedCanvas: observation.canvas?.width === 0 && observation.canvas?.height === 0,
+      clearedCanvas: Array.from(observation.canvases).every((canvas) => canvas.width === 0 && canvas.height === 0),
       errors: Array.from(viewer?.querySelectorAll("[role='alert']") ?? [], (node) => node.textContent ?? ""),
       cspViolations: observation.cspViolations,
     };
@@ -88,7 +133,9 @@ async function viewerSnapshot(): Promise<ViewerSnapshot> {
 
 function matchesPage(snapshot: ViewerSnapshot, color: number[]): boolean {
   return !snapshot.rendering && snapshot.width > 0 && snapshot.height > 0 && snapshot.errors.length === 0
-    && snapshot.pixels.length === 3
+    && snapshot.visibleCoverage && snapshot.tiles.length > 0
+    && snapshot.tiles.every((tile) => tile.ready && tile.width > 0 && tile.height > 0 && tile.width <= 512 && tile.height <= 512)
+    && snapshot.pixels.length === snapshot.tiles.length * 3
     && snapshot.pixels.every((pixel) => pixel[3] === 255
       && color.every((channel, index) => Math.abs(channel - pixel[index]) <= 3));
 }
@@ -217,10 +264,17 @@ describe("Corpi native notebook and PDF workflow", () => {
     const platform = await browser.execute(() => {
       const observation: Window["__corpiE2E"] = {
         activeWorkers: new Set(), startedWorkers: 0, terminatedWorkers: 0,
-        canvas: null, errors: [], cspViolations: [],
+        canvases: new Set(), errors: [], cspViolations: [],
         fetchHeld: false, fetchAborted: false, renderHeld: false,
       };
       window.__corpiE2E = observation;
+      // Track even tiles that are evicted between snapshots. Removing a node
+      // without zeroing its backing must fail the existing close/release story.
+      new MutationObserver((records) => {
+        for (const record of records) for (const node of record.addedNodes) {
+          if (node instanceof HTMLCanvasElement && node.dataset.tile) observation.canvases.add(node);
+        }
+      }).observe(document.body, { childList: true, subtree: true });
       const NativeWorker = window.Worker;
       window.Worker = class extends NativeWorker {
         constructor(url: string | URL, options?: WorkerOptions) {
@@ -292,6 +346,8 @@ describe("Corpi native notebook and PDF workflow", () => {
     });
     await expect(first.activeWorkers).toBe(1);
     await expect(matchesPage(first, secondPageColor)).toBe(false); // stale page control
+    await expect(matchesPage({ ...first, visibleCoverage: false }, firstPageColor)).toBe(false);
+    await expect(matchesPage({ ...first, tiles: first.tiles.map((tile) => ({ ...tile, ready: false })) }, firstPageColor)).toBe(false);
     const blank = await browser.execute(() => {
       const canvas = document.createElement("canvas");
       const pixel = Array.from(canvas.getContext("2d")!.getImageData(0, 0, 1, 1).data);
@@ -331,7 +387,18 @@ describe("Corpi native notebook and PDF workflow", () => {
         && matchesPage(snapshot, rasterColor);
     }, { timeout: 30000, timeoutMsg: "The raster PDF did not finish painting a bounded near-20-MP canvas" });
     record("near-limit-raster", snapshot!);
+    await expect(snapshot!.allocatedPixels).toBeLessThan(snapshot!.width * snapshot!.height);
     await browser.saveScreenshot(path.join(results, "near-limit-raster.png"));
+    // Content must survive tile replacement at every scroll edge, not merely
+    // paint a small top-left surface that reports the desired full-page size.
+    for (const [left, top] of [[1, 0], [1, 1], [0, 1], [0, 0]]) {
+      await browser.execute((left, top) => {
+        const region = document.querySelector<HTMLElement>(".pdf-viewer__page")!;
+        region.scrollLeft = (region.scrollWidth - region.clientWidth) * left;
+        region.scrollTop = (region.scrollHeight - region.clientHeight) * top;
+      }, left, top);
+      record("near-limit-scroll", { left, top, snapshot: await waitForPage(rasterColor) });
+    }
     // Close and switch through the normal modal UI, then reopen the previous saved file.
     await closePdf();
     await openPdf(textPdf.filename);
