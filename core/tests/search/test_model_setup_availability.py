@@ -11,7 +11,7 @@ from test_model_setup import SmallSetup, wait, worker
 
 from core.api.app import create_app
 from core.persistence.corelock import DataDirectoryLock
-from core.persistence.errors import DatabaseBusyError
+from core.persistence.errors import DatabaseBusyError, IntegrityViolationError, PersistenceError
 from core.persistence.models import new_id, utc_timestamp
 from core.search import install
 from core.search.profiles import installation_path, verify_installation
@@ -251,5 +251,36 @@ def test_lifecycle_cleanup_retries_a_transient_database_busy_error(store, monkey
         finally:
             await service.stop()
         assert service._cleanup_task is not None and service._cleanup_task.done()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("error_type", [IntegrityViolationError, PersistenceError])
+def test_lifecycle_cleanup_does_not_retry_non_busy_persistence_failures(
+    store,
+    monkeypatch,
+    error_type,
+):
+    service = SmallSetup(store)
+    calls = 0
+
+    def failed_cleanup():
+        nonlocal calls
+        calls += 1
+        raise error_type("controlled non-transient persistence failure")
+
+    async def exercise():
+        await service.start()
+        cleanup_task = service._cleanup_task
+        assert cleanup_task is not None
+        monkeypatch.setattr(service, "cleanup", failed_cleanup)
+        try:
+            with pytest.raises(error_type, match="non-transient"):
+                await asyncio.wait_for(asyncio.shield(cleanup_task), 5)
+            assert calls == 1
+        finally:
+            with pytest.raises(error_type, match="non-transient"):
+                await service.stop()
+        assert calls == 1
 
     asyncio.run(exercise())

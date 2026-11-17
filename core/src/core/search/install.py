@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from core.persistence.corelock import DataDirectoryLock
@@ -24,6 +24,18 @@ from core.persistence.store import PersistenceStore
 from core.search.handoff import SUPPORTED_PROFILE_IDS
 from core.search.profiles import ModelProfile, installation_path, profiles, verify_installation
 from core.search.supervisor import stop_owned_process_tree, worker_environment
+
+
+@dataclass(frozen=True)
+class _SetupTerminal:
+    writer: threading.Thread
+    manifest: str
+    generation: int
+    identity: str
+    state: str
+    failure_code: str
+    spent_seconds: float
+    updated_at: str
 
 
 class ModelSetupService:
@@ -46,6 +58,7 @@ class ModelSetupService:
         self._mutex = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._pending_terminal: _SetupTerminal | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
 
     @property
@@ -107,7 +120,7 @@ class ModelSetupService:
 
     async def _retry_cleanup(self) -> None:
         # A surviving transfer may release its lock after startup recovery.
-        # Retry only recorded cleanup, outside read-only status polls.
+        # Own abandoned terminal writes and recorded cleanup, never status polls.
         while not await asyncio.to_thread(self._stop.wait, 1):
             try:
                 await asyncio.to_thread(self.cleanup)
@@ -115,13 +128,18 @@ class ModelSetupService:
                 continue  # Keep pending evidence and retry after transient writer contention.
 
     async def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            await asyncio.to_thread(self._thread.join, 20)
-            if self._thread.is_alive():
+        with self._mutex:
+            self._stop.set()
+            writer = self._thread
+        if writer is not None:
+            await asyncio.to_thread(writer.join, 20)
+            if writer.is_alive():
                 raise RuntimeError("model_setup_writer_did_not_stop")
         if self._cleanup_task is not None:
             await self._cleanup_task
+        # The lifecycle loop may have stopped before the writer handed off its
+        # terminal write. Drain it after join; a failed drain must remain visible.
+        await asyncio.to_thread(self.cleanup)
 
     def state(self, profile_id: str) -> dict:
         profile = self.profile(profile_id)
@@ -138,6 +156,7 @@ class ModelSetupService:
                 row["state"] in ("missing", "failed", "cancelled")
                 and not self._stop.is_set()
                 and (self._thread is None or not self._thread.is_alive())
+                and self._pending_terminal is None
                 and connection.execute(
                     "SELECT 1 FROM model_setup_attempts"
                     " WHERE cleanup_pending=1 AND manifest_id=? LIMIT 1",
@@ -184,6 +203,23 @@ class ModelSetupService:
         self.cleanup()
 
     def cleanup(self) -> None:
+        terminal_applied = self._finish_pending_terminal()
+        try:
+            self._cleanup_staging()
+        finally:
+            if terminal_applied:
+                self.notify()
+
+    def _finish_pending_terminal(self) -> bool:
+        with self._mutex:
+            terminal = self._pending_terminal
+            if terminal is None or terminal.writer.is_alive():
+                return False
+            self._write_terminal(terminal)
+            self._pending_terminal = None
+            return True
+
+    def _cleanup_staging(self) -> None:
         with self.store.database.connect() as connection:
             rows = connection.execute(
                 "SELECT id,staging_path FROM model_setup_attempts"
@@ -212,6 +248,8 @@ class ModelSetupService:
         if not request_key.strip() or len(request_key) > 200 or self._stop.is_set():
             raise ValueError("invalid_setup_request")
         with self._mutex:
+            if self._stop.is_set():
+                raise ValueError("invalid_setup_request")
             with self.store._transaction() as connection:
                 previous = connection.execute(
                     "SELECT manifest_id FROM model_setup_attempts WHERE request_key=?",
@@ -235,6 +273,8 @@ class ModelSetupService:
                     return dict(state)
                 if self._thread is not None and self._thread.is_alive():
                     raise ConflictingWriteError("another model transfer is active")
+                if self._pending_terminal is not None:
+                    raise ConflictingWriteError("model setup finalization is pending")
                 if connection.execute(
                     "SELECT 1 FROM model_setup_attempts"
                     " WHERE cleanup_pending=1 AND manifest_id=? LIMIT 1",
@@ -402,36 +442,75 @@ class ModelSetupService:
                             (identity,),
                         ).fetchone()[0]
                     total_bytes = max(total_bytes, saved)
+        except DatabaseBusyError:
+            # Do not launch another transfer after losing an operational write.
+            # The terminal write below either commits or keeps an exact retry owner.
+            failure = "model_download_failed"
         finally:
-            if self._stop.is_set():
-                failure = "model_setup_interrupted"
-            with self.store._transaction() as connection:
-                connection.execute(
-                    "UPDATE model_setup_attempts SET state=CASE WHEN state='running'"
-                    " THEN ? ELSE state END,failure_code=COALESCE(failure_code,?),"
-                    "spent_seconds=?,updated_at=? WHERE id=? AND state<>'installed'",
-                    (
-                        "interrupted" if self._stop.is_set() else "failed",
-                        failure,
-                        time.monotonic() - started,
-                        utc_timestamp(),
-                        identity,
-                    ),
+            interrupted = self._stop.is_set()
+            terminal = _SetupTerminal(
+                writer=threading.current_thread(),
+                manifest=profile.identity,
+                generation=generation,
+                identity=identity,
+                state="interrupted" if interrupted else "failed",
+                failure_code="model_setup_interrupted" if interrupted else failure,
+                spent_seconds=time.monotonic() - started,
+                updated_at=utc_timestamp(),
+            )
+            try:
+                self._write_terminal(terminal, started_at=started)
+            except DatabaseBusyError:
+                # The failed terminal lock wait was still this writer's work.
+                # Freeze its charge here; maintenance retries must not add idle time.
+                terminal = replace(
+                    terminal,
+                    spent_seconds=time.monotonic() - started,
+                    updated_at=utc_timestamp(),
                 )
-                connection.execute(
-                    "UPDATE model_installations SET state='failed',failure_code=?,"
-                    "spent_seconds=?,updated_at=? WHERE manifest_id=? AND generation=?"
-                    " AND state='downloading'",
-                    (
-                        failure,
-                        time.monotonic() - started,
-                        utc_timestamp(),
-                        profile.identity,
-                        generation,
-                    ),
+                with self._mutex:
+                    self._pending_terminal = terminal
+            else:
+                self.cleanup()
+                self.notify()
+
+    def _write_terminal(self, terminal: _SetupTerminal, *, started_at: float | None = None) -> None:
+        with self.store._transaction() as connection:
+            if started_at is not None:
+                # Initial writer only: include the wait for this transaction.
+                # Lifecycle retries instead replay the already-frozen receipt.
+                terminal = replace(
+                    terminal,
+                    spent_seconds=time.monotonic() - started_at,
+                    updated_at=utc_timestamp(),
                 )
-            self.cleanup()
-            self.notify()
+            connection.execute(
+                "UPDATE model_setup_attempts SET state=CASE WHEN state='running'"
+                " THEN ? ELSE state END,failure_code=COALESCE(failure_code,?),"
+                "spent_seconds=?,updated_at=MAX(updated_at,?)"
+                " WHERE id=? AND manifest_id=? AND generation=? AND state<>'installed'",
+                (
+                    terminal.state,
+                    terminal.failure_code,
+                    terminal.spent_seconds,
+                    terminal.updated_at,
+                    terminal.identity,
+                    terminal.manifest,
+                    terminal.generation,
+                ),
+            )
+            connection.execute(
+                "UPDATE model_installations SET state='failed',failure_code=?,"
+                "spent_seconds=?,updated_at=? WHERE manifest_id=? AND generation=?"
+                " AND state='downloading'",
+                (
+                    terminal.failure_code,
+                    terminal.spent_seconds,
+                    terminal.updated_at,
+                    terminal.manifest,
+                    terminal.generation,
+                ),
+            )
 
     def _progress(self, manifest: str, generation: int, identity: str, count: int) -> None:
         if count > self.max_bytes:
