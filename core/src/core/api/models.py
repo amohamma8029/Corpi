@@ -276,7 +276,7 @@ def model_payload(service: ModelSetupService, profile_id: str) -> ModelSetupPayl
         received_bytes=row["received_bytes"],
         failure_code=row["failure_code"],
         can_cancel=row["state"] == "downloading",
-        can_retry=row["state"] in ("missing", "failed", "cancelled"),
+        can_retry=row["can_retry"],
     )
 
 
