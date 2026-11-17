@@ -360,6 +360,9 @@ class Database:
     def _preflight_existing_database(self) -> None:
         connection = self._connect(read_only=True)
         try:
+            # Keep revision, history and schema on one read-only WAL snapshot
+            # if another initializer commits a valid migration during preflight.
+            connection.execute("BEGIN")
             mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             bootstrap = is_bootstrap_database(connection)
             if mode != "wal" and not bootstrap:
