@@ -16,9 +16,12 @@ Corpi is not a supported stable release. Native compatibility needs evidence for
 the particular commit and platform; a unit-test or build pass does not replace it.
 Supervised PDF parsing and resource limits are not an OS security sandbox for
 hostile files. A user-facing backup/restore feature is deferred to Milestone 2.
-Publishing the source is not a finished-release claim. Current-feature CI/native
-verification, capacity acceptance and strict aggregate memory/no-swap proof remain
-unfinished.
+Publishing the source is not a finished-release claim. Search still needs final-candidate
+platform checks, review and integration before Milestone 1 can be called complete.
+The milestone's goal is a usable, tested searchable notebook. Exhaustive physical-memory,
+graphics/cache accounting and an absolute no-swapping guarantee remain unproved limitations,
+not milestone acceptance gates. Correctness, privacy, recovery, bounded work and acceptable
+measured performance are still required.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) for local checks and safe test data, and
 [SECURITY.md](SECURITY.md) for private reporting and current dependency limitations.
@@ -86,7 +89,9 @@ message while retaining the original file.
 The core enforces a configurable **25,000,000-byte** starting upload limit, a **120-second** total
 transfer deadline, and a **30-second** no-bytes deadline. Only one incoming PDF transfer runs per
 core. PDF.js downloads the complete verified file and renders selected pages under a configurable
-**20-megapixel** starting canvas limit; the upload cap doesn't bound decoded memory. PDF.js and its
+**20-megapixel** starting rendered-page limit; the upload cap doesn't bound decoded memory.
+The feature-branch viewer draws visible regions in tiles of at most 512 × 512 pixels at the
+same page resolution, then releases tiles that leave view. PDF.js and its
 matching worker/support assets are copied from the pinned `pdfjs-dist` package during `just dev`
 and desktop builds. Those generated assets are ignored by Git.
 
@@ -97,7 +102,7 @@ Environment overrides are read by the core at startup:
 | `CORPI_PDF_MAX_BYTES` | `25000000` | Maximum received PDF bytes. |
 | `CORPI_PDF_UPLOAD_TIMEOUT_SECONDS` | `120` | Total time from transfer request acceptance through finalization. |
 | `CORPI_PDF_UPLOAD_IDLE_SECONDS` | `30` | Maximum wait for the next non-empty body chunk. |
-| `CORPI_PDF_RENDERED_PAGE_PIXELS` | `20000000` | Maximum canvas pixels for a rendered page. |
+| `CORPI_PDF_RENDERED_PAGE_PIXELS` | `20000000` | Maximum full-page rendered pixels, independent of visible-tile backing. |
 | `CORPI_PDF_STAGING_AGE_SECONDS` | `86400` | Minimum idle age before unowned staging can be cleaned. |
 | `CORPI_MAINTENANCE_INTERVAL_SECONDS` | `3600` | Existing local maintenance interval. |
 
@@ -180,8 +185,10 @@ PDFs and citation coordinates remain unchanged.
 
 The app retains its sampled 1-GiB child-memory cutoff. Cached Windows verification uses
 separate 1-GiB application-tree and 256-MiB controller-tree jobs. These Job Objects limit
-committed memory; strict aggregate resident/cache memory and no-swap acceptance remain
-unproved. These limits do not establish a hard production RAM cap or everyday speed.
+committed memory, not all physical, graphics or file-cache memory. Physical-memory use and
+absence of swapping have not been certified. The milestone does not require that absolute
+certificate; the existing limits and tested timeout, retry, cancellation and cleanup controls
+still apply. These measurements do not establish a hard production RAM cap or everyday speed.
 Setup allows one transfer at a time, up to three transfer attempts within a 600-second budget,
 a cumulative 1,000,000,000 received-byte ceiling, and a 30-second no-bytes deadline.
 
@@ -226,10 +233,16 @@ measure the core API workflow, not desktop-visible waiting time. Managed setup a
 have scoped integration checks. The current Bekko runtime parses one shared tokenizer
 before backend/session allocation. Windows both-mode search/saved-page navigation,
 multilingual recovery, repeated original-paper/exact-200-page native imports and long
-cancellation/following import pass. The unchanged near-capacity fixture publishes in
-1,019.90 seconds in the latest saved-setting run, with every vector and canonical mapping
-matching the original references. New arena-off E5 preparation passes switching,
-both-mode search and saved-page navigation in two fresh copied native libraries,
+cancellation/following import have recorded passes at their tested source versions.
+With the current core/runtime, the unchanged 9,950-chunk / 17,512,000-byte capacity fixture
+publishes in 732.56 seconds (12 minutes 13 seconds), within the 1,200-second preparation
+limit. All 9,950 vectors and canonical mappings match the original references. This is
+core preparation timing, not desktop import-to-ready time.
+Current-core native observations with cached Bekko reach visible ready in 26.42 seconds
+for the 15-page Attention paper, 18.73 seconds for the 16-page BERT paper and 226.06 seconds
+for the exact 200-page report, including its partial-source confirmation. These are one
+observation per fixture, not a final-build repeat distribution. New arena-off E5 preparation
+passes switching, both-mode search and saved-page navigation in two fresh copied native libraries,
 with exact original vectors and no job memory-limit events. Its matched worker peak
 private memory falls from about 895 to 581 MiB, at a 9.4% document-inference cost in
 that single pair. These results are not broad reliability or strict RAM/no-swap proof.
@@ -238,11 +251,12 @@ or cancelled rebuilds instead of leaving them labelled “Rebuilding”; Cancel 
 keeps the active model. Failed or cancelled model-switch jobs no longer mark the
 saved PDF import failed, so its search-result PDF/page shortcuts remain available.
 Genuine import failures still report failure; previously failed libraries are not
-reset or migrated. The CI matrix separately exercises MiniLM/E5 managed setup, offline
-inference and native viewer/search flows on Linux/macOS. Those selected checks do not establish
-dedicated default-Bekko coverage or strict aggregate memory/no-swap acceptance. Full M1.6
-acceptance remains pending; benchmark results and native runs are evidence for their recorded
-source, model and scenario, not any later edited build.
+reset or migrated. The existing CI covers supported-model setup/offline inference on Windows,
+macOS and Linux, with native viewer/readiness/model-switch checks. Its setup scenario does
+not itself submit Words/Meaning queries or open a result's page link; those need their own
+connected evidence. Final-candidate CI and the integrated Milestone 1 journey remain acceptance
+requirements. Benchmark results and native runs apply to their recorded source, model and
+scenario, not any later edited build.
 Benchmark-combined quality is not a Meaning-only or Words-only UI success rate.
 
 For desktop-visible timing on Windows, `core/benchmarks/search_readiness.json`
