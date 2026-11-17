@@ -2,6 +2,8 @@
 
 Use the trained pooler or exported final sentence embedding, not an arbitrary
 CLS/mean substitute. All inference remains CPU-only, local, bounded and supervised.
+Fresh LEALLA setup is unsupported by the current single-repository downloader;
+its mixed-source manifest and historical measurements are retained unchanged.
 """
 
 import argparse
@@ -253,7 +255,7 @@ class UTF8InputTokenizer(InputTokenizer):
 
 
 class ContextualRuntime:
-    def __init__(self, path, profile):
+    def __init__(self, path, profile, *, memory_arena=False, stop_spinning=False):
         verify_installation(path, profile)
         self.profile = profile
         config = json.loads((path / "config.json").read_text("utf-8"))
@@ -266,7 +268,11 @@ class ContextualRuntime:
         options = ort.SessionOptions()
         options.intra_op_num_threads = 2
         options.inter_op_num_threads = 2
-        options.enable_cpu_mem_arena = False
+        # Direct legacy calls keep their arena-off/default-spinning behavior.
+        # The shared worker's explicit choices must reach the actual ORT session.
+        options.enable_cpu_mem_arena = memory_arena
+        if stop_spinning:
+            options.add_session_config_entry("session.force_spinning_stop", "1")
         try:
             self.model = ort.InferenceSession(
                 str(path / profile.model_file),
@@ -295,6 +301,8 @@ class ContextualRuntime:
                         "providers": self.model.get_providers(),
                         "intra_op_threads": options.intra_op_num_threads,
                         "inter_op_threads": options.inter_op_num_threads,
+                        "cpu_memory_arena": memory_arena,
+                        "stop_spinning_after_run": stop_spinning,
                         "padding_token_id": self.pad_id,
                         "tokenizer_loader": "compiled JSON UTF-8; no truncation",
                     },
@@ -416,6 +424,15 @@ def main():
         parser.error("explicit setup requires profile and directory")
     profile = catalog[args.profile]
     target = args.directory / profile.identity
+    if profile.id == "lealla-small" and (
+        args.download_child or (args.download and not target.exists())
+    ):
+        parser.error(
+            "Fresh LEALLA setup is unsupported: its historical manifest combines an ONNX "
+            "export with a pooler from another repository. The downloader requires one exact "
+            "repository/revision/path. Keep the manifest and saved measurements unchanged; "
+            "--download can verify an already complete cached installation."
+        )
     if args.download_child:
         print(json.dumps({"received_bytes": download_profile(target, profile)}))
     elif args.download:

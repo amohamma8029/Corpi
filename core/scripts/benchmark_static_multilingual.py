@@ -164,7 +164,18 @@ class StaticTokenizer:
 
 
 class StaticRuntime:
-    def __init__(self, path: Path, profile: ModelProfile):
+    def __init__(
+        self,
+        path: Path,
+        profile: ModelProfile,
+        *,
+        memory_arena: bool = True,
+        stop_spinning: bool = True,
+    ):
+        # Keep the protocol defaults as the legacy static implementation, not a
+        # claim that NumPy implements ONNX arena or idle-thread configuration.
+        if not memory_arena or not stop_spinning:
+            raise ValueError("runtime_mismatch")
         verify_installation(path, profile)
         self.profile = profile
         self.tokenizer = StaticTokenizer(path, profile)
