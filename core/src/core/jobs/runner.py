@@ -685,6 +685,7 @@ class JobRunner:
                 await self._backoff(policy, attempt.attempt_number)
                 continue
 
+            commit_guard = AttemptGuard(self._owner, step.step_key, attempt.attempt_number)
             try:
                 await self._db(
                     step.commit,
@@ -692,12 +693,18 @@ class JobRunner:
                     StepCommitContext(
                         job_id=job.id,
                         step_key=step.step_key,
-                        guard=AttemptGuard(self._owner, step.step_key, attempt.attempt_number),
+                        guard=commit_guard,
                         inputs_sha256=fingerprint,
                         outcome=outcome,
                     ),
                 )
             except PermanentStepFailure as error:
+                if await self._accepted_search_publication(job, step, commit_guard):
+                    self._step_completed_at = time.monotonic()
+                    logger.warning(
+                        "search publication %s retained after accounting timeout", job.id
+                    )
+                    return True
                 await self._db(
                     self._store.finish_step_attempt,
                     job.id,
@@ -716,6 +723,9 @@ class JobRunner:
                 )
                 return False
             except ConflictingWriteError:
+                if await self._accepted_search_publication(job, step, commit_guard):
+                    self._step_completed_at = time.monotonic()
+                    return True
                 # The guarded commit saw a cancellation, a superseded attempt,
                 # or a finished job: the late result must not be recorded.
                 await self._db(
@@ -726,11 +736,28 @@ class JobRunner:
                     "commit rejected",
                 )
                 return False
+            except Exception:
+                if not await self._accepted_search_publication(job, step, commit_guard):
+                    raise
+                # The original lease remains durable when settlement is unavailable.
+                # Do not stringify a native/store error or rewrite accepted output.
+                logger.warning("search publication %s retained after accounting failure", job.id)
+                self._step_completed_at = time.monotonic()
+                return True
             self._step_completed_at = time.monotonic()
+            if await self._accepted_search_publication(job, step, commit_guard):
+                return True  # The publication transaction already closed this attempt.
             await self._db(
                 self._store.finish_step_attempt, job.id, step.step_key, attempt.attempt_number, None
             )
             return True
+
+    async def _accepted_search_publication(
+        self, job: Job, step: StepDefinition, guard: AttemptGuard
+    ) -> bool:
+        if job.kind != "pdf-search" or step.step_key != "publish-search":
+            return False
+        return await self._db(self._store.search_publication_completed, job.id, guard)
 
     def _run_step_with_reader(
         self,

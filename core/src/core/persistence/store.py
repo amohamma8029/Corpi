@@ -2448,6 +2448,11 @@ class PersistenceStore:
             row = _fetchone(connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,))
             return None if row is None else _job_status(row)
 
+    def search_publication_completed(self, job_id: str, guard: AttemptGuard) -> bool:
+        """Identify this attempt's atomic accepted publication, never a failed job."""
+        with self.database.connect() as connection:
+            return _search_publication_completed(connection, job_id, guard)
+
     @contextmanager
     def job_cancellation_reader(self, job_id: str) -> Iterator[Callable[[], bool]]:
         """Own one verified read-only connection on the polling thread until step exit.
@@ -2547,6 +2552,38 @@ class PersistenceStore:
             failure_code = _required_text(failure_code, "failure code")
         timestamp = utc_timestamp()
         with self._transaction() as connection:
+            if status == "completed":
+                recovered = connection.execute(
+                    """SELECT s.owner_instance_id,a.attempt_number FROM jobs j
+                       JOIN job_status s ON s.job_id=j.id
+                       JOIN job_steps p ON p.job_id=j.id AND p.step_key='publish-search'
+                       JOIN job_step_attempts a ON a.job_id=j.id AND a.step_key=p.step_key
+                       WHERE j.id=? AND j.kind='pdf-search' AND s.status='running'
+                         AND a.finished_at IS NULL AND p.committed_at>=a.started_at
+                         AND a.attempt_number=(SELECT MAX(latest.attempt_number)
+                             FROM job_step_attempts latest
+                             WHERE latest.job_id=j.id AND latest.step_key=a.step_key)""",
+                    (job_id,),
+                ).fetchone()
+                if recovered is not None:
+                    # Checkpoint reuse closes an older interrupted publication's
+                    # original attempt; it never creates another attempt or index.
+                    _complete_search_publication(
+                        connection,
+                        job_id,
+                        AttemptGuard(
+                            recovered["owner_instance_id"],
+                            "publish-search",
+                            recovered["attempt_number"],
+                        ),
+                    )
+                    return _job_status(
+                        _require_row(
+                            _fetchone(
+                                connection, "SELECT * FROM job_status WHERE job_id=?", (job_id,)
+                            )
+                        )
+                    )
             cursor = connection.execute(
                 """UPDATE job_status SET status=?, failure_reason=?, failure_code=?, updated_at=?
                    WHERE job_id=? AND status IN ('queued','running')""",
@@ -2863,6 +2900,7 @@ class PersistenceStore:
                     checkpoint,
                     inputs_sha256,
                 )
+                _complete_search_publication(connection, job_id, guard)
             if search_deadline is not None and time.monotonic() >= search_deadline:
                 raise ConflictingWriteError(
                     "search preparation deadline expired during publication"
@@ -4273,6 +4311,62 @@ def _save_job_step(
             *output_values,
             utc_timestamp(),
         ),
+    )
+
+
+def _complete_search_publication(
+    connection: sqlite3.Connection, job_id: str, guard: AttemptGuard
+) -> None:
+    """Accept output, its checkpoint and terminal ownership in one transaction.
+
+    Generic publication/cancellation keeps its existing semantics. Only the final
+    search checkpoint closes its exact open attempt and job before COMMIT, so
+    later accounting/bookkeeping cannot fail an already accepted replacement.
+    """
+    if guard.step_key != "publish-search":
+        raise ConflictingWriteError("search completion requires the final publication attempt")
+    _verify_attempt_current(connection, job_id, guard.step_key, guard)
+    job = connection.execute("SELECT kind FROM jobs WHERE id=?", (job_id,)).fetchone()
+    checkpoint = connection.execute(
+        "SELECT 1 FROM job_steps WHERE job_id=? AND step_key='publish-search'", (job_id,)
+    ).fetchone()
+    if job is None or job[0] != "pdf-search" or checkpoint is None:
+        raise ConflictingWriteError("search completion requires its committed checkpoint")
+    timestamp = utc_timestamp()
+    connection.execute(
+        "UPDATE job_step_attempts SET finished_at=?,failure_reason=NULL,outcome='ok'"
+        " WHERE job_id=? AND step_key=? AND attempt_number=?",
+        (timestamp, job_id, guard.step_key, guard.expected_attempt_number),
+    )
+    connection.execute(
+        "UPDATE job_status SET status='completed',failure_reason=NULL,"
+        "failure_code=NULL,updated_at=?"
+        " WHERE job_id=?",
+        (timestamp, job_id),
+    )
+
+
+def _search_publication_completed(
+    connection: sqlite3.Connection, job_id: str, guard: AttemptGuard
+) -> bool:
+    """Permit only this successfully closed attempt's post-COMMIT accounting."""
+    if guard.step_key != "publish-search":
+        return False
+    return (
+        connection.execute(
+            """SELECT 1 FROM jobs j JOIN job_status s ON s.job_id=j.id
+               JOIN job_step_attempts a ON a.job_id=j.id AND a.step_key='publish-search'
+               JOIN job_steps p ON p.job_id=j.id AND p.step_key=a.step_key
+               WHERE j.id=? AND j.kind='pdf-search' AND s.status='completed'
+                 AND s.owner_instance_id=? AND a.attempt_number=?
+                 AND a.finished_at IS NOT NULL AND a.outcome='ok' AND a.failure_reason IS NULL
+                 AND p.committed_at>=a.started_at
+                 AND a.attempt_number=(SELECT MAX(latest.attempt_number)
+                     FROM job_step_attempts latest
+                     WHERE latest.job_id=j.id AND latest.step_key=a.step_key)""",
+            (job_id, guard.owner_instance_id, guard.expected_attempt_number),
+        ).fetchone()
+        is not None
     )
 
 

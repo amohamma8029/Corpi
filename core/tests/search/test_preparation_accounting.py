@@ -338,7 +338,9 @@ def test_runner_preparation_wall_including_handoffs_and_checkpoints_matches_char
             while time.monotonic() < deadline:
                 status = store.load_job_status(job)
                 assert status is not None
-                if status.status in ("completed", "failed"):
+                if status.status in ("completed", "failed") and (
+                    runner.snapshot().claimed_job_id is None
+                ):
                     assert status.status == "completed", status
                     break
                 await asyncio.sleep(0.02)
@@ -355,10 +357,10 @@ def test_runner_preparation_wall_including_handoffs_and_checkpoints_matches_char
             " ON s.output_index_version_id=g.index_version_id WHERE s.job_id=? AND s.step_key=?",
             (job, preparation.PLAN),
         ).fetchone()[0]
-    # Final attempt-status bookkeeping follows completed publication and is not
-    # preparation. Earlier bookkeeping,5s handoff,load,inference,reap and all4
-    # actual native checkpoint writes ARE charged,without double-counting.
-    assert charged == pytest.approx(clock.monotonic() - began - 2)
+    # Final attempt/job completion now shares publication's transaction, not a
+    # later 2s finish_step_attempt call. Earlier bookkeeping,5s handoff,load,
+    # inference,reap and all4 native checkpoint writes remain charged exactly.
+    assert charged == pytest.approx(clock.monotonic() - began)
     assert charged == pytest.approx(27)
     assert len(store.load_job_steps(job)) == 4
 
