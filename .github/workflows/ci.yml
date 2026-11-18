@@ -136,7 +136,6 @@ jobs:
         if: runner.os == 'Linux'
         env:
           CORPI_RUN_MODEL_DOWNLOAD: "1"
-          CORPI_AUTOCOMPLETE_PROBE: "1"
         run: xvfb-run -a --server-args="-screen 0 1280x1024x24" dbus-run-session -- pnpm --dir desktop run test:e2e
 
       - name: Native viewer and search setup E2E (macOS / WKWebView)
