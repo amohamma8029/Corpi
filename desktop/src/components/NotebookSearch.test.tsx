@@ -30,7 +30,9 @@ function submit(query = "rainfall") {
 it("searches only on submit, preserves canonical RTL text and opens the mapped saved page", async () => {
   const open = vi.fn();
   render(<NotebookSearch connection={connection} notebookId="one" onOpen={open} />);
-  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "rainfall" } });
+  const field = screen.getByRole("searchbox", { name: "Find a passage" });
+  expect(field.getAttribute("autocomplete")).toBe("off");
+  fireEvent.change(field, { target: { value: "rainfall" } });
   expect(searchNotebook).not.toHaveBeenCalled();
   submit();
   const button = await screen.findByRole("button", { name: "Open original.pdf, page 2" });
