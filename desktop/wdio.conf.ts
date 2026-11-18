@@ -1,7 +1,9 @@
 import { browser } from "@wdio/globals";
 import { launcher as TauriLauncher, type TauriServiceOptions } from "@wdio/tauri-service";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { windowsAttachment } from "./scripts/windows-webdriver.mjs";
 
@@ -69,5 +71,28 @@ export const config: WebdriverIO.Config = {
       error: result.error?.message,
     })}\n`);
     await browser.saveScreenshot(path.join(results, `${name}.png`));
+    // The one-off Mac probe needs a normal quit so Python's crash reporter
+    // cannot cover the reopened app. Leave normal test teardown untouched.
+    if (result.passed && process.platform === "darwin" && process.env.CORPI_AUTOCOMPLETE_PHASE === "prime") {
+      const report = process.env.CORPI_AUTOCOMPLETE_RESULTS;
+      if (!report) throw Error("Missing autocomplete results directory");
+      const entry = JSON.parse(readFileSync(path.join(report, "observations.jsonl"), "utf8").split("\n")[0]);
+      if (entry.phase !== "prime" || !Number.isInteger(entry.pid) || entry.pid < 2) throw Error("Cannot verify the probe app PID");
+      const quit = spawnSync("osascript", ["-e", `tell application "System Events"
+        if (unix id of (first application process whose frontmost is true)) is not ${entry.pid} then error "Corpi lost focus"
+        keystroke "q" using command down
+      end tell`], { encoding: "utf8", timeout: 10_000 });
+      if (quit.error || quit.status !== 0) throw Error(`Normal Corpi quit failed: ${quit.error?.message ?? quit.stderr}`);
+      const deadline = Date.now() + 10_000;
+      while (true) {
+        try { process.kill(entry.pid, 0); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+          throw error;
+        }
+        if (Date.now() >= deadline) throw Error("Corpi did not quit normally during the autocomplete probe");
+        await delay(100);
+      }
+    }
   },
 };

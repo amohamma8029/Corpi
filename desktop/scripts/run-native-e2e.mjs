@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { arch, release, version } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { arch, release, tmpdir, version } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -198,30 +198,45 @@ try {
       await waitForDriver(driver);
     }
   }
+  let probeFailure;
+  if (!windows && env.GITHUB_ACTIONS === "true" && env.CORPI_AUTOCOMPLETE_PROBE === "1") {
+    const dataKey = provider === "embedded" ? "CORPI_E2E_DATA_DIR" : "XDG_DATA_HOME";
+    const originalData = env[dataKey];
+    try {
+      const probeFile = path.join(results, "autocomplete-probe");
+      env[dataKey] = mkdtempSync(path.join(tmpdir(), "corpi-autocomplete-"));
+      // Run first on the fresh CI display. Retain the isolated profile through
+      // two separate launches, not just a page reload.
+      for (const phase of ["prime", "observe"]) {
+        evidence.stage = `autocomplete-${phase}`;
+        saveEvidence();
+        Object.assign(env, { CORPI_AUTOCOMPLETE_PHASE: phase, CORPI_AUTOCOMPLETE_RESULTS: probeFile });
+        await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts", "--spec", "e2e/probes/autocomplete.ts"], 180_000);
+        const deadline = Date.now() + 10_000;
+        while (corePids().some((pid) => !existingCorePids.has(pid))) {
+          if (Date.now() >= deadline) throw new Error(`Autocomplete ${phase}: core survived launcher shutdown.`);
+          await delay(200);
+        }
+      }
+      const observed = readFileSync(path.join(probeFile, "observations.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+      const prime = observed.find((entry) => entry.phase === "prime" && entry.pid);
+      const reopen = observed.find((entry) => entry.phase === "observe" && entry.pid);
+      if (!prime || !reopen || prime.pid === reopen.pid) throw new Error("A full native app relaunch was not confirmed.");
+    } catch (error) {
+      probeFailure = error;
+      evidence.autocompleteFailure = {stage: evidence.stage, message: error.message};
+    } finally {
+      delete env.CORPI_AUTOCOMPLETE_PHASE;
+      delete env.CORPI_AUTOCOMPLETE_RESULTS;
+      if (originalData === undefined) delete env[dataKey];
+      else env[dataKey] = originalData;
+    }
+  }
   evidence.stage = "viewer";
   saveEvidence();
   // Allow the bounded setup test plus the ordinary viewer/startup checks.
   await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], modelDownloads ? 1_800_000 : 300_000);
-  if (!windows && env.GITHUB_ACTIONS === "true" && env.CORPI_AUTOCOMPLETE_PROBE === "1") {
-    const probeFile = path.join(results, "autocomplete-probe");
-    // Fresh hosted job, existing isolated E2E app profile. Keep that profile
-    // through two separate WDIO launcher invocations, not just a page reload.
-    for (const phase of ["prime", "observe"]) {
-      evidence.stage = `autocomplete-${phase}`;
-      saveEvidence();
-      Object.assign(env, { CORPI_AUTOCOMPLETE_PHASE: phase, CORPI_AUTOCOMPLETE_RESULTS: probeFile });
-      await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts", "--spec", "e2e/probes/autocomplete.ts"], 180_000);
-      const deadline = Date.now() + 10_000;
-      while (corePids().some((pid) => !existingCorePids.has(pid))) {
-        if (Date.now() >= deadline) throw new Error(`Autocomplete ${phase}: core survived launcher shutdown.`);
-        await delay(200);
-      }
-    }
-    const observed = readFileSync(path.join(probeFile, "observations.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
-    const prime = observed.find((entry) => entry.phase === "prime" && entry.pid);
-    const reopen = observed.find((entry) => entry.phase === "observe" && entry.pid);
-    if (!prime || !reopen || prime.pid === reopen.pid) throw new Error("A full native app relaunch was not confirmed.");
-  }
+  if (probeFailure) throw probeFailure;
 } catch (error) {
   failure = error;
 } finally {

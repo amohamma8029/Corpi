@@ -1,7 +1,7 @@
 // One-off native evidence for PR #19. A screenshot is evidence for review,
 // not an assertion that a platform does or does not offer autocomplete.
 import { $, browser } from "@wdio/globals";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -17,7 +17,11 @@ const cases = [
 const query = "cobalt fern";
 
 function command(executable: string, args: string[]): string {
-  return execFileSync(executable, args, { encoding: "utf8", timeout: 10_000 }).trim();
+  const result = spawnSync(executable, args, { encoding: "utf8", timeout: 10_000 });
+  if (result.error || result.status !== 0) {
+    throw Error(`${executable}: ${result.error?.message ?? result.stderr?.trim() ?? result.signal ?? result.status}`);
+  }
+  return result.stdout.trim();
 }
 
 function appPid(): number {
@@ -100,8 +104,7 @@ describe("Notebook autocomplete observation in the native WebView", () => {
             await delay(140);
             const name = path.join(output, `${variant.label}-${String(index + 1).padStart(2, "0")}.png`);
             if (process.platform === "darwin") command("screencapture", ["-x", "-t", "png", name]);
-            else command("ffmpeg", ["-nostdin", "-v", "error", "-f", "x11grab", "-video_size", "1280x1024",
-              "-i", process.env.DISPLAY ?? "", "-frames:v", "1", "-threads", "1", "-n", name]);
+            else command("python3", ["-I", "e2e/probes/x11-screenshot.py", name]);
           }
         }
         await $("button=Search").click();
