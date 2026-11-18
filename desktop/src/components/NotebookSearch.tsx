@@ -118,7 +118,7 @@ export function NotebookSearch({ connection, notebookId, invalidationKey = 0, on
     <form onSubmit={(event) => void submit(event)}>
       <label htmlFor="notebook-search-query">Find a passage</label>
       <div className="notebook-search__controls">
-        <input id="notebook-search-query" type="search" dir="auto" required maxLength={8192}
+        <input id="notebook-search-query" type="search" dir="auto" autoComplete="off" required maxLength={8192}
           value={query} onChange={(event) => setQuery(event.currentTarget.value)} />
         <label className="visually-hidden" htmlFor="notebook-search-mode">Search mode</label>
         <select id="notebook-search-mode" value={mode}
