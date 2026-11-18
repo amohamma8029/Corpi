@@ -202,6 +202,26 @@ try {
   saveEvidence();
   // Allow the bounded setup test plus the ordinary viewer/startup checks.
   await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts"], modelDownloads ? 1_800_000 : 300_000);
+  if (!windows && env.GITHUB_ACTIONS === "true" && env.CORPI_AUTOCOMPLETE_PROBE === "1") {
+    const probeFile = path.join(results, "autocomplete-probe");
+    // Fresh hosted job, existing isolated E2E app profile. Keep that profile
+    // through two separate WDIO launcher invocations, not just a page reload.
+    for (const phase of ["prime", "observe"]) {
+      evidence.stage = `autocomplete-${phase}`;
+      saveEvidence();
+      Object.assign(env, { CORPI_AUTOCOMPLETE_PHASE: phase, CORPI_AUTOCOMPLETE_RESULTS: probeFile });
+      await run("pnpm", ["exec", "wdio", "run", "wdio.conf.ts", "--spec", "e2e/probes/autocomplete.ts"], 180_000);
+      const deadline = Date.now() + 10_000;
+      while (corePids().some((pid) => !existingCorePids.has(pid))) {
+        if (Date.now() >= deadline) throw new Error(`Autocomplete ${phase}: core survived launcher shutdown.`);
+        await delay(200);
+      }
+    }
+    const observed = readFileSync(path.join(probeFile, "observations.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+    const prime = observed.find((entry) => entry.phase === "prime" && entry.pid);
+    const reopen = observed.find((entry) => entry.phase === "observe" && entry.pid);
+    if (!prime || !reopen || prime.pid === reopen.pid) throw new Error("A full native app relaunch was not confirmed.");
+  }
 } catch (error) {
   failure = error;
 } finally {
