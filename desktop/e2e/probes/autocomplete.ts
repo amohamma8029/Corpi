@@ -92,12 +92,22 @@ describe("Notebook autocomplete observation in the native WebView", () => {
       try {
         for (const [index, character] of [...query].entries()) {
           await type(character, pid);
-          const state = await browser.execute((selector) => {
+          const readInput = () => browser.execute((selector) => {
             const node = document.querySelector(selector) as HTMLInputElement & { probeEvents: boolean[] };
-            return { value: node.value, trusted: node.probeEvents.at(-1), autocomplete: node.getAttribute("autocomplete") };
+            return {
+              value: node.value, eventCount: node.probeEvents.length,
+              trusted: node.probeEvents.at(-1), autocomplete: node.getAttribute("autocomplete"),
+            };
           }, field);
+          // AppleScript returns after sending the key, not after WebKit has
+          // delivered it. Do not send another key or accept the previous event.
+          await browser.waitUntil(async () => (await readInput()).eventCount >= index + 1, {
+            timeout: 2_000, interval: 40, timeoutMsg: `No new input event at ${variant.label} character ${index + 1}`,
+          });
+          const state = await readInput();
           log({ variant: variant.label, index, ...state });
-          if (!state.trusted || state.value !== query.slice(0, index + 1) || state.autocomplete !== variant.autocomplete) {
+          if (state.eventCount !== index + 1 || !state.trusted ||
+              state.value !== query.slice(0, index + 1) || state.autocomplete !== variant.autocomplete) {
             throw Error("Native keystroke or requested autocomplete setting could not be confirmed.");
           }
           if (phase === "observe" && index < query.length - 1) {
