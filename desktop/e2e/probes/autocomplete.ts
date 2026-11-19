@@ -70,6 +70,15 @@ describe("Notebook autocomplete observation in the native WebView", () => {
       await $("#new-notebook-title").setValue(title);
       await $("#create-notebook").click();
     } else {
+      if (process.platform === "darwin") {
+        // A Python crash report from the first launch can stay above Corpi.
+        // Move the test window so the real input and its suggestions are clear;
+        // leave the report visible in the evidence and do not dismiss it.
+        const before = await browser.getWindowRect();
+        const placed = await browser.setWindowRect(0, 235, before.width, 480);
+        log({ windowBefore: before, observationWindow: placed });
+        if (placed.y < 220) throw Error("Could not place the Mac test window clear of the crash report.");
+      }
       await $("#notebook-select").selectByVisibleText(title);
     }
     await $(field).waitForDisplayed();
