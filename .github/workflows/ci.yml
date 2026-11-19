@@ -142,7 +142,6 @@ jobs:
         if: runner.os == 'macOS'
         env:
           CORPI_RUN_MODEL_DOWNLOAD: "1"
-          CORPI_AUTOCOMPLETE_PROBE: "1"
         run: pnpm --dir desktop run test:e2e
 
       - name: Upload native viewer evidence

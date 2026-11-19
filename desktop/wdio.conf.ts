@@ -1,9 +1,7 @@
 import { browser } from "@wdio/globals";
 import { launcher as TauriLauncher, type TauriServiceOptions } from "@wdio/tauri-service";
-import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 
 import { windowsAttachment } from "./scripts/windows-webdriver.mjs";
 
@@ -23,41 +21,9 @@ const launcherOptions: TauriServiceOptions = {
   captureBackendLogs: true,
   logDir: path.join(results, "logs"),
 };
-class AutocompleteLauncher extends TauriLauncher {
-  override async onComplete(...args: Parameters<TauriLauncher["onComplete"]>) {
-    try {
-      if (args[0] !== 0) return;
-      const report = process.env.CORPI_AUTOCOMPLETE_RESULTS;
-      if (!report) throw Error("Missing autocomplete results directory");
-      const entry = JSON.parse(readFileSync(path.join(report, "observations.jsonl"), "utf8").split("\n")[0]);
-      if (entry.phase !== "prime" || !Number.isInteger(entry.pid) || entry.pid < 2) throw Error("Cannot verify the probe app PID");
-      const quit = spawnSync("osascript", ["-e", `tell application "System Events"
-        if (unix id of (first application process whose frontmost is true)) is not ${entry.pid} then error "Corpi lost focus"
-        keystroke "q" using command down
-      end tell`], { encoding: "utf8", timeout: 10_000 });
-      if (quit.error || quit.status !== 0) throw Error(`Normal Corpi quit failed: ${quit.error?.message ?? quit.stderr}`);
-      const deadline = Date.now() + 10_000;
-      while (true) {
-        try { process.kill(entry.pid, 0); }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
-          throw error;
-        }
-        if (Date.now() >= deadline) throw Error("Corpi did not quit normally during the autocomplete probe");
-        await delay(100);
-      }
-      console.log(`Autocomplete prime: app ${entry.pid} quit after the WebDriver session ended.`);
-    } finally {
-      await super.onComplete(...args);
-    }
-  }
-}
-// Keep the Mac app alive until its WebDriver worker finishes disconnecting.
-const launcher = process.platform === "darwin" && process.env.CORPI_AUTOCOMPLETE_PHASE === "prime"
-  ? AutocompleteLauncher : TauriLauncher;
 // WDIO accepts launcher-only custom classes at runtime, but ServiceEntry's
 // constructor type describes worker services. Keep the cast at this boundary.
-const launcherService = [launcher, launcherOptions] as unknown as
+const launcherService = [TauriLauncher, launcherOptions] as unknown as
   NonNullable<WebdriverIO.Config["services"]>[number];
 
 export const config: WebdriverIO.Config = {
