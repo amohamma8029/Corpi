@@ -14,7 +14,9 @@ const cases = [
   { label: "browser-default", autocomplete: null },
   { label: "autocomplete-off", autocomplete: "off" },
 ] as const;
-const query = "cobalt fern";
+// macOS may capitalize the first word when a space follows it. Use a single
+// word so this comparison doesn't change native autocapitalization settings.
+const query = "transformer";
 
 function command(executable: string, args: string[]): string {
   const result = spawnSync(executable, args, { encoding: "utf8", timeout: 10_000 });
