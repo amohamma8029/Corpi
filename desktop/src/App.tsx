@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ModelSettings } from "./components/ModelSettings";
+import { ProviderSettings } from "./components/ProviderSettings";
 import { SearchProgress } from "./components/SearchProgress";
 import { NotebookSearch } from "./components/NotebookSearch";
 
@@ -562,6 +563,7 @@ export function App() {
               <button id="create-notebook" type="submit" disabled={uploading}>Create notebook</button>
             </form>
             <ModelSettings connection={connection} notebookId={selectedNotebookId} />
+            <ProviderSettings connection={connection} />
             {selectedNotebookId ? (
               <>
                 <button

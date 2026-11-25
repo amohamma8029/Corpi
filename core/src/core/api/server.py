@@ -17,6 +17,8 @@ from core.persistence.database import Database, DatabaseConfig, verify_sqlite_ru
 from core.persistence.errors import PersistenceError
 from core.persistence.models import new_id
 from core.persistence.store import PersistenceStore
+from core.providers.credentials import KeyringCredentialStore
+from core.providers.service import ProviderService
 from core.search.handoff import SearchCoordinator
 from core.search.install import ModelSetupService
 from core.search.preparation import build_search_steps
@@ -111,6 +113,7 @@ def main() -> None:
         )
         model_setup = ModelSetupService(store, notify=runner.notify)
         notebook_models = NotebookModelService(store, notify=runner.notify)
+        provider_service = ProviderService(store, KeyringCredentialStore())
         pdf_ingest = PdfIngestService(
             store,
             owner_instance_id,
@@ -134,6 +137,7 @@ def main() -> None:
             sweeper=sweeper,
             model_setup=model_setup,
             notebook_models=notebook_models,
+            provider_service=provider_service,
         )
         config = uvicorn.Config(
             app,

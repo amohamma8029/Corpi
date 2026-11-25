@@ -324,7 +324,7 @@ deferral of artifact creation itself.
 | --- | --- | --- |
 | Overall artifact requirements | **Partially Decided** | Saved-output behavior is settled in [notes, artifacts, and history](#notes-artifacts-and-history); the remaining details are listed below. |
 | Initial artifact types and evidence selection | **Deferred** | Decide the types, source coverage, and evidence-selection strategy and budgets at the artifact milestone. Rules for evidence/citations from note inputs remain unspecified. |
-| Generation provider/model and claim-support checker | **Needs Decision** | No vendor/model is chosen. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
+| Generation provider/model and claim-support checker | **Decided for M2** | Google Gemini API on the free tier, with `gemini-3.8-flash` for generation and `gemini-3.5-flash-lite` for claim checks. The user must acknowledge that free-tier prompts and responses may be used to improve Google's products. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
 | Local backup/export/restore | **Needs Decision** | Export formats and recovery workflow. |
 
 Other implementation choices are listed in [architecture.md](architecture.md).

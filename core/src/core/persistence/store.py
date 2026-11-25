@@ -35,12 +35,14 @@ from core.persistence.models import (
     JSONValue,
     ManagedFile,
     ManagedFileRemoval,
+    ModelCallUsage,
     Notebook,
     Passage,
     PdfAcquisition,
     PdfImport,
     PdfImportTrash,
     PersistenceSnapshot,
+    ProviderSettings,
     RetrievalChunk,
     Source,
     SourcePdfState,
@@ -3363,6 +3365,146 @@ class PersistenceStore:
                 job_steps,
             )
 
+    def load_provider_settings(self, provider_id: str) -> ProviderSettings | None:
+        provider_id = _required_text(provider_id, "provider id")
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM provider_settings WHERE provider_id=?", (provider_id,)
+            ).fetchone()
+            return None if row is None else _provider_settings(row)
+
+    def save_provider_settings(self, settings: ProviderSettings) -> ProviderSettings:
+        provider_id = _required_text(settings.provider_id, "provider id")
+        generation_model = _required_text(settings.generation_model, "generation model")
+        checker_model = _required_text(settings.checker_model, "checker model")
+        _integer(settings.settings_format_version, "settings format version", minimum=1)
+        _integer(settings.output_token_allowance, "output token allowance", minimum=1)
+        _integer(settings.safety_margin_tokens, "safety margin tokens", minimum=0)
+        if settings.output_token_allowance > 1_000_000:
+            raise ValueError("output token allowance exceeds the supported maximum")
+        if settings.safety_margin_tokens > 1_000_000:
+            raise ValueError("safety margin exceeds the supported maximum")
+        if not isinstance(settings.free_tier_acknowledged, bool):
+            raise ValueError("free-tier acknowledgement must be boolean")
+        if not isinstance(settings.call_policies, dict):
+            raise ValueError("call policies must be a JSON object")
+        call_policies_json = encode_json(settings.call_policies)
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM provider_settings WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+            created_at = timestamp if existing is None else existing["created_at"]
+            connection.execute(
+                """INSERT INTO provider_settings(
+                       provider_id,settings_format_version,generation_model,checker_model,
+                       free_tier_acknowledged,output_token_allowance,safety_margin_tokens,
+                       call_policies_json,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(provider_id) DO UPDATE SET
+                       settings_format_version=excluded.settings_format_version,
+                       generation_model=excluded.generation_model,
+                       checker_model=excluded.checker_model,
+                       free_tier_acknowledged=excluded.free_tier_acknowledged,
+                       output_token_allowance=excluded.output_token_allowance,
+                       safety_margin_tokens=excluded.safety_margin_tokens,
+                       call_policies_json=excluded.call_policies_json,
+                       updated_at=excluded.updated_at""",
+                (
+                    provider_id,
+                    settings.settings_format_version,
+                    generation_model,
+                    checker_model,
+                    int(settings.free_tier_acknowledged),
+                    settings.output_token_allowance,
+                    settings.safety_margin_tokens,
+                    call_policies_json,
+                    created_at,
+                    timestamp,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM provider_settings WHERE provider_id=?", (provider_id,)
+            ).fetchone()
+            return _provider_settings(_require_row(row))
+
+    def record_model_call_usage(self, usage: ModelCallUsage) -> ModelCallUsage:
+        validate_id(usage.id)
+        request_id = _required_text(usage.request_id, "request id")
+        provider_id = _required_text(usage.provider_id, "provider id")
+        model = _required_text(usage.model, "model")
+        if usage.call_type not in {
+            "generation",
+            "support_check",
+            "summary",
+            "format_repair",
+            "citation_retry",
+            "settings_test",
+        }:
+            raise ValueError("unsupported model call type")
+        if usage.outcome not in {"completed", "failed", "cancelled", "unknown"}:
+            raise ValueError("unsupported model call outcome")
+        for field, value in (
+            ("input tokens", usage.input_tokens),
+            ("output tokens", usage.output_tokens),
+            ("thought tokens", usage.thought_tokens),
+            ("cached tokens", usage.cached_tokens),
+            ("total tokens", usage.total_tokens),
+        ):
+            if value is not None:
+                _integer(value, field, minimum=0)
+        error_code = (
+            None if usage.error_code is None else _required_text(usage.error_code, "error code")
+        )
+        if error_code is not None and len(error_code) > 120:
+            raise ValueError("error code is too long")
+        validate_utc_timestamp(usage.started_at)
+        if usage.finished_at is not None:
+            validate_utc_timestamp(usage.finished_at)
+        validate_utc_timestamp(usage.created_at)
+        with self._transaction() as connection:
+            connection.execute(
+                """INSERT INTO model_call_usage(
+                       id,request_id,call_type,provider_id,model,input_tokens,output_tokens,
+                       thought_tokens,cached_tokens,total_tokens,outcome,error_code,
+                       started_at,finished_at,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    usage.id,
+                    request_id,
+                    usage.call_type,
+                    provider_id,
+                    model,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.thought_tokens,
+                    usage.cached_tokens,
+                    usage.total_tokens,
+                    usage.outcome,
+                    error_code,
+                    usage.started_at,
+                    usage.finished_at,
+                    usage.created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM model_call_usage WHERE id=?", (usage.id,)
+            ).fetchone()
+            return _model_call_usage(_require_row(row))
+
+    def list_model_call_usage(self, limit: int = 50) -> tuple[ModelCallUsage, ...]:
+        if not 1 <= limit <= 500:
+            raise ValueError("usage limit must be between 1 and 500")
+        with self.database.connect() as connection:
+            return tuple(
+                _model_call_usage(row)
+                for row in connection.execute(
+                    "SELECT * FROM model_call_usage ORDER BY created_at DESC,id DESC LIMIT ?",
+                    (limit,),
+                )
+            )
+
     @contextmanager
     def _transaction(self, write: bool = True) -> Iterator[sqlite3.Connection]:
         try:
@@ -4571,6 +4713,44 @@ def _source(row: sqlite3.Row) -> Source:
         row["display_name"],
         row["created_at"],
         row["updated_at"],
+    )
+
+
+def _provider_settings(row: sqlite3.Row) -> ProviderSettings:
+    policies = decode_json(row["call_policies_json"])
+    if not isinstance(policies, dict):
+        raise ValueError("stored provider policies are not an object")
+    return ProviderSettings(
+        row["provider_id"],
+        row["settings_format_version"],
+        row["generation_model"],
+        row["checker_model"],
+        bool(row["free_tier_acknowledged"]),
+        row["output_token_allowance"],
+        row["safety_margin_tokens"],
+        policies,
+        row["created_at"],
+        row["updated_at"],
+    )
+
+
+def _model_call_usage(row: sqlite3.Row) -> ModelCallUsage:
+    return ModelCallUsage(
+        row["id"],
+        row["request_id"],
+        row["call_type"],
+        row["provider_id"],
+        row["model"],
+        row["input_tokens"],
+        row["output_tokens"],
+        row["thought_tokens"],
+        row["cached_tokens"],
+        row["total_tokens"],
+        row["outcome"],
+        row["error_code"],
+        row["started_at"],
+        row["finished_at"],
+        row["created_at"],
     )
 
 
