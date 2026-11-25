@@ -103,8 +103,8 @@ The fetch/browser component must run in isolation, or a sandbox, to restrict wha
 content can access. Other runtime and process boundaries remain open.
 
 Both model-call arrows pass through the component authorized to make model requests. They do not
-assign credentials to the core or background runner: which local component may retrieve credentials
-remains **Needs Decision**.
+assign credentials to the core or background runner: the core's authorized provider service is the
+credential holder for M2.1. Background callers use that service and never receive the secret.
 
 ### Components and responsibilities
 
@@ -843,7 +843,7 @@ and links to the work that produced or used it.
 | Local app records | One SQLite database under the user's Corpi app-data directory: notebooks; sources, versions and PDF import history; durable PDF acquisitions/plans; canonical-original registry and removal reservations; immutable citation passages and their retrieval-chunk links; search metadata; conversations, answers, notes, artifacts, and citations; settings and job/task state. |
 | Corpi-managed files | Uploaded originals, saved web pages/PDFs, previews, generated documents/exports, and other large app-managed files. New PDF originals live at `files/objects/<managed-file-id>.pdf`; acquisition staging lives under `files/staging/`. Export behavior remains open. |
 | Search indexes | Local keyword and semantic/vector indexes. Record each index version, the source versions it covers, and the embedding model and version used for semantic search. |
-| Secure credential storage | External generation credentials, kept outside ordinary app/database fields. The storage/decryption technology and authorized component remain open. |
+| Secure credential storage | External generation credentials, kept outside ordinary app/database fields. M2.1 uses the OS-native keychain through Python `keyring` (Windows Credential Locker, macOS Keychain, or Linux Secret Service). Only the core provider service may read the secret; the desktop may submit or replace it but cannot read it back. |
 
 #### Keep record links valid
 
@@ -952,6 +952,16 @@ cited passage for a support check. Interactive calls come from the request-scope
 artifact calls may come from background work. Every response must pass the applicable versioned
 schema and validation rules.
 
+M2.1's first adapter uses Google Gemini's Interactions endpoint with the pinned
+`Api-Revision: 2026-05-20`, `store: false`, trusted `system_instruction`, optional
+`response_format` JSON Schema, and `generation_config` output/thinking limits. The preflight
+`models/{model}:countTokens` call supplies the input-token count used by context budgeting.
+Interaction usage records input, output, thought, cached, and total tokens when reported. The
+free tier is used only after the user acknowledges that Google may use free-tier prompts and
+responses to improve its products. The adapter retries only 429/503 responses and pre-send connection
+failures within the recorded attempt cap; a timeout or disconnect after sending is an unknown outcome
+and is not replayed.
+
 Corpi-supported embeddings run locally by default, so users need no embedding API credential and
 retrieval chunks stay on the device for indexing. Record the model identifier/version with each
 set. Additional explicitly supported local or remote embedding backends may come later, but initial
@@ -984,7 +994,7 @@ communication (IPC). An internal HTTP server is not required.
 | Desktop UI ↔ Application Core | Route app actions through the core; UI content cannot directly change search internals, retrieve credentials, or bypass sandboxed fetching. |
 | Core ↔ Background Processing | Record jobs and share progress/results through local storage for the core/UI to read. PDF receipt is a pre-job acquisition; only a durable finalization transaction creates its queued processing job. No external job-routing service is assumed. |
 | Background Processing ↔ Fetch/Browser | Exchange only the fetch request, validated import parameters, and fetched content. Never send credentials or unrelated app state. |
-| Authorized model component ↔ Provider | Send required instructions/context with configured credentials; accept only responses that pass schema and validation checks. The credential-holding component remains open. |
+| Authorized model component ↔ Provider | Send required instructions/context with configured credentials; accept only responses that pass schema and validation checks. M2.1 makes the core provider service the credential holder; background callers use it without receiving the secret. |
 | Search ↔ Context selection ↔ Generation ↔ Citation checks | Keep steps independently testable and retain source-version and citation-passage references, including when candidates are dropped or rearranged. |
 
 These rules define responsibilities and the data passed between components. They do not specify
@@ -1041,8 +1051,10 @@ instructions structurally separate from retrieved source context when assembling
 
 Only the authorized model component may retrieve and use generation credentials. Source content,
 prompts in retrieved documents, the desktop UI, and the fetch sandbox cannot directly request or
-read stored credentials. Use an appropriate secure local credential mechanism, not ordinary
-app/database fields.
+read stored credentials. M2.1 stores the credential in the OS-native keychain through Python
+`keyring`; only the core provider service reads it. The desktop submits or replaces a credential
+through the authenticated local API, and the database stores only non-secret settings and usage
+records.
 
 The database and Corpi-managed research files stay under the user's OS-account and app-data
 boundary. Initial v1 does not add Corpi-managed encryption; copied database or file data is not
@@ -1080,12 +1092,12 @@ Choose and record each open implementation detail before building the component 
 | --- | --- | --- |
 | Local keyword/FTS and vector search | **Partially Decided** | M1.6 implements SQLite FTS5 and sqlite-vec with ready-source/model eligibility applied before top K. Meaning and Words are separate app modes; production fusion/Q&A remains later work. Search remains unmerged: recovery repairs pass local checks, but the repaired publication candidate still needs new-head platform CI before merge. PostgreSQL, `ts_rank_cd`, and pgvector are not selected v1 requirements. |
 | Local embeddings | **Partially Decided** | New notebooks use pinned Bekko A8M quint8 AVX2 for English/French/Arabic same-language search. Explicit saved choices remain unchanged; all-MiniLM-L6-v2 and multilingual E5 small stay selectable. New preparation saves its OpenBLAS choice and disables the arena only for new E5 work; missing fields and recorded old choices preserve legacy behavior, and mixed query groups load serially. The retained original near-capacity result passes the adopted twenty-minute recipe. Earlier candidate `4139df1` passed supported-model setup, offline inference, automatic readiness and native checks on Windows, macOS and Linux, but later review found recovery defects. Those repairs now pass 862 local core tests with 24 unchanged gated skips, 152 frontend tests, static checks and a current-source native viewer/search/page/restart/trash journey. Post-publication failures, activation restart with later model choices and contended setup terminal writes have discriminating regression coverage. The repaired commit still needs fresh hosted CI; earlier green runs do not verify it. Strict aggregate physical/shared/GPU/cache/no-swap proof remains unproved, not a milestone gate. Benchmark-combined quality is not either separate UI mode's measured success rate. Local-by-default processing is decided. |
-| Generation credentials | **Needs Decision** | Secure storage/decryption technology and which local component may retrieve/use credentials. |
+| Generation credentials | **Decided** | Use the OS-native keychain through Python `keyring`. Only the core provider service may read a generation credential; the desktop may submit or replace it but cannot read it back. No plaintext or encrypted-database fallback. |
 | Local file layout | **Partially Decided** | PDF original/staging paths, safe copy, integrity verification, and shared-original removal are set by M1.4. Layouts for other file types remain open. The research-data protection boundary is decided: OS-account/app-data protection without extra Corpi-managed encryption in initial v1. |
-| Generation and verification models | **Needs Decision** | Provider/model choice. A supported local-generation alternative remains optional; its implementation and support commitment are unresolved. |
+| Generation and verification models | **Decided for M2.1** | Initial provider: Google Gemini API on the free tier. Generation: `gemini-3.8-flash`; claim checking: `gemini-3.5-flash-lite`. The settings UI requires acknowledgement that free-tier prompts and responses may be used to improve Google's products. Automated checks use a fake provider; live provider acceptance remains pending. A local-generation alternative remains optional and unresolved. |
 | Fetch/browser | **Needs Decision** | Sandboxing and browser tools. |
 | Format tools | **Needs Decision** | Separate OCR engine, DOCX parser, HTML/boilerplate extractor, and YouTube transcript method/library. Native PDF text extraction is decided (pdfminer.six — see the decided choices); OCR stays with its milestone. |
-| Resource limits | **Partially Decided** | Non-PDF limits and remaining API timeout/retry/resource values. Limits, bounded retries, and PDF/OCR starting defaults are already required; step-class timeout/retry starting defaults were set with the background job runner (see the decided choices); PDF extraction limits were set with M1.5 (200-page extraction cap, provisional 600 s × 2 extraction policy). |
+| Resource limits | **Partially Decided** | Non-PDF limits and remaining API timeout/retry/resource values. Limits, bounded retries, and PDF/OCR starting defaults are already required; step-class timeout/retry starting defaults were set with the background job runner (see the decided choices); PDF extraction limits were set with M1.5 (200-page extraction cap, provisional 600 s × 2 extraction policy). M2.1 provider-call starting values: generation 180 s × 2 attempts, support check 90 s × 2, summary 90 s × 2, format repair 90 s × 1, citation retry 180 s × 1, settings test 30 s × 1; retry 429/503 only; never replay a timeout or disconnect after sending. |
 | Desktop delivery | **Needs Decision** | Packaging, distribution, and updates. |
 | Local backup/export/restore | **Needs Decision** | Backup/export/restore behavior and implementation. |
 | Overall artifact requirements | **Partially Decided** | Template and saved-output rules in [notes and artifacts](#notes-and-artifacts) are settled; the remaining details are listed below. |

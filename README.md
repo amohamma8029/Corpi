@@ -192,6 +192,24 @@ still apply. These measurements do not establish a hard production RAM cap or ev
 Setup allows one transfer at a time, up to three transfer attempts within a 600-second budget,
 a cumulative 1,000,000,000 received-byte ceiling, and a 30-second no-bytes deadline.
 
+### Generation provider setup
+
+M2.1 adds Google Gemini as the first generation provider. Open **Generation provider** in the
+notebook panel, accept the free-tier notice, and paste a Google AI Studio API key. The key is sent
+once to the local core and stored in the operating-system keychain (Windows Credential Locker,
+macOS Keychain, or Linux Secret Service); it is never written to the Corpi database or shown again.
+On Linux, the desktop session needs a running Secret Service provider such as GNOME Keyring or
+KWallet; a missing provider is reported as an actionable credential-store error.
+The free tier may use prompts and responses to improve Google's products, so use non-sensitive
+material until the provider policy is acceptable to you.
+
+The initial model pair is `gemini-3.8-flash` for generation and `gemini-3.5-flash-lite` for claim
+checks. Provider calls use the pinned Interactions API revision, `store: false`, the configured
+output allowance, and bounded timeouts. A 429 or 503 response, or a connection failure before the
+request is sent, may be retried within the recorded attempt cap; a timeout or disconnect after
+sending is recorded as an unknown outcome and is not replayed automatically. Automated checks use a fake provider; a live Gemini test remains acceptance
+evidence for the milestone.
+
 ### Search runtime upgrades and recovery
 
 FastEmbed 0.9.1 runs Corpi's existing embedding contract without changing saved model

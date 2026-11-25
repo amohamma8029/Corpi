@@ -56,7 +56,7 @@ def test_real_upgrade_keeps_old_records_and_restored_copy_opens_with_old_schema(
     upgraded.initialize()
     assert records(upgraded) == before and original.read_bytes() == original_bytes
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == len(migrations)
         assert connection.execute("SELECT count(*) FROM search_batch_executions").fetchone()[0] == 0
     database_bytes = upgraded.path.read_bytes()
     with pytest.raises(UnsupportedSchemaError):

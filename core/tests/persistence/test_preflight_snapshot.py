@@ -37,12 +37,14 @@ def test_preflight_keeps_one_snapshot_when_another_initializer_commits(tmp_path,
     assert observed == {
         "reader_before": 14,
         "has_read_transaction": True,
-        "published_revision": 15,
+        "published_revision": len(migrations.load_migrations()),
         "reader_after": 14,
     }
     assert records(upgraded) == before and original.read_bytes() == saved_original
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == len(
+            migrations.load_migrations()
+        )
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert not connection.execute("PRAGMA foreign_key_check").fetchall()
     copies = list(old.config.snapshot_dir.glob("snapshot-r*.sqlite3"))

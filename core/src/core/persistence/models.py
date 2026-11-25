@@ -106,6 +106,39 @@ class Source:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderSettings:
+    provider_id: str
+    settings_format_version: int
+    generation_model: str
+    checker_model: str
+    free_tier_acknowledged: bool
+    output_token_allowance: int
+    safety_margin_tokens: int
+    call_policies: dict[str, JSONValue]
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCallUsage:
+    id: str
+    request_id: str
+    call_type: str
+    provider_id: str
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    thought_tokens: int | None
+    cached_tokens: int | None
+    total_tokens: int | None
+    outcome: str
+    error_code: str | None
+    started_at: str
+    finished_at: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class ManagedFile:
     id: str
     relative_path: str

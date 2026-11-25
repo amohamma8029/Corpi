@@ -11,6 +11,11 @@ import {
   decideExtractionReview,
   getExtraction,
   getPdfAcquisition,
+  getProviderSettings,
+  listProviderModels,
+  saveProviderSettings,
+  clearProviderCredential,
+  testProvider,
   listNotebooks,
   listModels,
   getNotebookModel,
@@ -46,6 +51,11 @@ vi.mock("./api/client", async (loadActual) => {
     listNotebooks: vi.fn(),
     listModels: vi.fn(),
     getNotebookModel: vi.fn(),
+    getProviderSettings: vi.fn(),
+    listProviderModels: vi.fn(),
+    saveProviderSettings: vi.fn(),
+    testProvider: vi.fn(),
+    clearProviderCredential: vi.fn(),
     storageReport: vi.fn(),
     createNotebook: vi.fn(),
     listNotebookSources: vi.fn(),
@@ -86,6 +96,20 @@ const source = {
   id: "source-1", notebook_id: notebook.id, display_name: "Field report",
   created_at: notebook.created_at, updated_at: notebook.updated_at,
   current_import_id: "import-1", pending_import_id: null,
+};
+
+const providerSettings = {
+  provider_id: "google-gemini",
+  provider_label: "Google Gemini",
+  generation_model: "gemini-3.8-flash",
+  checker_model: "gemini-3.5-flash-lite",
+  free_tier_acknowledged: false,
+  output_token_allowance: 1024,
+  safety_margin_tokens: 512,
+  call_policies: {},
+  credential_configured: false,
+  generation_models: ["gemini-3.8-flash", "gemini-4-hydrogen"],
+  checker_models: ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
 };
 
 const emptyExtraction: ExtractionReport = {
@@ -142,6 +166,24 @@ beforeEach(() => {
   vi.mocked(coreHealthWithRetry).mockResolvedValue({ app: "corpi-core", version: "0.1.0", status: "ok" });
   vi.mocked(listNotebooks).mockResolvedValue([notebook]);
   vi.mocked(listModels).mockResolvedValue([]);
+  vi.mocked(getProviderSettings).mockResolvedValue(providerSettings);
+  vi.mocked(listProviderModels).mockResolvedValue({
+    generation_models: providerSettings.generation_models,
+    checker_models: providerSettings.checker_models,
+    discovered: true,
+    warning: null,
+  });
+  vi.mocked(saveProviderSettings).mockResolvedValue(providerSettings);
+  vi.mocked(clearProviderCredential).mockResolvedValue(providerSettings);
+  vi.mocked(testProvider).mockResolvedValue({
+    ok: true,
+    provider_id: "google-gemini",
+    model: "gemini-3.8-flash",
+    request_id: "request-1",
+    input_tokens: 4,
+    output_tokens: 1,
+    total_tokens: 5,
+  });
   vi.mocked(getNotebookModel).mockResolvedValue({
     notebook_id: notebook.id, active_profile_id: "minilm-en", pending_profile_id: null,
     generation: 0, ready_sources: 0, rebuilt_sources: 0, failed_sources: 0, cancelled_sources: 0,

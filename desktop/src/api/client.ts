@@ -39,6 +39,19 @@ export type NotebookModel = components["schemas"]["NotebookModelPayload"];
 export type NotebookSearchResult = components["schemas"]["SearchResult"];
 export type NotebookSearchResponse = components["schemas"]["SearchResponse"];
 export type NotebookSearchState = components["schemas"]["SearchState"];
+export type ProviderSettings = components["schemas"]["ProviderSettingsPayload"];
+export type ProviderModels = components["schemas"]["ProviderModelsPayload"];
+export type ProviderTestResult = components["schemas"]["ProviderTestPayload"];
+export type ProviderUsage = components["schemas"]["ProviderUsagePayload"];
+
+export interface ProviderSettingsInput {
+  generation_model: string;
+  checker_model: string;
+  free_tier_acknowledged: boolean;
+  output_token_allowance: number;
+  safety_margin_tokens: number;
+  api_key?: string;
+}
 
 export function getNotebookSearchState(
   connection: CoreConnection, notebookId: string, signal?: AbortSignal,
@@ -54,6 +67,37 @@ export function searchNotebook(
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, mode, limit: 10 }), signal,
   });
+}
+
+export function getProviderSettings(connection: CoreConnection): Promise<ProviderSettings> {
+  return coreRequest(connection, "/provider/settings");
+}
+
+export function listProviderModels(connection: CoreConnection): Promise<ProviderModels> {
+  return coreRequest(connection, "/provider/models");
+}
+
+export function saveProviderSettings(
+  connection: CoreConnection,
+  settings: ProviderSettingsInput,
+): Promise<ProviderSettings> {
+  return coreRequest(connection, "/provider/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
+export function testProvider(connection: CoreConnection): Promise<ProviderTestResult> {
+  return coreRequest(connection, "/provider/settings/test", { method: "POST" });
+}
+
+export function clearProviderCredential(connection: CoreConnection): Promise<ProviderSettings> {
+  return coreRequest(connection, "/provider/credential", { method: "DELETE" });
+}
+
+export function listProviderUsage(connection: CoreConnection, limit = 20): Promise<ProviderUsage[]> {
+  return coreRequest(connection, `/provider/usage?limit=${encodeURIComponent(String(limit))}`);
 }
 
 export function listModels(connection: CoreConnection): Promise<SupportedModel[]> {

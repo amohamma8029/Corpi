@@ -11,9 +11,11 @@ from core.api.jobs import router as jobs_router
 from core.api.models import router as models_router
 from core.api.notebooks import router as notebooks_router
 from core.api.pdfs import router as pdfs_router
+from core.api.providers import router as providers_router
 from core.api.routes import router
 from core.api.search import router as search_router
 from core.persistence.store import PersistenceStore
+from core.providers.service import ProviderService
 from core.search.query import QueryService
 
 
@@ -43,6 +45,7 @@ def create_app(
     sweeper: LifecycleService | None = None,
     model_setup: LifecycleService | None = None,
     notebook_models: object | None = None,
+    provider_service: ProviderService | None = None,
     search_queries: QueryService | None = None,
 ) -> FastAPI:
     """Build the core FastAPI app.
@@ -87,6 +90,7 @@ def create_app(
     app.state.runner = runner
     app.state.model_setup = model_setup
     app.state.notebook_models = notebook_models
+    app.state.provider_service = provider_service
     app.state.search_queries = search_queries or (
         QueryService(store, store.database.config.data_dir / "models") if store else None
     )
@@ -99,5 +103,6 @@ def create_app(
     app.include_router(pdfs_router)
     app.include_router(extraction_router)
     app.include_router(models_router)
+    app.include_router(providers_router)
     app.include_router(search_router)
     return app

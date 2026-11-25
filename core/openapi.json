@@ -1302,6 +1302,160 @@
         }
       }
     },
+    "/provider/settings": {
+      "get": {
+        "summary": "Get Provider Settings",
+        "operationId": "get_provider_settings_provider_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderSettingsPayload"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Save Provider Settings",
+        "operationId": "save_provider_settings_provider_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderSettingsUpdatePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderSettingsPayload"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider/models": {
+      "get": {
+        "summary": "Get Provider Models",
+        "operationId": "get_provider_models_provider_models_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderModelsPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider/settings/test": {
+      "post": {
+        "summary": "Test Provider",
+        "operationId": "test_provider_provider_settings_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderTestPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider/credential": {
+      "delete": {
+        "summary": "Clear Provider Credential",
+        "operationId": "clear_provider_credential_provider_credential_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderSettingsPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/provider/usage": {
+      "get": {
+        "summary": "List Provider Usage",
+        "operationId": "list_provider_usage_provider_usage_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderUsagePayload"
+                  },
+                  "title": "Response List Provider Usage Provider Usage Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/notebooks/{notebook_id}/search-state": {
       "get": {
         "summary": "Search State",
@@ -2316,6 +2470,361 @@
           "status"
         ],
         "title": "ProcessingActionPayload"
+      },
+      "ProviderModelsPayload": {
+        "properties": {
+          "generation_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Generation Models"
+          },
+          "checker_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Checker Models"
+          },
+          "discovered": {
+            "type": "boolean",
+            "title": "Discovered"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "type": "object",
+        "required": [
+          "generation_models",
+          "checker_models",
+          "discovered",
+          "warning"
+        ],
+        "title": "ProviderModelsPayload"
+      },
+      "ProviderSettingsPayload": {
+        "properties": {
+          "provider_id": {
+            "type": "string",
+            "title": "Provider Id"
+          },
+          "provider_label": {
+            "type": "string",
+            "title": "Provider Label"
+          },
+          "generation_model": {
+            "type": "string",
+            "title": "Generation Model"
+          },
+          "checker_model": {
+            "type": "string",
+            "title": "Checker Model"
+          },
+          "free_tier_acknowledged": {
+            "type": "boolean",
+            "title": "Free Tier Acknowledged"
+          },
+          "output_token_allowance": {
+            "type": "integer",
+            "title": "Output Token Allowance"
+          },
+          "safety_margin_tokens": {
+            "type": "integer",
+            "title": "Safety Margin Tokens"
+          },
+          "call_policies": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Call Policies"
+          },
+          "credential_configured": {
+            "type": "boolean",
+            "title": "Credential Configured"
+          },
+          "generation_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Generation Models"
+          },
+          "checker_models": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Checker Models"
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider_id",
+          "provider_label",
+          "generation_model",
+          "checker_model",
+          "free_tier_acknowledged",
+          "output_token_allowance",
+          "safety_margin_tokens",
+          "call_policies",
+          "credential_configured",
+          "generation_models",
+          "checker_models"
+        ],
+        "title": "ProviderSettingsPayload"
+      },
+      "ProviderSettingsUpdatePayload": {
+        "properties": {
+          "generation_model": {
+            "type": "string",
+            "title": "Generation Model"
+          },
+          "checker_model": {
+            "type": "string",
+            "title": "Checker Model"
+          },
+          "free_tier_acknowledged": {
+            "type": "boolean",
+            "title": "Free Tier Acknowledged"
+          },
+          "output_token_allowance": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 1.0,
+            "title": "Output Token Allowance",
+            "default": 1024
+          },
+          "safety_margin_tokens": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Safety Margin Tokens",
+            "default": 512
+          },
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "generation_model",
+          "checker_model",
+          "free_tier_acknowledged"
+        ],
+        "title": "ProviderSettingsUpdatePayload"
+      },
+      "ProviderTestPayload": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok"
+          },
+          "provider_id": {
+            "type": "string",
+            "title": "Provider Id"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Tokens"
+          }
+        },
+        "type": "object",
+        "required": [
+          "ok",
+          "provider_id",
+          "model",
+          "request_id",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "title": "ProviderTestPayload"
+      },
+      "ProviderUsagePayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "call_type": {
+            "type": "string",
+            "title": "Call Type"
+          },
+          "provider_id": {
+            "type": "string",
+            "title": "Provider Id"
+          },
+          "model": {
+            "type": "string",
+            "title": "Model"
+          },
+          "input_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Input Tokens"
+          },
+          "output_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Tokens"
+          },
+          "thought_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thought Tokens"
+          },
+          "cached_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached Tokens"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Tokens"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "started_at": {
+            "type": "string",
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "request_id",
+          "call_type",
+          "provider_id",
+          "model",
+          "input_tokens",
+          "output_tokens",
+          "thought_tokens",
+          "cached_tokens",
+          "total_tokens",
+          "outcome",
+          "error_code",
+          "started_at",
+          "finished_at",
+          "created_at"
+        ],
+        "title": "ProviderUsagePayload"
       },
       "ResumePreparation": {
         "properties": {

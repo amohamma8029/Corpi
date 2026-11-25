@@ -50,7 +50,7 @@ def test_application_id_and_schema_fingerprint_are_stable(database: Database) ->
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x434F5250
         assert CORPI_APPLICATION_ID == 0x434F5250
         assert schema_fingerprint(connection) == (
-            "d05470bf0e809e09e954569b5917ef7a2d673597fb1da614f7e761109d549cb6"
+            "8ba078fd77cecf0b4795f8057325b89e455ff623ec8557f7928bb115d21fbca5"
         )
 
 

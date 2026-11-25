@@ -506,6 +506,92 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/provider/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Provider Settings */
+        get: operations["get_provider_settings_provider_settings_get"];
+        /** Save Provider Settings */
+        put: operations["save_provider_settings_provider_settings_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Provider Models */
+        get: operations["get_provider_models_provider_models_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/settings/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test Provider */
+        post: operations["test_provider_provider_settings_test_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/credential": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Clear Provider Credential */
+        delete: operations["clear_provider_credential_provider_credential_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Provider Usage */
+        get: operations["list_provider_usage_provider_usage_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/notebooks/{notebook_id}/search-state": {
         parameters: {
             query?: never;
@@ -832,6 +918,115 @@ export interface components {
             job_id: string | null;
             /** Status */
             status: string;
+        };
+        /** ProviderModelsPayload */
+        ProviderModelsPayload: {
+            /** Generation Models */
+            generation_models: string[];
+            /** Checker Models */
+            checker_models: string[];
+            /** Discovered */
+            discovered: boolean;
+            /** Warning */
+            warning: string | null;
+        };
+        /** ProviderSettingsPayload */
+        ProviderSettingsPayload: {
+            /** Provider Id */
+            provider_id: string;
+            /** Provider Label */
+            provider_label: string;
+            /** Generation Model */
+            generation_model: string;
+            /** Checker Model */
+            checker_model: string;
+            /** Free Tier Acknowledged */
+            free_tier_acknowledged: boolean;
+            /** Output Token Allowance */
+            output_token_allowance: number;
+            /** Safety Margin Tokens */
+            safety_margin_tokens: number;
+            /** Call Policies */
+            call_policies: {
+                [key: string]: unknown;
+            };
+            /** Credential Configured */
+            credential_configured: boolean;
+            /** Generation Models */
+            generation_models: string[];
+            /** Checker Models */
+            checker_models: string[];
+        };
+        /** ProviderSettingsUpdatePayload */
+        ProviderSettingsUpdatePayload: {
+            /** Generation Model */
+            generation_model: string;
+            /** Checker Model */
+            checker_model: string;
+            /** Free Tier Acknowledged */
+            free_tier_acknowledged: boolean;
+            /**
+             * Output Token Allowance
+             * @default 1024
+             */
+            output_token_allowance: number;
+            /**
+             * Safety Margin Tokens
+             * @default 512
+             */
+            safety_margin_tokens: number;
+            /** Api Key */
+            api_key?: string | null;
+        };
+        /** ProviderTestPayload */
+        ProviderTestPayload: {
+            /** Ok */
+            ok: boolean;
+            /** Provider Id */
+            provider_id: string;
+            /** Model */
+            model: string;
+            /** Request Id */
+            request_id: string;
+            /** Input Tokens */
+            input_tokens: number | null;
+            /** Output Tokens */
+            output_tokens: number | null;
+            /** Total Tokens */
+            total_tokens: number | null;
+        };
+        /** ProviderUsagePayload */
+        ProviderUsagePayload: {
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Call Type */
+            call_type: string;
+            /** Provider Id */
+            provider_id: string;
+            /** Model */
+            model: string;
+            /** Input Tokens */
+            input_tokens: number | null;
+            /** Output Tokens */
+            output_tokens: number | null;
+            /** Thought Tokens */
+            thought_tokens: number | null;
+            /** Cached Tokens */
+            cached_tokens: number | null;
+            /** Total Tokens */
+            total_tokens: number | null;
+            /** Outcome */
+            outcome: string;
+            /** Error Code */
+            error_code: string | null;
+            /** Started At */
+            started_at: string;
+            /** Finished At */
+            finished_at: string | null;
+            /** Created At */
+            created_at: string;
         };
         /** ResumePreparation */
         ResumePreparation: {
@@ -1997,6 +2192,150 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ModelSetupPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_provider_settings_provider_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderSettingsPayload"];
+                };
+            };
+        };
+    };
+    save_provider_settings_provider_settings_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderSettingsUpdatePayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderSettingsPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_provider_models_provider_models_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderModelsPayload"];
+                };
+            };
+        };
+    };
+    test_provider_provider_settings_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderTestPayload"];
+                };
+            };
+        };
+    };
+    clear_provider_credential_provider_credential_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderSettingsPayload"];
+                };
+            };
+        };
+    };
+    list_provider_usage_provider_usage_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderUsagePayload"][];
                 };
             };
             /** @description Validation Error */
