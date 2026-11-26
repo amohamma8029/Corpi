@@ -74,6 +74,100 @@ def test_generate_uses_interactions_contract_and_parses_usage() -> None:
     assert (result.cached_tokens, result.total_tokens) == (8, 162)
 
 
+def test_current_model_output_ignores_input_and_earlier_output() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "interaction-current",
+                "status": "completed",
+                "output_text": "leaked input or earlier output",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "thought",
+                        "content": [{"type": "text", "text": "internal thought"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": '{"answer":"current"}'}],
+                    },
+                ],
+            },
+        )
+
+    result = call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert result.output_text == '{"answer":"current"}'
+
+
+def test_multiple_current_model_output_steps_join_in_order() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "interaction-multiple",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "first "}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "second"}],
+                    },
+                ],
+            },
+        )
+
+    result = call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert result.output_text == "first second"
+
+
+def test_response_without_current_model_text_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "no-current-answer",
+                "status": "completed",
+                "output_text": "leaked input or earlier output",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "thought",
+                        "content": [{"type": "text", "text": "internal thought"}],
+                    },
+                ],
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
 def test_generate_retries_429_and_503_then_succeeds() -> None:
     calls = 0
 
@@ -515,6 +609,63 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
         assert "total time limit" in str(failure.value)
 
     asyncio.run(main())
+
+
+def test_slow_client_close_is_bounded_and_preserves_result() -> None:
+    class SlowCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "slow-close", "output_text": "answer"})
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(3)
+
+    started = time.monotonic()
+    result = call(
+        GeminiClient("secret-key", transport=SlowCloseTransport()),
+        timeout_seconds=5,
+        attempts=1,
+        deadline_seconds=0.5,
+    )
+
+    assert result.output_text == "answer"
+    assert time.monotonic() - started < 1.0
+
+
+def test_cancelled_client_close_preserves_known_result() -> None:
+    class CancelCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "known", "output_text": "answer"})
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    result = call(
+        GeminiClient("secret-key", transport=CancelCloseTransport()),
+        timeout_seconds=5,
+        attempts=1,
+        deadline_seconds=2,
+    )
+
+    assert result.output_text == "answer"
+
+
+def test_cancelled_client_close_after_no_reply_is_possibly_processed() -> None:
+    class CancelRequestAndCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise asyncio.CancelledError
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(ProviderCancelled) as failure:
+        call(
+            GeminiClient("secret-key", transport=CancelRequestAndCloseTransport()),
+            timeout_seconds=5,
+            attempts=1,
+            deadline_seconds=2,
+        )
+
+    assert failure.value.possibly_processed is True
 
 
 def test_model_discovery_deadline_covers_pagination() -> None:
