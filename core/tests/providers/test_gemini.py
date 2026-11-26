@@ -454,7 +454,13 @@ def test_total_deadline_cancels_a_slow_response() -> None:
 def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
     monkeypatch.setenv("NO_PROXY", "*")
     monkeypatch.setenv("no_proxy", "*")
-    body = b'{"id":"trickle","output_text":"late","usage":{}}'
+    body = json.dumps(
+        {
+            "id": "trickle",
+            "output_text": "late" * 80,
+            "usage": {},
+        }
+    ).encode()
 
     async def main() -> None:
         async def serve(
@@ -472,7 +478,7 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
                 for index in range(0, len(body), 10):
                     writer.write(body[index : index + 10])
                     await writer.drain()
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.1)
             except (ConnectionError, asyncio.IncompleteReadError):
                 pass
             finally:
@@ -498,14 +504,14 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
                     max_output_tokens=10,
                     timeout_seconds=5,
                     attempts=1,
-                    deadline_seconds=0.1,
+                    deadline_seconds=1.0,
                     request_id="local-request",
                 )
         finally:
             server.close()
             await server.wait_closed()
 
-        assert time.monotonic() - started < 0.6
+        assert time.monotonic() - started < 2.0
         assert "total time limit" in str(failure.value)
 
     asyncio.run(main())
