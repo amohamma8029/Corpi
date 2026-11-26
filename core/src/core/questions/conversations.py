@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from core.persistence.errors import ConflictingWriteError
 from core.persistence.models import new_id, utc_timestamp, validate_id
 from core.persistence.store import PersistenceStore
-from core.questions.selection import ReadyQuestionPdf, SelectedPdf, resolve_question_selection
+from core.questions.selection import (
+    QuestionSelectionError,
+    ReadyQuestionPdf,
+    SelectedPdf,
+    resolve_question_selection,
+)
 
 
 class ConversationUnavailable(LookupError):
@@ -171,7 +176,7 @@ class ConversationStore:
         """Save the question, history boundary and exact versions before returning."""
         _validate_conversation_ids(notebook_id, conversation_id)
         validate_id(submission_id)
-        validate_id(owner_instance_id)
+        _validate_attempt_owner(owner_instance_id)
         if not text.strip():
             raise ValueError("question text must not be empty")
         selected = tuple(selected)
@@ -211,9 +216,10 @@ class ConversationStore:
             row = connection.execute(
                 """INSERT INTO qa_attempts(
                        id,conversation_id,notebook_id,question_message_id,submission_id,
-                       submission_sha256,owner_instance_id,history_through_ordinal,status,
+                       submission_sha256,owner_instance_id,history_through_ordinal,
+                       selected_source_count,status,
                        created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,'accepted',?,?) RETURNING *""",
+                   ) VALUES(?,?,?,?,?,?,?,?,?,'accepted',?,?) RETURNING *""",
                 (
                     attempt_id,
                     conversation_id,
@@ -223,6 +229,7 @@ class ConversationStore:
                     fingerprint,
                     owner_instance_id,
                     history_end,
+                    len(exact),
                     now,
                     now,
                 ),
@@ -240,33 +247,68 @@ class ConversationStore:
         _validate_conversation_ids(notebook_id, conversation_id)
         validate_id(attempt_id)
         with self._persistence._transaction(write=False) as connection:
-            row = connection.execute(
-                "SELECT * FROM qa_attempts WHERE notebook_id=? AND conversation_id=? AND id=?",
-                (notebook_id, conversation_id, attempt_id),
-            ).fetchone()
-            if row is None:
-                raise ConversationUnavailable()
-            sources = connection.execute(
-                "SELECT * FROM qa_attempt_sources WHERE attempt_id=? ORDER BY ordinal",
-                (attempt_id,),
+            row = _require_attempt(connection, notebook_id, conversation_id, attempt_id)
+            return _attempt(row), _attempt_sources(connection, attempt_id)
+
+    def begin_attempt(
+        self,
+        notebook_id: str,
+        conversation_id: str,
+        attempt_id: str,
+        *,
+        owner_instance_id: str,
+    ) -> bool:
+        """Give the accepting owner permission to start this attempt at most once."""
+        _validate_conversation_ids(notebook_id, conversation_id)
+        validate_id(attempt_id)
+        _validate_attempt_owner(owner_instance_id)
+        with self._persistence._transaction() as connection:
+            row = _require_attempt(connection, notebook_id, conversation_id, attempt_id)
+            if row["status"] != "accepted" or row["owner_instance_id"] != owner_instance_id:
+                return False
+            saved = _attempt_sources(connection, attempt_id)
+            if len(saved) != row["selected_source_count"] or not _selection_is_current(
+                connection, notebook_id, saved
+            ):
+                _set_attempt_status(connection, attempt_id, "interrupted", "source_changed")
+                return False
+            _set_attempt_status(connection, attempt_id, "running", None)
+            return True
+
+    def stop_attempt(
+        self, notebook_id: str, conversation_id: str, attempt_id: str
+    ) -> QuestionAttempt:
+        """Stop this question, or report the outcome if it already finished."""
+        _validate_conversation_ids(notebook_id, conversation_id)
+        validate_id(attempt_id)
+        with self._persistence._transaction() as connection:
+            row = _require_attempt(connection, notebook_id, conversation_id, attempt_id)
+            if row["status"] in ("accepted", "running"):
+                row = _set_attempt_status(connection, attempt_id, "stopped", "user_stopped")
+            return _attempt(row)
+
+    def interrupt_abandoned_attempts(self, current_owner_instance_id: str) -> int:
+        """Interrupt prior work at startup, with exclusive ownership of the library."""
+        _validate_attempt_owner(current_owner_instance_id)
+        with self._persistence._transaction() as connection:
+            result = connection.execute(
+                """UPDATE qa_attempts
+                   SET status='interrupted',reason_code='core_restarted',updated_at=?
+                   WHERE status IN ('accepted','running') AND owner_instance_id<>?""",
+                (utc_timestamp(), current_owner_instance_id),
             )
-            return _attempt(row), tuple(
-                ReadyQuestionPdf(
-                    source["source_id"],
-                    source["source_version_id"],
-                    source["import_id"],
-                    source["extraction_version_id"],
-                    source["review_generation"],
-                    source["manifest_id"],
-                    tuple(json.loads(source["index_version_ids_json"])),
-                )
-                for source in sources
-            )
+            return result.rowcount
 
 
 def _validate_conversation_ids(notebook_id: str, conversation_id: str) -> None:
     validate_id(notebook_id)
     validate_id(conversation_id)
+
+
+def _validate_attempt_owner(owner_instance_id: str) -> None:
+    # The application passes its "core-<uuid>" instance identity, not a row ID.
+    if not owner_instance_id.strip():
+        raise ValueError("question owner instance must not be empty")
 
 
 def _require_notebook(connection: sqlite3.Connection, notebook_id: str) -> None:
@@ -284,6 +326,59 @@ def _require_conversation(
     if row is None:
         raise ConversationUnavailable()
     return row
+
+
+def _require_attempt(
+    connection: sqlite3.Connection, notebook_id: str, conversation_id: str, attempt_id: str
+) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM qa_attempts WHERE notebook_id=? AND conversation_id=? AND id=?",
+        (notebook_id, conversation_id, attempt_id),
+    ).fetchone()
+    if row is None:
+        raise ConversationUnavailable()
+    return row
+
+
+def _attempt_sources(
+    connection: sqlite3.Connection, attempt_id: str
+) -> tuple[ReadyQuestionPdf, ...]:
+    rows = connection.execute(
+        "SELECT * FROM qa_attempt_sources WHERE attempt_id=? ORDER BY ordinal", (attempt_id,)
+    )
+    return tuple(
+        ReadyQuestionPdf(
+            row["source_id"],
+            row["source_version_id"],
+            row["import_id"],
+            row["extraction_version_id"],
+            row["review_generation"],
+            row["manifest_id"],
+            tuple(json.loads(row["index_version_ids_json"])),
+        )
+        for row in rows
+    )
+
+
+def _selection_is_current(
+    connection: sqlite3.Connection, notebook_id: str, saved: Sequence[ReadyQuestionPdf]
+) -> bool:
+    selected = tuple(SelectedPdf(pdf.source_id, pdf.source_version_id) for pdf in saved)
+    try:
+        return resolve_question_selection(connection, notebook_id, selected) == tuple(saved)
+    except QuestionSelectionError:
+        return False
+
+
+def _set_attempt_status(
+    connection: sqlite3.Connection, attempt_id: str, status: str, reason: str | None
+) -> sqlite3.Row:
+    # The caller owns the write transaction and has checked the previous status.
+    return connection.execute(
+        """UPDATE qa_attempts SET status=?,reason_code=?,updated_at=?
+           WHERE id=? RETURNING *""",
+        (status, reason, utc_timestamp(), attempt_id),
+    ).fetchone()
 
 
 def _picker_ids(connection: sqlite3.Connection, conversation_id: str) -> tuple[str, ...]:

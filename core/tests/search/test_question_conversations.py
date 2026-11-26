@@ -90,7 +90,7 @@ def test_two_conversations_reopen_with_distinct_pickers_and_ordered_questions(st
     one, first_pdf = new_conversation_with_selection(questions, notebook, first.item, "First")
     two, second_pdf = new_conversation_with_selection(questions, notebook, second.item, "Second")
 
-    owner = new_id()
+    owner = f"core-{new_id()}"
     submissions = []
     for conversation, selected, text in (
         (one, first_pdf, "  First question, verbatim.  "),
@@ -231,9 +231,100 @@ def test_stale_selection_cannot_partially_accept_and_selected_only_does_not_pin_
     store.trash_pdf_import(old.item.id, "2000-01-01T00:00:00.000000Z")
     PdfIngestService(store, "question-selection-expiry").purge_expired_pdf_history()
     assert not old.original.exists()
+    assert not questions.begin_attempt(
+        notebook, conversation.id, attempt.id, owner_instance_id=attempt.owner_instance_id
+    )
     saved, sources = questions.load_attempt(notebook, conversation.id, attempt.id)
     assert saved.id == attempt.id and sources == ()
+    assert (saved.status, saved.reason_code) == ("interrupted", "source_changed")
     assert not submit(first, sub).created
     assert len(questions.open_conversation(notebook, conversation.id).messages) == 2
     with store.database.connect() as connection:
         assert not connection.execute("PRAGMA foreign_key_check").fetchall()
+
+
+def test_stop_prevents_start_and_picker_changes_do_not_stop_an_accepted_question(store, original):
+    notebook, _, pdf = original
+    questions = ConversationStore(store)
+    conversation, selected = new_conversation_with_selection(questions, notebook, pdf.item, "Work")
+    other = questions.create_conversation(notebook, "Other thread")
+    owner = f"core-{new_id()}"
+
+    def accept():
+        return questions.submit_question(
+            notebook,
+            conversation.id,
+            submission_id=new_id(),
+            owner_instance_id=owner,
+            text="What do the sources say?",
+            picker_revision=conversation.picker_revision,
+            selected=[selected],
+        ).attempt
+
+    stop_first, start_first = accept(), accept()
+    with pytest.raises(ConversationUnavailable):
+        questions.stop_attempt(notebook, other.id, stop_first.id)
+    stopped = questions.stop_attempt(notebook, conversation.id, stop_first.id)
+    assert (stopped.status, stopped.reason_code) == ("stopped", "user_stopped")
+    assert questions.stop_attempt(notebook, conversation.id, stop_first.id) == stopped
+    assert not questions.begin_attempt(
+        notebook, conversation.id, stop_first.id, owner_instance_id=owner
+    )
+
+    questions.update_picker(
+        notebook, conversation.id, expected_revision=conversation.picker_revision, source_ids=[]
+    )
+    assert not questions.begin_attempt(
+        notebook, conversation.id, start_first.id, owner_instance_id=new_id()
+    )
+    assert questions.begin_attempt(
+        notebook, conversation.id, start_first.id, owner_instance_id=owner
+    )
+    assert not questions.begin_attempt(
+        notebook, conversation.id, start_first.id, owner_instance_id=owner
+    )
+    assert questions.stop_attempt(notebook, conversation.id, start_first.id).status == "stopped"
+
+
+def test_restart_interrupts_accepted_and_running_attempts_without_replaying(store, original):
+    notebook, _, pdf = original
+    questions = ConversationStore(store)
+    conversation, selected = new_conversation_with_selection(questions, notebook, pdf.item, "Work")
+    previous_owner = f"core-{new_id()}"
+
+    def submit(submission_id, owner):
+        return questions.submit_question(
+            notebook,
+            conversation.id,
+            submission_id=submission_id,
+            owner_instance_id=owner,
+            text="What do the sources say?",
+            picker_revision=conversation.picker_revision,
+            selected=[selected],
+        )
+
+    first_id, second_id = new_id(), new_id()
+    accepted = submit(first_id, previous_owner).attempt
+    started = submit(second_id, previous_owner).attempt
+    assert questions.begin_attempt(
+        notebook, conversation.id, started.id, owner_instance_id=previous_owner
+    )
+    replacement_owner = f"core-{new_id()}"
+    database = candidate_database(store.database.config)
+    database.initialize()
+    questions = ConversationStore(PersistenceStore(database))
+    assert questions.interrupt_abandoned_attempts(replacement_owner) == 2
+    assert questions.interrupt_abandoned_attempts(replacement_owner) == 0
+    for submission_id, original_attempt in ((first_id, accepted), (second_id, started)):
+        replay = submit(submission_id, replacement_owner)
+        assert not replay.created and replay.attempt.id == original_attempt.id
+        assert (replay.attempt.status, replay.attempt.reason_code) == (
+            "interrupted",
+            "core_restarted",
+        )
+        assert questions.stop_attempt(notebook, conversation.id, original_attempt.id) == (
+            replay.attempt
+        )
+        assert not questions.begin_attempt(
+            notebook, conversation.id, original_attempt.id, owner_instance_id=previous_owner
+        )

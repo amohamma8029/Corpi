@@ -54,8 +54,9 @@ CREATE TABLE qa_attempts (
     submission_sha256 TEXT NOT NULL CHECK(
         length(submission_sha256)=64 AND submission_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
-    owner_instance_id TEXT NOT NULL,
+    owner_instance_id TEXT NOT NULL CHECK(length(trim(owner_instance_id)) > 0),
     history_through_ordinal INTEGER NOT NULL CHECK(history_through_ordinal >= 0),
+    selected_source_count INTEGER NOT NULL CHECK(selected_source_count > 0),
     status TEXT NOT NULL CHECK(status IN (
         'accepted','running','completed','failed','stopped','interrupted'
     )),
