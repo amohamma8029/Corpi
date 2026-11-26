@@ -39,12 +39,36 @@ DEFAULT_OUTPUT_TOKENS = 1024
 DEFAULT_SAFETY_MARGIN = 512
 SETTINGS_TEST_OUTPUT_TOKENS = 256
 DEFAULT_POLICIES: dict[str, JSONValue] = {
-    "generation": {"timeout_seconds": 180, "attempts": 2},
-    "support_check": {"timeout_seconds": 90, "attempts": 2},
-    "summary": {"timeout_seconds": 90, "attempts": 2},
-    "format_repair": {"timeout_seconds": 90, "attempts": 1},
-    "citation_retry": {"timeout_seconds": 180, "attempts": 1},
-    "settings_test": {"timeout_seconds": 30, "attempts": 1},
+    "generation": {
+        "timeout_seconds": 180,
+        "attempts": 2,
+        "total_timeout_seconds": 390,
+    },
+    "support_check": {
+        "timeout_seconds": 90,
+        "attempts": 2,
+        "total_timeout_seconds": 210,
+    },
+    "summary": {
+        "timeout_seconds": 90,
+        "attempts": 2,
+        "total_timeout_seconds": 210,
+    },
+    "format_repair": {
+        "timeout_seconds": 90,
+        "attempts": 1,
+        "total_timeout_seconds": 90,
+    },
+    "citation_retry": {
+        "timeout_seconds": 180,
+        "attempts": 1,
+        "total_timeout_seconds": 180,
+    },
+    "settings_test": {
+        "timeout_seconds": 30,
+        "attempts": 1,
+        "total_timeout_seconds": 30,
+    },
 }
 CALL_TYPES = frozenset(DEFAULT_POLICIES)
 
@@ -71,6 +95,9 @@ class ProviderService:
         self._store = store
         self._credentials = credentials
         self._client_factory = client_factory
+        # A previous process may have stopped after recording a call but before
+        # finalizing it. It is never safe to replay those calls automatically.
+        self._store.recover_pending_model_calls()
 
     def usage(self, limit: int = 20) -> tuple[ModelCallUsage, ...]:
         return self._store.list_model_call_usage(limit)
@@ -78,8 +105,8 @@ class ProviderService:
     async def available_models(self) -> dict[str, Any]:
         settings = self._load_or_default()
         fallback = {
-            "generation_models": list(GENERATION_MODELS),
-            "checker_models": list(CHECKER_MODELS),
+            "generation_models": list(self._catalog(settings)),
+            "checker_models": list(self._catalog(settings)),
             "discovered": False,
             "warning": None,
         }
@@ -88,23 +115,29 @@ class ProviderService:
             return fallback
         client = self._client_factory(api_key)
         try:
-            discovered = await client.list_models(timeout_seconds=30, attempts=1)
+            discovered = await client.list_models(
+                timeout_seconds=30,
+                attempts=1,
+                deadline_seconds=30,
+            )
         except (ProviderFailure, PaidCallOutcomeUnknown) as error:
             fallback["warning"] = str(error)
             return fallback
         if not discovered:
             fallback["warning"] = "The provider returned no text-generation models."
             return fallback
-        models = sorted(set(discovered) | {settings.generation_model, settings.checker_model})
+        self._store.replace_provider_model_catalog(PROVIDER_ID, discovered)
+        catalog = list(self._catalog(settings))
         return {
-            "generation_models": models,
-            "checker_models": models,
+            "generation_models": catalog,
+            "checker_models": catalog,
             "discovered": True,
             "warning": None,
         }
 
     def state(self) -> dict[str, Any]:
         settings = self._load_or_default()
+        catalog = list(self._catalog(settings))
         return {
             "provider_id": settings.provider_id,
             "provider_label": PROVIDER_LABEL,
@@ -115,8 +148,8 @@ class ProviderService:
             "safety_margin_tokens": settings.safety_margin_tokens,
             "call_policies": settings.call_policies,
             "credential_configured": self._credential() is not None,
-            "generation_models": list(GENERATION_MODELS),
-            "checker_models": list(CHECKER_MODELS),
+            "generation_models": catalog,
+            "checker_models": catalog,
         }
 
     def save(
@@ -131,13 +164,16 @@ class ProviderService:
                 "Confirm the provider's free-tier data-use notice before saving settings.",
                 status=400,
             )
-        if update.generation_model not in GENERATION_MODELS:
+        existing = self._store.load_provider_settings(PROVIDER_ID)
+        current = existing if existing is not None else self._load_or_default()
+        catalog = self._catalog(current)
+        if update.generation_model not in catalog:
             raise ProviderFailure(
                 "unsupported_model",
                 "Choose a supported generation model.",
                 status=400,
             )
-        if update.checker_model not in CHECKER_MODELS:
+        if update.checker_model not in catalog:
             raise ProviderFailure(
                 "unsupported_model",
                 "Choose a supported claim-checker model.",
@@ -155,7 +191,6 @@ class ProviderService:
                 "Safety margin is outside the supported range.",
                 status=400,
             )
-        existing = self._store.load_provider_settings(PROVIDER_ID)
         timestamp = utc_timestamp()
         if api_key is not None:
             cleaned = api_key.strip()
@@ -198,7 +233,8 @@ class ProviderService:
             "ok": True,
             "provider_id": PROVIDER_ID,
             "model": self._model_for("settings_test"),
-            "request_id": result.request_id,
+            "request_id": result.local_request_id,
+            "provider_request_id": result.provider_request_id,
             "input_tokens": result.input_tokens,
             "output_tokens": result.output_tokens,
             "total_tokens": result.total_tokens,
@@ -212,6 +248,7 @@ class ProviderService:
         input_text: str,
         schema: JSONSchema | None = None,
         max_output_tokens: int | None = None,
+        parent_request_id: str | None = None,
     ) -> ProviderCallResult:
         if call_type not in CALL_TYPES:
             raise ValueError("unsupported model call type")
@@ -229,11 +266,37 @@ class ProviderService:
                 "Configure a provider API key first.",
                 status=409,
             )
+        if parent_request_id is not None:
+            parent_request_id = parent_request_id.strip()
+            if not parent_request_id or len(parent_request_id) > 200:
+                raise ValueError("parent request id is invalid")
         model = self._model_for(call_type)
-        policy = self._policy(settings, call_type)
+        timeout_seconds, attempts, deadline_seconds = self._policy(settings, call_type)
         output_limit = max_output_tokens or self._default_output(call_type, settings)
         request_id = new_id()
+        usage_id = new_id()
         started_at = utc_timestamp()
+        self._store.record_model_call_usage(
+            ModelCallUsage(
+                id=usage_id,
+                request_id=request_id,
+                provider_request_id=None,
+                parent_request_id=parent_request_id,
+                call_type=call_type,
+                provider_id=PROVIDER_ID,
+                model=model,
+                input_tokens=None,
+                output_tokens=None,
+                thought_tokens=None,
+                cached_tokens=None,
+                total_tokens=None,
+                outcome="pending",
+                error_code=None,
+                started_at=started_at,
+                finished_at=None,
+                created_at=started_at,
+            )
+        )
         client = self._client_factory(api_key)
         try:
             result = await client.generate(
@@ -242,47 +305,45 @@ class ProviderService:
                 input_text=input_text,
                 schema=schema,
                 max_output_tokens=output_limit,
-                timeout_seconds=policy[0],
-                attempts=policy[1],
+                timeout_seconds=timeout_seconds,
+                attempts=attempts,
+                deadline_seconds=deadline_seconds,
                 request_id=request_id,
             )
         except ProviderCancelled as error:
-            self._record_usage(
-                request_id,
-                call_type,
-                model,
-                started_at,
-                outcome="cancelled",
+            self._finalize_usage(
+                usage_id,
+                outcome="unknown" if error.possibly_processed else "cancelled",
                 error_code=error.code,
             )
             raise
         except PaidCallOutcomeUnknown:
-            self._record_usage(
-                request_id,
-                call_type,
-                model,
-                started_at,
+            self._finalize_usage(
+                usage_id,
                 outcome="unknown",
                 error_code="paid_outcome_unknown",
             )
             raise
         except ProviderFailure as error:
-            self._record_usage(
-                request_id,
-                call_type,
-                model,
-                started_at,
+            self._finalize_usage(
+                usage_id,
                 outcome="failed",
                 error_code=error.code,
+                details=error,
             )
             raise
-        self._record_usage(
-            request_id,
-            call_type,
-            model,
-            started_at,
-            result=result,
+        except Exception:
+            self._finalize_usage(
+                usage_id,
+                outcome="unknown",
+                error_code="call_interrupted",
+            )
+            raise
+        self._finalize_usage(
+            usage_id,
             outcome="completed",
+            error_code=None,
+            details=result,
         )
         return result
 
@@ -307,14 +368,15 @@ class ProviderService:
                 "Configure a provider API key first.",
                 status=409,
             )
-        policy = self._policy(settings, "settings_test")
+        timeout_seconds, _, deadline_seconds = self._policy(settings, "settings_test")
         client = self._client_factory(api_key)
         count = await client.count_tokens(
             model=model or settings.generation_model,
             instructions=instructions,
             input_text=input_text,
-            timeout_seconds=policy[0],
+            timeout_seconds=timeout_seconds,
             attempts=1,
+            deadline_seconds=deadline_seconds,
         )
         return count + settings.safety_margin_tokens
 
@@ -336,6 +398,16 @@ class ProviderService:
             updated_at=timestamp,
         )
 
+    def _catalog(self, settings: ProviderSettings) -> tuple[str, ...]:
+        discovered = self._store.list_provider_model_catalog(PROVIDER_ID)
+        return tuple(
+            sorted(
+                set(FALLBACK_MODELS)
+                | set(discovered)
+                | {settings.generation_model, settings.checker_model}
+            )
+        )
+
     def _credential(self) -> str | None:
         return self._credentials.get(PROVIDER_ID)
 
@@ -353,7 +425,7 @@ class ProviderService:
         return settings.output_token_allowance
 
     @staticmethod
-    def _policy(settings: ProviderSettings, call_type: str) -> tuple[float, int]:
+    def _policy(settings: ProviderSettings, call_type: str) -> tuple[float, int, float]:
         raw = settings.call_policies.get(call_type)
         if isinstance(raw, dict):
             policy = raw
@@ -366,35 +438,28 @@ class ProviderService:
             timeout = 90
         if not isinstance(attempts, int) or attempts < 1:
             attempts = 1
-        return float(timeout), min(attempts, 3)
+        total = policy.get("total_timeout_seconds")
+        if not isinstance(total, (int, float)) or total <= 0:
+            total = timeout * attempts
+        return float(timeout), min(attempts, 3), float(total)
 
-    def _record_usage(
+    def _finalize_usage(
         self,
-        request_id: str,
-        call_type: str,
-        model: str,
-        started_at: str,
+        usage_id: str,
         *,
-        result: ProviderCallResult | None = None,
         outcome: str,
-        error_code: str | None = None,
+        error_code: str | None,
+        details: ProviderCallResult | ProviderFailure | None = None,
     ) -> None:
-        self._store.record_model_call_usage(
-            ModelCallUsage(
-                id=new_id(),
-                request_id=request_id,
-                call_type=call_type,
-                provider_id=PROVIDER_ID,
-                model=model,
-                input_tokens=None if result is None else result.input_tokens,
-                output_tokens=None if result is None else result.output_tokens,
-                thought_tokens=None if result is None else result.thought_tokens,
-                cached_tokens=None if result is None else result.cached_tokens,
-                total_tokens=None if result is None else result.total_tokens,
-                outcome=outcome,
-                error_code=error_code,
-                started_at=started_at,
-                finished_at=utc_timestamp(),
-                created_at=utc_timestamp(),
-            )
+        self._store.finalize_model_call_usage(
+            usage_id,
+            outcome=outcome,
+            error_code=error_code,
+            provider_request_id=None if details is None else details.provider_request_id,
+            input_tokens=None if details is None else details.input_tokens,
+            output_tokens=None if details is None else details.output_tokens,
+            thought_tokens=None if details is None else details.thought_tokens,
+            cached_tokens=None if details is None else details.cached_tokens,
+            total_tokens=None if details is None else details.total_tokens,
+            finished_at=utc_timestamp(),
         )

@@ -95,6 +95,38 @@ it("shows recommended request limits and resets edited values", async () => {
   expect(reset.hasAttribute("disabled")).toBe(true);
 });
 
+it("offers a discovered model and saves the selected model", async () => {
+  const discovered = ["gemini-3.8-flash", "gemini-9-experimental"];
+  const configured = {
+    ...settings,
+    free_tier_acknowledged: true,
+    credential_configured: true,
+    generation_models: discovered,
+    checker_models: settings.checker_models,
+  };
+  vi.mocked(getProviderSettings).mockResolvedValue(configured);
+  vi.mocked(listProviderModels).mockResolvedValue({
+    generation_models: discovered,
+    checker_models: settings.checker_models,
+    discovered: true,
+    warning: null,
+  });
+  vi.mocked(saveProviderSettings).mockResolvedValue({
+    ...configured,
+    generation_model: "gemini-9-experimental",
+  });
+
+  render(<ProviderSettings connection={connection} />);
+  const model = await screen.findByLabelText("Generation model");
+  fireEvent.change(model, { target: { value: "gemini-9-experimental" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save provider settings" }));
+
+  await waitFor(() => expect(saveProviderSettings).toHaveBeenCalledWith(
+    connection,
+    expect.objectContaining({ generation_model: "gemini-9-experimental" }),
+  ));
+});
+
 it("saves the key and consent without rendering the key afterward", async () => {
   const saved = {
     ...settings,
@@ -143,6 +175,7 @@ it("saves the current model before testing, then removes a configured key", asyn
     provider_id: "google-gemini",
     model: "gemini-4-hydrogen",
     request_id: "request-1",
+    provider_request_id: "provider-request-1",
     input_tokens: 4,
     output_tokens: 1,
     total_tokens: 5,

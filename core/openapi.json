@@ -2648,6 +2648,17 @@
             "type": "string",
             "title": "Request Id"
           },
+          "provider_request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Request Id"
+          },
           "input_tokens": {
             "anyOf": [
               {
@@ -2688,6 +2699,7 @@
           "provider_id",
           "model",
           "request_id",
+          "provider_request_id",
           "input_tokens",
           "output_tokens",
           "total_tokens"
@@ -2703,6 +2715,28 @@
           "request_id": {
             "type": "string",
             "title": "Request Id"
+          },
+          "provider_request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Request Id"
+          },
+          "parent_request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Request Id"
           },
           "call_type": {
             "type": "string",
@@ -2810,6 +2844,8 @@
         "required": [
           "id",
           "request_id",
+          "provider_request_id",
+          "parent_request_id",
           "call_type",
           "provider_id",
           "model",

@@ -988,6 +988,8 @@ export interface components {
             model: string;
             /** Request Id */
             request_id: string;
+            /** Provider Request Id */
+            provider_request_id: string | null;
             /** Input Tokens */
             input_tokens: number | null;
             /** Output Tokens */
@@ -1001,6 +1003,10 @@ export interface components {
             id: string;
             /** Request Id */
             request_id: string;
+            /** Provider Request Id */
+            provider_request_id: string | null;
+            /** Parent Request Id */
+            parent_request_id: string | null;
             /** Call Type */
             call_type: string;
             /** Provider Id */

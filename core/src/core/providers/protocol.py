@@ -11,7 +11,8 @@ type JSONSchema = dict[str, Any]
 @dataclass(frozen=True, slots=True)
 class ProviderCallResult:
     output_text: str
-    request_id: str
+    local_request_id: str
+    provider_request_id: str | None
     input_tokens: int | None = None
     output_tokens: int | None = None
     thought_tokens: int | None = None

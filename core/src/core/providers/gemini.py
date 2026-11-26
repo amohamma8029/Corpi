@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -15,6 +18,36 @@ from core.providers.protocol import JSONSchema, ProviderCallResult
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_API_REVISION = "2026-05-20"
 DEFAULT_THINKING_LEVEL = "low"
+MAX_RETRY_DELAY_SECONDS = 300.0
+_SAFE_MODEL_ID = re.compile(r"[A-Za-z0-9._-]{1,200}")
+
+FAILURE_MESSAGES = {
+    "invalid_credentials": "The provider rejected the API key. Replace the key and try again.",
+    "quota_exhausted": (
+        "The provider quota for this key is exhausted. "
+        "Check the account's quota or try again later."
+    ),
+    "rate_limited": "The provider is limiting requests right now. Wait a moment and try again.",
+    "context_length_exceeded": (
+        "The request is too long for the selected model. Shorten the input or choose a model "
+        "with a larger context window."
+    ),
+    "provider_access_denied": (
+        "The provider denied access to the selected model or project. "
+        "Check the key's project and model access."
+    ),
+    "provider_rejected": (
+        "The provider rejected the request. Check the selected model and request settings."
+    ),
+    "provider_unavailable": "The provider is temporarily unavailable. Try again later.",
+    "provider_timeout": (
+        "The provider did not complete within the total time limit. Try again later."
+    ),
+    "invalid_response": "The provider returned an unreadable response.",
+    "incomplete_response": (
+        "The provider stopped before completing the answer. Try again or choose a different model."
+    ),
+}
 
 
 def _optional_int(value: object) -> int | None:
@@ -23,16 +56,65 @@ def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) and value >= 0 else None
 
 
-def _sanitize(
-    message: object,
+def _provider_request_id(data: dict[str, Any]) -> str | None:
+    value = data.get("id")
+    if isinstance(value, str) and 0 < len(value) <= 512:
+        return value
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _Reported:
+    provider_request_id: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    thought_tokens: int | None
+    cached_tokens: int | None
+    total_tokens: int | None
+
+    @classmethod
+    def from_payload(cls, data: dict[str, Any]) -> _Reported:
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        return cls(
+            provider_request_id=_provider_request_id(data),
+            input_tokens=_optional_int(
+                usage.get("total_input_tokens", usage.get("prompt_token_count"))
+            ),
+            output_tokens=_optional_int(
+                usage.get("total_output_tokens", usage.get("candidates_token_count"))
+            ),
+            thought_tokens=_optional_int(usage.get("total_thought_tokens")),
+            cached_tokens=_optional_int(
+                usage.get("total_cached_tokens", usage.get("cached_content_token_count"))
+            ),
+            total_tokens=_optional_int(usage.get("total_tokens")),
+        )
+
+
+def _failure(
+    code: str,
     *,
-    secret: str | None = None,
-    default: str = "The provider rejected the request.",
-) -> str:
-    text = " ".join(str(message).split()) if message is not None else ""
-    if secret:
-        text = text.replace(secret, "[redacted]")
-    return text[:300] or default
+    status: int,
+    reported: _Reported | None = None,
+    message: str | None = None,
+) -> ProviderFailure:
+    reported = reported or _Reported(None, None, None, None, None, None)
+    return ProviderFailure(
+        code,
+        message or FAILURE_MESSAGES[code],
+        status=status,
+        provider_request_id=reported.provider_request_id,
+        input_tokens=reported.input_tokens,
+        output_tokens=reported.output_tokens,
+        thought_tokens=reported.thought_tokens,
+        cached_tokens=reported.cached_tokens,
+        total_tokens=reported.total_tokens,
+    )
+
+
+def _deadline_failure() -> ProviderFailure:
+    return _failure("provider_timeout", status=504)
 
 
 class GeminiClient:
@@ -62,6 +144,7 @@ class GeminiClient:
         timeout_seconds: float,
         attempts: int,
         request_id: str,
+        deadline_seconds: float | None = None,
     ) -> ProviderCallResult:
         body: dict[str, Any] = {
             "model": model,
@@ -84,8 +167,9 @@ class GeminiClient:
             body,
             timeout_seconds=timeout_seconds,
             attempts=attempts,
+            deadline_seconds=deadline_seconds,
         )
-        return self._result(data, fallback_request_id=request_id)
+        return self._result(data, local_request_id=request_id)
 
     async def count_tokens(
         self,
@@ -95,6 +179,7 @@ class GeminiClient:
         input_text: str,
         timeout_seconds: float,
         attempts: int = 1,
+        deadline_seconds: float | None = None,
     ) -> int:
         text = input_text if not instructions else f"{instructions}\n\n{input_text}"
         data = await self._post_with_retries(
@@ -102,14 +187,11 @@ class GeminiClient:
             {"contents": [{"parts": [{"text": text}]}]},
             timeout_seconds=timeout_seconds,
             attempts=attempts,
+            deadline_seconds=deadline_seconds,
         )
         value = data.get("totalTokens", data.get("total_tokens"))
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ProviderFailure(
-                "invalid_response",
-                "The provider did not return a valid token count.",
-                status=502,
-            )
+            raise _failure("invalid_response", status=502)
         return value
 
     async def list_models(
@@ -117,11 +199,19 @@ class GeminiClient:
         *,
         timeout_seconds: float = 30,
         attempts: int = 1,
+        deadline_seconds: float | None = None,
     ) -> list[str]:
         models: set[str] = set()
         page_token: str | None = None
         pages = 0
+        total_seconds = deadline_seconds if deadline_seconds is not None else timeout_seconds
+        if total_seconds <= 0:
+            raise ValueError("deadline must be positive")
+        deadline = time.monotonic() + total_seconds
         while pages < 10:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _deadline_failure()
             params: dict[str, str | int] = {"pageSize": 1000}
             if page_token:
                 params["pageToken"] = page_token
@@ -131,14 +221,11 @@ class GeminiClient:
                 params=params,
                 timeout_seconds=timeout_seconds,
                 attempts=attempts,
+                deadline_seconds=remaining,
             )
             items = data.get("models")
             if not isinstance(items, list):
-                raise ProviderFailure(
-                    "invalid_response",
-                    "The provider returned no model list.",
-                    status=502,
-                )
+                raise _failure("invalid_response", status=502)
             models.update(_text_model_ids(items))
             token = data.get("nextPageToken")
             page_token = token if isinstance(token, str) and token else None
@@ -154,6 +241,7 @@ class GeminiClient:
         *,
         timeout_seconds: float,
         attempts: int,
+        deadline_seconds: float | None,
     ) -> dict[str, Any]:
         return await self._request_with_retries(
             "POST",
@@ -161,6 +249,7 @@ class GeminiClient:
             body=body,
             timeout_seconds=timeout_seconds,
             attempts=attempts,
+            deadline_seconds=deadline_seconds,
         )
 
     async def _request_with_retries(
@@ -172,41 +261,57 @@ class GeminiClient:
         params: dict[str, str | int] | None = None,
         timeout_seconds: float,
         attempts: int,
+        deadline_seconds: float | None = None,
     ) -> dict[str, Any]:
         if attempts < 1:
             raise ValueError("attempts must be at least one")
+        total_seconds = deadline_seconds if deadline_seconds is not None else timeout_seconds
+        if total_seconds <= 0:
+            raise ValueError("deadline must be positive")
+        deadline = time.monotonic() + total_seconds
         headers = {
             "x-goog-api-key": self._api_key,
             "Api-Revision": GEMINI_API_REVISION,
             "Content-Type": "application/json",
         }
-        timeout = httpx.Timeout(
-            timeout_seconds,
-            connect=min(10.0, timeout_seconds),
-        )
         async with httpx.AsyncClient(
             base_url=self._base_url,
-            timeout=timeout,
             transport=self._transport,
         ) as client:
             for attempt in range(1, attempts + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _deadline_failure()
+                attempt_timeout = min(timeout_seconds, remaining)
+                timeout = httpx.Timeout(
+                    attempt_timeout,
+                    connect=min(10.0, attempt_timeout),
+                )
+                in_flight = False
                 try:
-                    response = await client.request(
-                        method,
-                        path,
-                        json=body,
-                        params=params,
-                        headers=headers,
-                    )
+                    in_flight = True
+                    async with asyncio.timeout(remaining):
+                        response = await client.request(
+                            method,
+                            path,
+                            json=body,
+                            params=params,
+                            headers=headers,
+                            timeout=timeout,
+                        )
+                    in_flight = False
+                except TimeoutError as error:
+                    raise PaidCallOutcomeUnknown(
+                        "The provider request exceeded the total time limit; "
+                        "its outcome is unknown."
+                    ) from error
+                except asyncio.CancelledError:
+                    raise ProviderCancelled(possibly_processed=in_flight) from None
                 except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                     if attempt < attempts:
-                        await asyncio.sleep(min(2.0 ** (attempt - 1), 5.0))
+                        await _wait_before_retry(min(2.0 ** (attempt - 1), 5.0), deadline)
                         continue
-                    raise ProviderFailure(
-                        "provider_unavailable",
-                        "The provider could not be reached.",
-                        status=503,
-                    ) from error
+                    raise _failure("provider_unavailable", status=503) from error
                 except httpx.TimeoutException as error:
                     raise PaidCallOutcomeUnknown(
                         "The provider request timed out; its paid outcome is unknown."
@@ -216,39 +321,26 @@ class GeminiClient:
                         "The provider connection ended after the request was sent; "
                         "its paid outcome is unknown."
                     ) from error
-                except asyncio.CancelledError as error:
-                    raise ProviderCancelled() from error
 
                 if response.status_code in {429, 503}:
                     if attempt < attempts:
-                        await asyncio.sleep(_retry_delay(response))
+                        await _wait_before_retry(_retry_delay(response), deadline)
                         continue
                 if response.status_code >= 400:
-                    raise _response_failure(response, self._api_key)
+                    raise _response_failure(response)
                 try:
                     data = response.json()
                 except (json.JSONDecodeError, ValueError) as error:
-                    raise ProviderFailure(
-                        "invalid_response",
-                        "The provider returned an unreadable response.",
-                        status=502,
-                    ) from error
+                    raise _failure("invalid_response", status=502) from error
                 if not isinstance(data, dict):
-                    raise ProviderFailure(
-                        "invalid_response",
-                        "The provider returned an unexpected response.",
-                        status=502,
-                    )
+                    raise _failure("invalid_response", status=502)
                 if "error" in data:
-                    raise _payload_failure(response.status_code, data["error"], self._api_key)
+                    raise _payload_failure(response.status_code, data["error"])
                 return data
-        raise ProviderFailure(
-            "provider_unavailable",
-            "The provider did not return a usable response.",
-            status=503,
-        )
+        raise _failure("provider_unavailable", status=503)
 
-    def _result(self, data: dict[str, Any], *, fallback_request_id: str) -> ProviderCallResult:
+    def _result(self, data: dict[str, Any], *, local_request_id: str) -> ProviderCallResult:
+        reported = _Reported.from_payload(data)
         status = data.get("status")
         if isinstance(status, str) and status.lower() not in {"completed", "succeeded", "success"}:
             code = (
@@ -256,18 +348,14 @@ class GeminiClient:
                 if status.lower() in {"incomplete", "truncated", "max_tokens"}
                 else "provider_rejected"
             )
-            raise ProviderFailure(
+            raise _failure(
                 code,
-                f"Gemini interaction finished with status {_sanitize(status)}.",
                 status=502 if code == "incomplete_response" else 400,
+                reported=reported,
             )
         errors = data.get("errors")
         if isinstance(errors, list) and errors:
-            raise ProviderFailure(
-                "provider_rejected",
-                "Gemini returned an error result.",
-                status=400,
-            )
+            raise _failure("provider_rejected", status=400, reported=reported)
         finish = data.get("finish_reason") or data.get("finishReason")
         if isinstance(finish, str) and finish.upper() in {
             "MAX_TOKENS",
@@ -277,10 +365,10 @@ class GeminiClient:
             "OTHER",
         }:
             code = "incomplete_response" if finish.upper() == "MAX_TOKENS" else "provider_rejected"
-            raise ProviderFailure(
+            raise _failure(
                 code,
-                f"Gemini stopped with {_sanitize(finish)}.",
                 status=502 if code == "incomplete_response" else 400,
+                reported=reported,
             )
         output_text = data.get("output_text")
         if not isinstance(output_text, str) or not output_text:
@@ -302,31 +390,27 @@ class GeminiClient:
                             parts.append(item["text"])
             output_text = "".join(parts)
         if not output_text:
-            raise ProviderFailure(
-                "invalid_response",
-                "The provider returned no answer text.",
-                status=502,
-            )
-        usage = data.get("usage")
-        usage = usage if isinstance(usage, dict) else {}
+            raise _failure("invalid_response", status=502, reported=reported)
         return ProviderCallResult(
             output_text=output_text,
-            request_id=str(data.get("id") or fallback_request_id),
-            input_tokens=_optional_int(
-                usage.get("total_input_tokens", usage.get("prompt_token_count"))
-            ),
-            output_tokens=_optional_int(
-                usage.get("total_output_tokens", usage.get("candidates_token_count"))
-            ),
-            thought_tokens=_optional_int(usage.get("total_thought_tokens")),
-            cached_tokens=_optional_int(
-                usage.get("total_cached_tokens", usage.get("cached_content_token_count"))
-            ),
-            total_tokens=_optional_int(usage.get("total_tokens")),
+            local_request_id=local_request_id,
+            provider_request_id=reported.provider_request_id,
+            input_tokens=reported.input_tokens,
+            output_tokens=reported.output_tokens,
+            thought_tokens=reported.thought_tokens,
+            cached_tokens=reported.cached_tokens,
+            total_tokens=reported.total_tokens,
         )
 
 
-MAX_RETRY_DELAY_SECONDS = 300.0
+async def _wait_before_retry(delay: float, deadline: float) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or delay >= remaining:
+        raise _deadline_failure()
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        raise ProviderCancelled(possibly_processed=False) from None
 
 
 def _text_model_ids(items: list[object]) -> set[str]:
@@ -357,7 +441,7 @@ def _text_model_ids(items: list[object]) -> set[str]:
             continue
         if any(marker in lowered for marker in excluded):
             continue
-        if model_id.startswith(("gemini-", "gemma-")):
+        if model_id.startswith(("gemini-", "gemma-")) and _SAFE_MODEL_ID.fullmatch(model_id):
             result.add(model_id)
     return result
 
@@ -396,30 +480,40 @@ def _retry_delay(response: httpx.Response) -> float:
     return 1.0
 
 
-def _response_failure(response: httpx.Response, secret: str | None = None) -> ProviderFailure:
+def _response_failure(response: httpx.Response) -> ProviderFailure:
     try:
         payload = response.json()
     except (json.JSONDecodeError, ValueError):
         payload = None
     error = _error_from_payload(payload)
-    if error is None:
-        raw = _sanitize(response.text, secret=secret, default="")
-        if raw:
-            return ProviderFailure(
-                "provider_rejected",
-                f"Gemini rejected the request (HTTP {response.status_code}): {raw}",
-                status=400,
-            )
-    return _payload_failure(response.status_code, error, secret)
+    if error is not None:
+        return _payload_failure(response.status_code, error)
+    return _status_failure(response.status_code)
 
 
-def _payload_failure(status: int, error: object, secret: str | None = None) -> ProviderFailure:
+def _status_failure(status: int) -> ProviderFailure:
+    if status == 401:
+        return _failure("invalid_credentials", status=401)
+    if status == 403:
+        return _failure(
+            "provider_rejected",
+            status=403,
+            message=FAILURE_MESSAGES["provider_access_denied"],
+        )
+    if status == 429:
+        return _failure("rate_limited", status=429)
+    if status >= 500:
+        return _failure("provider_unavailable", status=503)
+    return _failure("provider_rejected", status=400)
+
+
+def _payload_failure(status: int, error: object) -> ProviderFailure:
     error = error if isinstance(error, dict) else {}
-    raw_message = _sanitize(error.get("message"), secret=secret, default="")
+    raw_message = error.get("message")
+    raw_message = raw_message if isinstance(raw_message, str) else ""
     lowered = raw_message.lower()
     reasons: set[str] = set()
     quota_ids: list[str] = []
-    field_violations: list[str] = []
     details = error.get("details")
     if isinstance(details, list):
         for detail in details:
@@ -436,33 +530,8 @@ def _payload_failure(status: int, error: object, secret: str | None = None) -> P
                     quota_id = violation.get("quotaId")
                     if isinstance(quota_id, str):
                         quota_ids.append(quota_id)
-            field_errors = detail.get("fieldViolations")
-            if isinstance(field_errors, list):
-                for field_error in field_errors:
-                    if not isinstance(field_error, dict):
-                        continue
-                    field = _sanitize(field_error.get("field"), secret=secret, default="request")
-                    description = _sanitize(
-                        field_error.get("description"), secret=secret, default="invalid"
-                    )
-                    field_violations.append(f"{field}: {description}")
-    joined = " ".join([raw_message, *sorted(reasons), *quota_ids]).lower()
-    status_label = str(error.get("status") or error.get("code") or status)
-    if raw_message:
-        message = (
-            raw_message
-            if status_label.lower() in raw_message.lower()
-            else f"Gemini {status_label}: {raw_message}"
-        )
-    else:
-        message = f"Gemini rejected the request (HTTP {status}, {status_label})."
-    if reasons:
-        message = f"{message} [{', '.join(sorted(reasons))}]"
-    if quota_ids:
-        message = f"{message} [{', '.join(quota_ids[:2])}]"
-    if field_violations:
-        message = f"{message} [{'; '.join(field_violations[:2])}]"
-    message = message[:300]
+    joined = " ".join([lowered, *sorted(reason.lower() for reason in reasons), *quota_ids])
+    joined = joined.lower()
 
     invalid_key = (
         bool(reasons & {"API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_NOT_VALID"})
@@ -470,13 +539,17 @@ def _payload_failure(status: int, error: object, secret: str | None = None) -> P
         or "api key expired" in lowered
     )
     if invalid_key or status == 401:
-        return ProviderFailure("invalid_credentials", message, status=401)
+        return _failure("invalid_credentials", status=401)
     if status == 403:
-        return ProviderFailure("provider_rejected", message, status=403)
+        return _failure(
+            "provider_rejected",
+            status=403,
+            message=FAILURE_MESSAGES["provider_access_denied"],
+        )
     if status == 400:
-        if "context" in lowered or "token" in lowered or "too long" in lowered:
-            return ProviderFailure("context_length_exceeded", message, status=400)
-        return ProviderFailure("provider_rejected", message, status=400)
+        if "context" in joined or "token" in joined or "too long" in joined:
+            return _failure("context_length_exceeded", status=400)
+        return _failure("provider_rejected", status=400)
     if status == 429:
         per_minute = (
             any(
@@ -488,14 +561,14 @@ def _payload_failure(status: int, error: object, secret: str | None = None) -> P
             or "RATE_LIMIT_EXCEEDED" in reasons
         )
         if per_minute:
-            return ProviderFailure("rate_limited", message, status=429)
+            return _failure("rate_limited", status=429)
         if (
             any("perday" in quota_id.lower() for quota_id in quota_ids)
             or "QUOTA_EXCEEDED" in reasons
             or any(word in joined for word in ("quota", "billing", "credit", "per day"))
         ):
-            return ProviderFailure("quota_exhausted", message, status=429)
-        return ProviderFailure("rate_limited", message, status=429)
+            return _failure("quota_exhausted", status=429)
+        return _failure("rate_limited", status=429)
     if status >= 500:
-        return ProviderFailure("provider_unavailable", message, status=503)
-    return ProviderFailure("provider_rejected", message, status=400)
+        return _failure("provider_unavailable", status=503)
+    return _failure("provider_rejected", status=400)

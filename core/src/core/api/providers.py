@@ -50,6 +50,7 @@ class ProviderTestPayload(BaseModel):
     provider_id: str
     model: str
     request_id: str
+    provider_request_id: str | None
     input_tokens: int | None
     output_tokens: int | None
     total_tokens: int | None
@@ -58,6 +59,8 @@ class ProviderTestPayload(BaseModel):
 class ProviderUsagePayload(BaseModel):
     id: str
     request_id: str
+    provider_request_id: str | None
+    parent_request_id: str | None
     call_type: str
     provider_id: str
     model: str
@@ -158,6 +161,8 @@ def list_provider_usage(
         ProviderUsagePayload(
             id=row.id,
             request_id=row.request_id,
+            provider_request_id=row.provider_request_id,
+            parent_request_id=row.parent_request_id,
             call_type=row.call_type,
             provider_id=row.provider_id,
             model=row.model,
