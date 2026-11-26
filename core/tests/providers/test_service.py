@@ -47,6 +47,27 @@ def configured_service(
     return service
 
 
+def service_with_transport(
+    store: PersistenceStore,
+    transport: httpx.AsyncBaseTransport,
+) -> ProviderService:
+    credentials = InMemoryCredentialStore()
+    service = ProviderService(
+        store,
+        credentials,
+        client_factory=lambda key: GeminiClient(key, transport=transport),
+    )
+    service.save(
+        ProviderSettingsUpdate(
+            generation_model=DEFAULT_GENERATION_MODEL,
+            checker_model=DEFAULT_CHECKER_MODEL,
+            free_tier_acknowledged=True,
+        ),
+        api_key="test-key",
+    )
+    return service
+
+
 def success_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(
         200,
@@ -376,6 +397,59 @@ def test_cancel_before_retry_is_recorded_as_cancelled(
     assert usage[0].error_code == "cancelled"
 
 
+def test_cancelled_client_close_after_reply_finalizes_completed(
+    store: PersistenceStore,
+) -> None:
+    class CancelCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return success_handler(request)
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    service = service_with_transport(store, CancelCloseTransport())
+    result = asyncio.run(
+        service.complete(
+            "generation",
+            instructions="Use evidence.",
+            input_text="Question",
+        )
+    )
+
+    assert result.output_text == "Grounded answer."
+    usage = service.usage()
+    assert usage[0].outcome == "completed"
+    assert usage[0].provider_request_id == "provider-result"
+    assert usage[0].finished_at is not None
+
+
+def test_cancelled_client_close_after_no_reply_finalizes_unknown(
+    store: PersistenceStore,
+) -> None:
+    class CancelRequestAndCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise asyncio.CancelledError
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    service = service_with_transport(store, CancelRequestAndCloseTransport())
+    with pytest.raises(ProviderCancelled) as failure:
+        asyncio.run(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
+        )
+
+    assert failure.value.possibly_processed is True
+    usage = service.usage()
+    assert usage[0].outcome == "unknown"
+    assert usage[0].error_code == "cancelled_outcome_unknown"
+    assert usage[0].finished_at is not None
+
+
 def test_incomplete_result_retains_reported_usage_without_marking_success(
     store: PersistenceStore,
 ) -> None:
@@ -662,6 +736,39 @@ def test_test_connection_uses_a_model_safe_probe_budget(store: PersistenceStore)
     assert usage[0].outcome == "completed"
     assert usage[0].request_id == result["request_id"]
     assert usage[0].provider_request_id == result["provider_request_id"]
+
+
+def test_connection_rejects_a_response_without_current_model_text(
+    store: PersistenceStore,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "no-current-answer",
+                "status": "completed",
+                "output_text": "leaked input text",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "Reply with exactly OK."}],
+                    },
+                    {
+                        "type": "thought",
+                        "content": [{"type": "text", "text": "thinking"}],
+                    },
+                ],
+            },
+        )
+
+    service = configured_service(store, handler)
+    with pytest.raises(ProviderFailure) as failure:
+        asyncio.run(service.test_connection())
+
+    assert failure.value.code == "invalid_response"
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
 
 
 def test_count_tokens_uses_generation_model_and_requires_a_key(

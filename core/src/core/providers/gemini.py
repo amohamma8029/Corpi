@@ -19,6 +19,7 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_API_REVISION = "2026-05-20"
 DEFAULT_THINKING_LEVEL = "low"
 MAX_RETRY_DELAY_SECONDS = 300.0
+CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 _SAFE_MODEL_ID = re.compile(r"[A-Za-z0-9._-]{1,200}")
 
 FAILURE_MESSAGES = {
@@ -115,6 +116,45 @@ def _failure(
 
 def _deadline_failure() -> ProviderFailure:
     return _failure("provider_timeout", status=504)
+
+
+def _current_model_text(steps: list[object]) -> str:
+    """Read the trailing model-output text after the last user input.
+
+    Mirrors the Interactions SDK's output boundary: walk steps backward, stop at
+    the last user input, skip thoughts, and collect only trailing text blocks
+    from model-output steps. Earlier output and input text cannot become the
+    current answer.
+    """
+
+    text_parts: list[str] = []
+    collecting = False
+    for step in reversed(steps):
+        step_type = step.get("type") if isinstance(step, dict) else None
+        if step_type == "user_input":
+            break
+        if step_type == "thought":
+            continue
+        if step_type != "model_output":
+            if collecting:
+                break
+            continue
+        content = step.get("content") if isinstance(step, dict) else None
+        if not isinstance(content, list):
+            continue
+        should_stop = False
+        for item in reversed(content):
+            item_type = item.get("type") if isinstance(item, dict) else None
+            if item_type == "text":
+                collecting = True
+                text = item.get("text") if isinstance(item, dict) else None
+                text_parts.append(text if isinstance(text, str) else "")
+            elif collecting:
+                should_stop = True
+                break
+        if should_stop:
+            break
+    return "".join(reversed(text_parts))
 
 
 class GeminiClient:
@@ -274,10 +314,11 @@ class GeminiClient:
             "Api-Revision": GEMINI_API_REVISION,
             "Content-Type": "application/json",
         }
-        async with httpx.AsyncClient(
+        client = httpx.AsyncClient(
             base_url=self._base_url,
             transport=self._transport,
-        ) as client:
+        )
+        try:
             for attempt in range(1, attempts + 1):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -337,7 +378,9 @@ class GeminiClient:
                 if "error" in data:
                     raise _payload_failure(response.status_code, data["error"])
                 return data
-        raise _failure("provider_unavailable", status=503)
+            raise _failure("provider_unavailable", status=503)
+        finally:
+            await _close_client(client, deadline)
 
     def _result(self, data: dict[str, Any], *, local_request_id: str) -> ProviderCallResult:
         reported = _Reported.from_payload(data)
@@ -370,26 +413,12 @@ class GeminiClient:
                 status=502 if code == "incomplete_response" else 400,
                 reported=reported,
             )
-        output_text = data.get("output_text")
+        steps = data.get("steps")
+        if isinstance(steps, list):
+            output_text = _current_model_text(steps)
+        else:
+            output_text = data.get("output_text")
         if not isinstance(output_text, str) or not output_text:
-            parts: list[str] = []
-            steps = data.get("steps")
-            if isinstance(steps, list):
-                for step in steps:
-                    if not isinstance(step, dict):
-                        continue
-                    content = step.get("content")
-                    if not isinstance(content, list):
-                        continue
-                    for item in content:
-                        if (
-                            isinstance(item, dict)
-                            and item.get("type") == "text"
-                            and isinstance(item.get("text"), str)
-                        ):
-                            parts.append(item["text"])
-            output_text = "".join(parts)
-        if not output_text:
             raise _failure("invalid_response", status=502, reported=reported)
         return ProviderCallResult(
             output_text=output_text,
@@ -411,6 +440,21 @@ async def _wait_before_retry(delay: float, deadline: float) -> None:
         await asyncio.sleep(delay)
     except asyncio.CancelledError:
         raise ProviderCancelled(possibly_processed=False) from None
+
+
+async def _close_client(client: httpx.AsyncClient, deadline: float) -> None:
+    """Close without letting cleanup replace a known outcome or leak a pending call."""
+
+    remaining = deadline - time.monotonic()
+    timeout = max(0.01, min(CLIENT_CLOSE_TIMEOUT_SECONDS, remaining))
+    try:
+        async with asyncio.timeout(timeout):
+            await client.aclose()
+    except (Exception, asyncio.CancelledError):
+        # The provider result or its controlled failure already carries the
+        # outcome. A slow or cancelled close must not turn that into a pending
+        # usage row or replace a known answer.
+        pass
 
 
 def _text_model_ids(items: list[object]) -> set[str]:
