@@ -3443,7 +3443,7 @@ class PersistenceStore:
             "settings_test",
         }:
             raise ValueError("unsupported model call type")
-        if usage.outcome not in {"completed", "failed", "cancelled", "unknown"}:
+        if usage.outcome not in {"pending", "completed", "failed", "cancelled", "unknown"}:
             raise ValueError("unsupported model call outcome")
         for field, value in (
             ("input tokens", usage.input_tokens),
@@ -3454,25 +3454,38 @@ class PersistenceStore:
         ):
             if value is not None:
                 _integer(value, field, minimum=0)
-        error_code = (
-            None if usage.error_code is None else _required_text(usage.error_code, "error code")
+        error_code = self._model_call_error_code(usage.error_code)
+        provider_request_id = self._optional_model_call_id(
+            usage.provider_request_id,
+            "provider request id",
+            maximum=512,
         )
-        if error_code is not None and len(error_code) > 120:
-            raise ValueError("error code is too long")
+        parent_request_id = self._optional_model_call_id(
+            usage.parent_request_id,
+            "parent request id",
+            maximum=200,
+        )
         validate_utc_timestamp(usage.started_at)
         if usage.finished_at is not None:
             validate_utc_timestamp(usage.finished_at)
+        if usage.outcome == "pending" and usage.finished_at is not None:
+            raise ValueError("pending model calls cannot have a finish time")
+        if usage.outcome != "pending" and usage.finished_at is None:
+            raise ValueError("finished model calls require a finish time")
         validate_utc_timestamp(usage.created_at)
         with self._transaction() as connection:
             connection.execute(
                 """INSERT INTO model_call_usage(
-                       id,request_id,call_type,provider_id,model,input_tokens,output_tokens,
-                       thought_tokens,cached_tokens,total_tokens,outcome,error_code,
-                       started_at,finished_at,created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       id,request_id,provider_request_id,parent_request_id,call_type,
+                       provider_id,model,input_tokens,output_tokens,thought_tokens,
+                       cached_tokens,total_tokens,outcome,error_code,started_at,
+                       finished_at,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     usage.id,
                     request_id,
+                    provider_request_id,
+                    parent_request_id,
                     usage.call_type,
                     provider_id,
                     model,
@@ -3492,6 +3505,148 @@ class PersistenceStore:
                 "SELECT * FROM model_call_usage WHERE id=?", (usage.id,)
             ).fetchone()
             return _model_call_usage(_require_row(row))
+
+    def finalize_model_call_usage(
+        self,
+        usage_id: str,
+        *,
+        outcome: str,
+        error_code: str | None,
+        provider_request_id: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        thought_tokens: int | None,
+        cached_tokens: int | None,
+        total_tokens: int | None,
+        finished_at: str,
+    ) -> ModelCallUsage:
+        validate_id(usage_id)
+        if outcome not in {"completed", "failed", "cancelled", "unknown"}:
+            raise ValueError("unsupported final model call outcome")
+        error_code = self._model_call_error_code(error_code)
+        provider_request_id = self._optional_model_call_id(
+            provider_request_id,
+            "provider request id",
+            maximum=512,
+        )
+        for field, value in (
+            ("input tokens", input_tokens),
+            ("output tokens", output_tokens),
+            ("thought tokens", thought_tokens),
+            ("cached tokens", cached_tokens),
+            ("total tokens", total_tokens),
+        ):
+            if value is not None:
+                _integer(value, field, minimum=0)
+        validate_utc_timestamp(finished_at)
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE model_call_usage
+                   SET outcome=?,error_code=?,provider_request_id=?,input_tokens=?,
+                       output_tokens=?,thought_tokens=?,cached_tokens=?,total_tokens=?,
+                       finished_at=?
+                   WHERE id=? AND outcome='pending'""",
+                (
+                    outcome,
+                    error_code,
+                    provider_request_id,
+                    input_tokens,
+                    output_tokens,
+                    thought_tokens,
+                    cached_tokens,
+                    total_tokens,
+                    finished_at,
+                    usage_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                exists = connection.execute(
+                    "SELECT 1 FROM model_call_usage WHERE id=?", (usage_id,)
+                ).fetchone()
+                if exists is None:
+                    raise PersistenceError("model call usage does not exist")
+                raise PersistenceError("model call usage is already final")
+            row = connection.execute(
+                "SELECT * FROM model_call_usage WHERE id=?", (usage_id,)
+            ).fetchone()
+            return _model_call_usage(_require_row(row))
+
+    def recover_pending_model_calls(self, *, finished_at: str | None = None) -> int:
+        timestamp = utc_timestamp() if finished_at is None else finished_at
+        validate_utc_timestamp(timestamp)
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE model_call_usage
+                   SET outcome='unknown',error_code='interrupted_before_completion',
+                       finished_at=?
+                   WHERE outcome='pending'""",
+                (timestamp,),
+            )
+            return cursor.rowcount
+
+    def replace_provider_model_catalog(
+        self,
+        provider_id: str,
+        model_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        provider_id = _required_text(provider_id, "provider id")
+        cleaned = sorted({_required_text(model_id, "model id") for model_id in model_ids})
+        if any(len(model_id) > 200 for model_id in cleaned):
+            raise ValueError("model id is too long")
+        timestamp = utc_timestamp()
+        with self._transaction() as connection:
+            connection.execute(
+                "DELETE FROM provider_model_catalog WHERE provider_id=?",
+                (provider_id,),
+            )
+            connection.executemany(
+                """INSERT INTO provider_model_catalog(provider_id,model_id,discovered_at)
+                   VALUES(?,?,?)""",
+                ((provider_id, model_id, timestamp) for model_id in cleaned),
+            )
+            return self._provider_model_catalog(connection, provider_id)
+
+    def list_provider_model_catalog(self, provider_id: str) -> tuple[str, ...]:
+        provider_id = _required_text(provider_id, "provider id")
+        with self.database.connect() as connection:
+            return self._provider_model_catalog(connection, provider_id)
+
+    @staticmethod
+    def _provider_model_catalog(
+        connection: sqlite3.Connection,
+        provider_id: str,
+    ) -> tuple[str, ...]:
+        return tuple(
+            row["model_id"]
+            for row in connection.execute(
+                """SELECT model_id FROM provider_model_catalog
+                   WHERE provider_id=? ORDER BY model_id""",
+                (provider_id,),
+            )
+        )
+
+    @staticmethod
+    def _optional_model_call_id(
+        value: str | None,
+        label: str,
+        *,
+        maximum: int,
+    ) -> str | None:
+        if value is None:
+            return None
+        cleaned = _required_text(value, label)
+        if len(cleaned) > maximum:
+            raise ValueError(f"{label} is too long")
+        return cleaned
+
+    @staticmethod
+    def _model_call_error_code(value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = _required_text(value, "error code")
+        if len(cleaned) > 120:
+            raise ValueError("error code is too long")
+        return cleaned
 
     def list_model_call_usage(self, limit: int = 50) -> tuple[ModelCallUsage, ...]:
         if not 1 <= limit <= 500:
@@ -4738,6 +4893,8 @@ def _model_call_usage(row: sqlite3.Row) -> ModelCallUsage:
     return ModelCallUsage(
         row["id"],
         row["request_id"],
+        row["provider_request_id"],
+        row["parent_request_id"],
         row["call_type"],
         row["provider_id"],
         row["model"],

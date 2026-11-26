@@ -10,7 +10,7 @@ import pytest
 
 from core.ingest.service import PdfIngestService
 from core.jobs.sweeper import TrashSweeper
-from core.persistence.database import Database
+from core.persistence.database import Database, DatabaseConfig
 from core.persistence.errors import (
     DeletedPdfAcquisitionError,
     MigrationError,
@@ -50,7 +50,7 @@ def test_application_id_and_schema_fingerprint_are_stable(database: Database) ->
         assert connection.execute("PRAGMA application_id").fetchone()[0] == 0x434F5250
         assert CORPI_APPLICATION_ID == 0x434F5250
         assert schema_fingerprint(connection) == (
-            "8ba078fd77cecf0b4795f8057325b89e455ff623ec8557f7928bb115d21fbca5"
+            "4558bf779dda54e900298966d276b331a6486f084fc4c6c35fbdb5beabb1c6d4"
         )
 
 
@@ -72,6 +72,80 @@ def test_upgrade_preserves_existing_record_identity(database: Database) -> None:
             (notebook.id,),
         ).fetchone()[0]
         assert color == "neutral"
+
+
+def test_provider_usage_upgrade_preserves_rows_and_adds_identity_columns(
+    tmp_path: Path,
+) -> None:
+    migrations = load_migrations()
+    old = Database(DatabaseConfig(tmp_path / "provider-upgrade"), migrations=migrations[:16])
+    old.initialize()
+    timestamp = utc_timestamp()
+    usage_id = new_id()
+    with old.connect() as connection:
+        connection.execute(
+            """INSERT INTO provider_settings(
+                   provider_id,settings_format_version,generation_model,checker_model,
+                   free_tier_acknowledged,output_token_allowance,safety_margin_tokens,
+                   call_policies_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "google-gemini",
+                1,
+                "gemini-3.8-flash",
+                "gemini-3.5-flash-lite",
+                1,
+                1024,
+                512,
+                '{"generation":{"timeout_seconds":180,"attempts":2}}',
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO model_call_usage(
+                   id,request_id,call_type,provider_id,model,input_tokens,output_tokens,
+                   thought_tokens,cached_tokens,total_tokens,outcome,error_code,
+                   started_at,finished_at,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                usage_id,
+                "local-before-0017",
+                "generation",
+                "google-gemini",
+                "gemini-3.8-flash",
+                12,
+                3,
+                1,
+                0,
+                16,
+                "unknown",
+                "paid_outcome_unknown",
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    upgraded = Database(old.config)
+    upgraded.initialize()
+
+    usage = PersistenceStore(upgraded).list_model_call_usage()
+    assert len(usage) == 1
+    assert usage[0].id == usage_id
+    assert usage[0].request_id == "local-before-0017"
+    assert usage[0].provider_request_id is None
+    assert usage[0].parent_request_id is None
+    assert usage[0].outcome == "unknown"
+    assert usage[0].error_code == "paid_outcome_unknown"
+    assert (usage[0].input_tokens, usage[0].output_tokens) == (12, 3)
+    assert usage[0].thought_tokens == 1
+    assert usage[0].cached_tokens == 0
+    assert usage[0].total_tokens == 16
+    with upgraded.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == len(migrations)
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_failed_risky_upgrade_keeps_rollback_and_recovery_snapshot(database: Database) -> None:

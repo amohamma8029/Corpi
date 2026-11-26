@@ -89,13 +89,19 @@ def test_provider_settings_consent_and_secret_boundary(tmp_path) -> None:
 
         tested = client.post("/provider/settings/test", headers=HEADERS)
         assert tested.status_code == 200
-        assert tested.json()["ok"] is True
-        assert tested.json()["model"] == "gemini-3.8-flash"
+        test_body = tested.json()
+        assert test_body["ok"] is True
+        assert test_body["model"] == "gemini-3.8-flash"
+        assert test_body["provider_request_id"] == "api-provider-result"
+        assert test_body["request_id"] != test_body["provider_request_id"]
 
         usage = client.get("/provider/usage", headers=HEADERS)
         assert usage.status_code == 200
         assert usage.json()[0]["call_type"] == "settings_test"
         assert usage.json()[0]["outcome"] == "completed"
+        assert usage.json()[0]["request_id"] == test_body["request_id"]
+        assert usage.json()[0]["provider_request_id"] == "api-provider-result"
+        assert usage.json()[0]["parent_request_id"] is None
 
         cleared = client.delete("/provider/credential", headers=HEADERS)
         assert cleared.status_code == 200
@@ -144,7 +150,9 @@ def test_provider_models_route_returns_the_provider_catalog(tmp_path) -> None:
         assert response.json()["discovered"] is True
         assert response.json()["generation_models"] == [
             "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
             "gemini-3.8-flash",
+            "gemini-4-hydrogen",
         ]
 
 
@@ -163,3 +171,117 @@ def test_provider_rejects_an_unsupported_model(tmp_path) -> None:
         )
         assert response.status_code == 400
         assert response.json()["detail"]["code"] == "unsupported_model"
+
+
+def test_discovered_model_can_be_selected_saved_and_tested(tmp_path) -> None:
+    tested_models: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1beta/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "models/gemini-9-experimental",
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                        {
+                            "name": "models/gemini-3.8-flash",
+                            "supportedGenerationMethods": ["generateContent"],
+                        },
+                    ]
+                },
+            )
+        tested_models.append(json.loads(request.content)["model"])
+        return success_handler(request)
+
+    client, _ = make_client(tmp_path, handler)
+    with client:
+        saved = client.put(
+            "/provider/settings",
+            headers=HEADERS,
+            json={
+                "generation_model": "gemini-3.8-flash",
+                "checker_model": "gemini-3.5-flash-lite",
+                "free_tier_acknowledged": True,
+                "api_key": "secret-key",
+            },
+        )
+        assert saved.status_code == 200
+
+        models = client.get("/provider/models", headers=HEADERS)
+        assert models.status_code == 200
+        assert "gemini-9-experimental" in models.json()["generation_models"]
+
+        selected = client.put(
+            "/provider/settings",
+            headers=HEADERS,
+            json={
+                "generation_model": "gemini-9-experimental",
+                "checker_model": "gemini-3.5-flash-lite",
+                "free_tier_acknowledged": True,
+            },
+        )
+        assert selected.status_code == 200
+        assert selected.json()["generation_model"] == "gemini-9-experimental"
+
+        tested = client.post("/provider/settings/test", headers=HEADERS)
+        assert tested.status_code == 200
+        assert tested.json()["model"] == "gemini-9-experimental"
+        assert tested_models == ["gemini-9-experimental"]
+
+
+def test_provider_error_response_excludes_credentials_and_source_text(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json=[
+                {
+                    "error": {
+                        "code": 400,
+                        "message": (
+                            "secret-key and private source text appeared in the provider message"
+                        ),
+                        "status": "INVALID_ARGUMENT",
+                        "details": [
+                            {
+                                "fieldViolations": [
+                                    {
+                                        "field": "secret-key",
+                                        "description": "private source text",
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                }
+            ],
+        )
+
+    client, _ = make_client(tmp_path, handler)
+    with client:
+        saved = client.put(
+            "/provider/settings",
+            headers=HEADERS,
+            json={
+                "generation_model": "gemini-3.8-flash",
+                "checker_model": "gemini-3.5-flash-lite",
+                "free_tier_acknowledged": True,
+                "api_key": "secret-key",
+            },
+        )
+        assert saved.status_code == 200
+
+        tested = client.post("/provider/settings/test", headers=HEADERS)
+        assert tested.status_code == 400
+        body = tested.text
+        assert "secret-key" not in body
+        assert "private source text" not in body
+        assert "INVALID_ARGUMENT" not in body
+        assert "provider rejected the request" in body.lower()
+
+        usage = client.get("/provider/usage", headers=HEADERS)
+        assert usage.status_code == 200
+        assert usage.json()[0]["outcome"] == "failed"
+        assert usage.json()[0]["error_code"] == "provider_rejected"

@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import json
+import time
 from typing import Any
 
 import httpx
@@ -19,6 +21,7 @@ def call(client: GeminiClient, **overrides):
         "max_output_tokens": 128,
         "timeout_seconds": 5,
         "attempts": 1,
+        "deadline_seconds": 5,
         "request_id": "local-request",
     }
     values.update(overrides)
@@ -65,7 +68,8 @@ def test_generate_uses_interactions_contract_and_parses_usage() -> None:
     assert body["response_format"]["type"] == "text"
     assert body["response_format"]["mime_type"] == "application/json"
     assert result.output_text == "Supported answer."
-    assert result.request_id == "interaction-1"
+    assert result.local_request_id == "local-request"
+    assert result.provider_request_id == "interaction-1"
     assert (result.input_tokens, result.output_tokens, result.thought_tokens) == (120, 30, 4)
     assert (result.cached_tokens, result.total_tokens) == (8, 162)
 
@@ -254,6 +258,36 @@ def test_incomplete_or_truncated_response_is_not_accepted() -> None:
     assert failure.value.code == "incomplete_response"
 
 
+def test_incomplete_response_retains_reported_identity_and_tokens() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "provider-partial",
+                "status": "incomplete",
+                "output_text": "truncated",
+                "usage": {
+                    "total_input_tokens": 77,
+                    "total_output_tokens": 9,
+                    "total_thought_tokens": 3,
+                    "total_cached_tokens": 2,
+                    "total_tokens": 91,
+                },
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "incomplete_response"
+    assert failure.value.provider_request_id == "provider-partial"
+    assert failure.value.input_tokens == 77
+    assert failure.value.output_tokens == 9
+    assert failure.value.thought_tokens == 3
+    assert failure.value.cached_tokens == 2
+    assert failure.value.total_tokens == 91
+
+
 def test_retry_delay_honors_provider_directives() -> None:
     header = httpx.Response(429, headers={"retry-after": "60"})
     assert _retry_delay(header) == 60.0
@@ -271,7 +305,7 @@ def test_retry_delay_honors_provider_directives() -> None:
     assert _retry_delay(array_payload) == pytest.approx(12.5)
 
 
-def test_error_array_preserves_google_message_and_status() -> None:
+def test_error_array_maps_to_controlled_text_without_provider_details() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             400,
@@ -279,15 +313,18 @@ def test_error_array_preserves_google_message_and_status() -> None:
                 {
                     "error": {
                         "code": 400,
-                        "message": "Request contains an invalid argument.",
+                        "message": (
+                            "Request contains secret-key and private source text: "
+                            "the patient has a rare diagnosis."
+                        ),
                         "status": "INVALID_ARGUMENT",
                         "details": [
                             {"reason": "INVALID_ARGUMENT"},
                             {
                                 "fieldViolations": [
                                     {
-                                        "field": "generation_config.max_output_tokens",
-                                        "description": "must be greater than zero",
+                                        "field": "source.secret-key",
+                                        "description": "private source text is invalid",
                                     }
                                 ]
                             },
@@ -302,35 +339,53 @@ def test_error_array_preserves_google_message_and_status() -> None:
 
     assert failure.value.code == "provider_rejected"
     text = str(failure.value)
-    assert "INVALID_ARGUMENT" in text
-    assert "Request contains an invalid argument." in text
-    assert "generation_config.max_output_tokens" in text
+    assert "check the selected model and request settings" in text.lower()
+    assert "INVALID_ARGUMENT" not in text
+    assert "secret-key" not in text
+    assert "private source text" not in text
+    assert "generation_config" not in text
 
 
-def test_unstructured_rejection_includes_http_and_google_status() -> None:
+def test_unstructured_rejection_is_controlled_and_does_not_echo_the_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             403,
-            json={"error": {"code": 403, "status": "PERMISSION_DENIED"}},
+            content=(
+                b"private source text and secret-key appeared in the provider body "
+                b"PERMISSION_DENIED"
+            ),
+            headers={"content-type": "text/plain"},
         )
 
     with pytest.raises(ProviderFailure) as failure:
         call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
 
     assert failure.value.code == "provider_rejected"
-    assert "403" in str(failure.value)
-    assert "PERMISSION_DENIED" in str(failure.value)
+    text = str(failure.value)
+    assert "denied access" in text.lower()
+    assert "private source text" not in text
+    assert "secret-key" not in text
+    assert "PERMISSION_DENIED" not in text
 
 
-def test_provider_error_does_not_echo_the_key() -> None:
+def test_provider_error_does_not_echo_the_key_or_source_text() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": {"message": "bad key secret-key"}})
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "bad key secret-key for source private source text",
+                    "details": [{"violations": [{"quotaId": "secret-key-private-source-text"}]}],
+                }
+            },
+        )
 
     with pytest.raises(ProviderFailure) as failure:
         call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
 
     assert failure.value.code == "invalid_credentials"
     assert "secret-key" not in str(failure.value)
+    assert "private source text" not in str(failure.value)
 
 
 def test_list_models_filters_text_models_and_follows_pages() -> None:
@@ -377,6 +432,120 @@ def test_list_models_filters_text_models_and_follows_pages() -> None:
     assert pages == [None, "next-page"]
 
 
+def test_total_deadline_cancels_a_slow_response() -> None:
+    class SlowTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(1)
+            return httpx.Response(200, json={"id": "late", "output_text": "late"})
+
+    started = time.monotonic()
+    with pytest.raises(PaidCallOutcomeUnknown) as failure:
+        call(
+            GeminiClient("secret-key", transport=SlowTransport()),
+            timeout_seconds=5,
+            attempts=1,
+            deadline_seconds=0.05,
+        )
+
+    assert time.monotonic() - started < 0.5
+    assert "total time limit" in str(failure.value)
+
+
+def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    body = b'{"id":"trickle","output_text":"late","usage":{}}'
+
+    async def main() -> None:
+        async def serve(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                )
+                await writer.drain()
+                for index in range(0, len(body), 10):
+                    writer.write(body[index : index + 10])
+                    await writer.drain()
+                    await asyncio.sleep(0.05)
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        sockets = server.sockets
+        assert sockets is not None
+        port = sockets[0].getsockname()[1]
+        started = time.monotonic()
+        try:
+            with pytest.raises(PaidCallOutcomeUnknown) as failure:
+                await GeminiClient(
+                    "secret-key",
+                    base_url=f"http://127.0.0.1:{port}",
+                ).generate(
+                    model="gemini-3.8-flash",
+                    instructions="Use only evidence.",
+                    input_text="Question",
+                    schema=None,
+                    max_output_tokens=10,
+                    timeout_seconds=5,
+                    attempts=1,
+                    deadline_seconds=0.1,
+                    request_id="local-request",
+                )
+        finally:
+            server.close()
+            await server.wait_closed()
+
+        assert time.monotonic() - started < 0.6
+        assert "total time limit" in str(failure.value)
+
+    asyncio.run(main())
+
+
+def test_model_discovery_deadline_covers_pagination() -> None:
+    calls = 0
+
+    class SlowTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return httpx.Response(
+                    200,
+                    json={
+                        "models": [
+                            {
+                                "name": "models/gemini-3.8-flash",
+                                "supportedGenerationMethods": ["generateContent"],
+                            }
+                        ],
+                        "nextPageToken": "next-page",
+                    },
+                )
+            await asyncio.sleep(0.2)
+            return httpx.Response(200, json={"models": []})
+
+    with pytest.raises(PaidCallOutcomeUnknown) as failure:
+        asyncio.run(
+            GeminiClient("secret-key", transport=SlowTransport()).list_models(
+                timeout_seconds=1,
+                deadline_seconds=0.1,
+            )
+        )
+
+    assert "total time limit" in str(failure.value)
+    assert calls == 2
+
+
 def test_count_tokens_uses_the_same_instructions_and_content() -> None:
     seen: dict[str, Any] = {}
 
@@ -409,9 +578,82 @@ def test_empty_model_output_is_invalid() -> None:
     assert failure.value.code == "invalid_response"
 
 
-def test_cancellation_is_not_a_completed_call() -> None:
+def test_cancellation_during_a_request_is_possibly_processed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise asyncio.CancelledError
 
-    with pytest.raises(ProviderCancelled):
+    with pytest.raises(ProviderCancelled) as failure:
         call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.possibly_processed is True
+    assert failure.value.code == "cancelled_outcome_unknown"
+
+
+def test_cancellation_during_retry_wait_is_known_unsent(monkeypatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"retry-after": "0"},
+            json={"error": {"message": "slow down"}},
+        )
+
+    async def cancel(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", cancel)
+    with pytest.raises(ProviderCancelled) as failure:
+        call(
+            GeminiClient("secret-key", transport=httpx.MockTransport(handler)),
+            attempts=2,
+        )
+
+    assert failure.value.possibly_processed is False
+    assert failure.value.code == "cancelled"
+
+
+def test_total_deadline_rejects_a_retry_wait_past_the_limit() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            429,
+            headers={"retry-after": "3600"},
+            json={"error": {"message": "slow down"}},
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(
+            GeminiClient("secret-key", transport=httpx.MockTransport(handler)),
+            timeout_seconds=5,
+            attempts=3,
+            deadline_seconds=2,
+        )
+
+    assert failure.value.code == "provider_timeout"
+    assert calls == 1
+    assert "total time limit" in str(failure.value)
+
+
+def test_total_deadline_caps_the_http_timeout_budget() -> None:
+    class TimeoutRecordingTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.timeout: dict[str, float] | None = None
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            timeout = request.extensions.get("timeout")
+            self.timeout = timeout if isinstance(timeout, dict) else None
+            return httpx.Response(200, json={"id": "ok", "output_text": "ok"})
+
+    transport = TimeoutRecordingTransport()
+    call(
+        GeminiClient("secret-key", transport=transport),
+        timeout_seconds=5,
+        attempts=1,
+        deadline_seconds=0.01,
+    )
+
+    assert transport.timeout is not None
+    assert transport.timeout["read"] <= 0.01
+    assert transport.timeout["connect"] <= 0.01

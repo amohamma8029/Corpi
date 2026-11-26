@@ -4,16 +4,57 @@ from __future__ import annotations
 
 
 class ProviderFailure(Exception):
-    """A sanitized, actionable provider or credential failure."""
+    """A sanitized, actionable provider or credential failure.
 
-    def __init__(self, code: str, message: str, *, status: int = 502) -> None:
+    Messages are controlled text assembled by Corpi. Raw provider response text,
+    provider field names, quota identifiers, and credentials never pass through
+    this exception. Token counts and the provider request id are retained when
+    the provider reported them, including for incomplete results.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int = 502,
+        provider_request_id: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        thought_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        total_tokens: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
+        self.provider_request_id = provider_request_id
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.thought_tokens = thought_tokens
+        self.cached_tokens = cached_tokens
+        self.total_tokens = total_tokens
 
 
 class ProviderCancelled(ProviderFailure):
-    """An interactive call was stopped before a usable result existed."""
+    """An interactive call was stopped.
 
-    def __init__(self, message: str = "The provider call was stopped.") -> None:
-        super().__init__("cancelled", message, status=499)
+    ``possibly_processed`` is true only when cancellation happened after an HTTP
+    attempt began, where Corpi cannot prove the provider never received it.
+    """
+
+    def __init__(self, *, possibly_processed: bool = False) -> None:
+        self.possibly_processed = possibly_processed
+        if possibly_processed:
+            super().__init__(
+                "cancelled_outcome_unknown",
+                "The provider call was stopped after it was sent; "
+                "the provider may still process it.",
+                status=499,
+            )
+        else:
+            super().__init__(
+                "cancelled",
+                "The provider call was stopped before it was sent.",
+                status=499,
+            )

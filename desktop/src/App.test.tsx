@@ -180,6 +180,7 @@ beforeEach(() => {
     provider_id: "google-gemini",
     model: "gemini-3.8-flash",
     request_id: "request-1",
+    provider_request_id: "provider-request-1",
     input_tokens: 4,
     output_tokens: 1,
     total_tokens: 5,

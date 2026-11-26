@@ -123,6 +123,8 @@ class ProviderSettings:
 class ModelCallUsage:
     id: str
     request_id: str
+    provider_request_id: str | None
+    parent_request_id: str | None
     call_type: str
     provider_id: str
     model: str
