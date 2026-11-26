@@ -76,7 +76,8 @@ CREATE TABLE qa_attempts (
 ) STRICT;
 
 -- These are recorded choices, not dependencies that keep an original alive.
--- Removing a source version removes this snapshot row, not its question.
+-- Validate ownership at capture; after expiry the opaque IDs still identify
+-- what was selected but do not prevent deletion or make it available again.
 CREATE TABLE qa_attempt_sources (
     attempt_id TEXT NOT NULL,
     notebook_id TEXT NOT NULL,
@@ -93,10 +94,63 @@ CREATE TABLE qa_attempt_sources (
     ),
     PRIMARY KEY(attempt_id,source_id),
     UNIQUE(attempt_id,ordinal),
-    FOREIGN KEY(attempt_id,notebook_id) REFERENCES qa_attempts(id,notebook_id) ON DELETE CASCADE,
-    FOREIGN KEY(source_id,notebook_id) REFERENCES sources(id,notebook_id) ON DELETE CASCADE,
-    FOREIGN KEY(source_version_id,source_id)
-        REFERENCES source_versions(id,source_id) ON DELETE CASCADE
+    FOREIGN KEY(attempt_id,notebook_id) REFERENCES qa_attempts(id,notebook_id) ON DELETE CASCADE
 ) STRICT;
-CREATE INDEX qa_attempt_sources_source_idx ON qa_attempt_sources(source_id,notebook_id);
-CREATE INDEX qa_attempt_sources_version_idx ON qa_attempt_sources(source_version_id,source_id);
+CREATE INDEX qa_attempt_sources_source_idx ON qa_attempt_sources(source_id,import_id);
+CREATE INDEX qa_attempt_sources_extraction_idx ON qa_attempt_sources(extraction_version_id);
+
+CREATE TRIGGER qa_attempt_sources_check_capture
+BEFORE INSERT ON qa_attempt_sources
+WHEN NOT EXISTS(
+    SELECT 1 FROM sources s
+    JOIN pdf_imports p ON p.source_id=s.id AND p.source_version_id=NEW.source_version_id
+    JOIN extraction_versions e ON e.source_id=s.id AND e.source_version_id=p.source_version_id
+    WHERE s.id=NEW.source_id AND s.notebook_id=NEW.notebook_id
+      AND p.id=NEW.import_id AND e.id=NEW.extraction_version_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'question selection does not belong to this notebook and PDF version');
+END;
+
+CREATE TRIGGER qa_attempt_sources_are_immutable
+BEFORE UPDATE ON qa_attempt_sources
+BEGIN
+    SELECT RAISE(ABORT, 'question selection is immutable');
+END;
+
+-- These notifications belong to the source writer's transaction. If a
+-- publication or review change rolls back, the interruption rolls back too.
+CREATE TRIGGER qa_interrupt_on_pdf_replacement
+AFTER UPDATE OF current_import_id ON source_pdf_state
+WHEN OLD.current_import_id IS NOT NULL
+     AND NEW.current_import_id <> OLD.current_import_id
+BEGIN
+    UPDATE qa_attempts SET status='interrupted',reason_code='source_replaced',
+           updated_at=NEW.updated_at
+    WHERE status IN ('accepted','running') AND id IN (
+        SELECT attempt_id FROM qa_attempt_sources
+        WHERE source_id=NEW.source_id AND import_id=OLD.current_import_id
+    );
+END;
+
+CREATE TRIGGER qa_interrupt_on_review_withdrawal
+AFTER UPDATE OF generation ON extraction_reviews
+WHEN NEW.generation <> OLD.generation
+BEGIN
+    UPDATE qa_attempts SET status='interrupted',reason_code='review_withdrawn',
+           updated_at=NEW.updated_at
+    WHERE status IN ('accepted','running') AND id IN (
+        SELECT attempt_id FROM qa_attempt_sources
+        WHERE extraction_version_id=OLD.extraction_version_id
+    );
+END;
+
+CREATE TRIGGER qa_interrupt_on_source_trash
+AFTER INSERT ON source_trash
+BEGIN
+    UPDATE qa_attempts SET status='interrupted',reason_code='source_trashed',
+           updated_at=NEW.updated_at
+    WHERE status IN ('accepted','running') AND id IN (
+        SELECT attempt_id FROM qa_attempt_sources WHERE source_id=NEW.source_id
+    );
+END;

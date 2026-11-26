@@ -39,6 +39,9 @@ class ConversationMessage:
     role: str
     user_text: str | None
     created_at: str
+    attempt_id: str | None
+    attempt_status: str | None
+    attempt_reason_code: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,8 +106,11 @@ class ConversationStore:
         with self._persistence._transaction(write=False) as connection:
             row = _require_conversation(connection, notebook_id, conversation_id)
             messages = connection.execute(
-                """SELECT id,ordinal,role,user_text,created_at FROM qa_messages
-                   WHERE conversation_id=? ORDER BY ordinal""",
+                """SELECT m.id,m.ordinal,m.role,m.user_text,m.created_at,
+                          q.id,q.status,q.reason_code
+                   FROM qa_messages m LEFT JOIN qa_attempts q
+                       ON q.question_message_id=m.id AND q.conversation_id=m.conversation_id
+                   WHERE m.conversation_id=? ORDER BY m.ordinal""",
                 (conversation_id,),
             )
             return ConversationView(

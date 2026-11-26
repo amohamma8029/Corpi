@@ -7,9 +7,11 @@ from threading import Barrier
 
 import pytest
 from pdf_fixtures import native_text_pdf
+from test_import_cancellation import partial_pdf
 from test_import_expiry import publish_import
+from test_replacement_safety import finish_extraction, upload
 from test_replacement_safety import original as original
-from test_replacement_safety import upload
+from test_search_safety import prepare
 
 from core.ingest.service import PdfIngestService
 from core.persistence.database import Database, DatabaseConfig
@@ -235,8 +237,9 @@ def test_stale_selection_cannot_partially_accept_and_selected_only_does_not_pin_
         notebook, conversation.id, attempt.id, owner_instance_id=attempt.owner_instance_id
     )
     saved, sources = questions.load_attempt(notebook, conversation.id, attempt.id)
-    assert saved.id == attempt.id and sources == ()
-    assert (saved.status, saved.reason_code) == ("interrupted", "source_changed")
+    assert saved.id == attempt.id
+    assert [pdf.source_version_id for pdf in sources] == [first.source_version_id]
+    assert (saved.status, saved.reason_code) == ("interrupted", "source_replaced")
     assert not submit(first, sub).created
     assert len(questions.open_conversation(notebook, conversation.id).messages) == 2
     with store.database.connect() as connection:
@@ -328,3 +331,100 @@ def test_restart_interrupts_accepted_and_running_attempts_without_replaying(stor
         assert not questions.begin_attempt(
             notebook, conversation.id, original_attempt.id, owner_instance_id=previous_owner
         )
+    reopened = questions.open_conversation(notebook, conversation.id)
+    assert [message.attempt_id for message in reopened.messages] == [accepted.id, started.id]
+    assert [message.attempt_status for message in reopened.messages] == [
+        "interrupted",
+        "interrupted",
+    ]
+    assert {message.attempt_reason_code for message in reopened.messages} == {"core_restarted"}
+
+
+@pytest.mark.parametrize("change", ["source_replaced", "source_trashed"])
+def test_source_change_interrupts_only_affected_active_questions(store, original, change):
+    notebook, client, old = original
+    questions = ConversationStore(store)
+    conversation, selected = new_conversation_with_selection(questions, notebook, old.item, "Work")
+    other_content = native_text_pdf("Keep questions about an unrelated source running.")
+    other = publish_import(store, upload(client, notebook, other_content), other_content)
+    unrelated, other_selection = new_conversation_with_selection(
+        questions, notebook, other.item, "Other work"
+    )
+    owner = f"core-{new_id()}"
+
+    def accept(thread, selection):
+        return questions.submit_question(
+            notebook,
+            thread.id,
+            submission_id=new_id(),
+            owner_instance_id=owner,
+            text="What do the sources say?",
+            picker_revision=thread.picker_revision,
+            selected=[selection],
+        ).attempt
+
+    running, waiting, stopped = (accept(conversation, selected) for _ in range(3))
+    other_attempt = accept(unrelated, other_selection)
+    assert questions.begin_attempt(notebook, conversation.id, running.id, owner_instance_id=owner)
+    assert questions.begin_attempt(
+        notebook, unrelated.id, other_attempt.id, owner_instance_id=owner
+    )
+    questions.stop_attempt(notebook, conversation.id, stopped.id)
+    if change == "source_replaced":
+        replacement = native_text_pdf("This replacement must not change a running question's PDF.")
+        candidate = upload(client, notebook, replacement, selected.source_id)
+        assert questions.load_attempt(notebook, conversation.id, running.id)[0].status == "running"
+        publish_import(store, candidate, replacement)
+    else:
+        store.trash_source(selected.source_id, "2099-01-01T00:00:00.000000Z")
+
+    for original_attempt in (running, waiting):
+        current, sources = questions.load_attempt(notebook, conversation.id, original_attempt.id)
+        assert (current.status, current.reason_code) == ("interrupted", change)
+        assert sources[0].source_version_id == selected.source_version_id
+        assert not questions.begin_attempt(
+            notebook, conversation.id, original_attempt.id, owner_instance_id=owner
+        )
+    assert questions.load_attempt(notebook, conversation.id, stopped.id)[0].status == "stopped"
+    assert questions.load_attempt(notebook, unrelated.id, other_attempt.id)[0].status == "running"
+
+
+def test_withdrawn_review_cannot_revive_question_after_reconfirmation(store, original):
+    notebook, client, old = original
+    item = store.load_pdf_import(upload(client, notebook, partial_pdf(), old.item.source_id))
+    extraction = finish_extraction(store, item.id)
+
+    def publish_reviewed(generation):
+        store.record_review_decision(extraction, "confirmed", generation)
+        with store.database.connect() as connection:
+            job = connection.execute(
+                "SELECT job_id FROM search_handoffs WHERE extraction_version_id=? "
+                "AND review_generation=?",
+                (extraction, generation),
+            ).fetchone()[0]
+        index, guard = prepare(store, job)
+        store.publish_readiness(job, item.source_id, item.source_version_id, [index], guard=guard)
+        store.finish_step_attempt(job, "prepare", guard.expected_attempt_number, None)
+        store.finish_job(job, "completed")
+        return index
+
+    index = publish_reviewed(1)
+    questions = ConversationStore(store)
+    conversation, selection = new_conversation_with_selection(questions, notebook, item, "Review")
+    owner = f"core-{new_id()}"
+    attempt = questions.submit_question(
+        notebook,
+        conversation.id,
+        submission_id=new_id(),
+        owner_instance_id=owner,
+        text="Which pages are readable?",
+        picker_revision=conversation.picker_revision,
+        selected=[selection],
+    ).attempt
+    assert questions.begin_attempt(notebook, conversation.id, attempt.id, owner_instance_id=owner)
+
+    reopened = store.reopen_review(extraction)
+    invalidated = questions.load_attempt(notebook, conversation.id, attempt.id)[0]
+    assert (invalidated.status, invalidated.reason_code) == ("interrupted", "review_withdrawn")
+    assert publish_reviewed(reopened.generation) == index
+    assert questions.load_attempt(notebook, conversation.id, attempt.id)[0] == invalidated
