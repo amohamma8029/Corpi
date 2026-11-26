@@ -39,7 +39,8 @@ def lookup_saved_pdf_passage(
     """Resolve a canonical reference from the caller's notebook read snapshot.
 
     The caller must first authorize the saved answer or search result that
-    supplied the reference. This checks only passage and original availability;
+    supplied the reference. Search or extraction retries can change readiness
+    without removing the saved passage or original. This checks availability;
     it neither verifies PDF bytes nor guesses whether a box can be highlighted.
     """
     row = connection.execute(
@@ -51,7 +52,6 @@ def lookup_saved_pdf_passage(
            JOIN pdf_imports pdf ON pdf.source_version_id=v.id AND pdf.source_id=s.id
            JOIN managed_files f ON f.id=v.managed_file_id
            WHERE s.notebook_id=? AND p.source_id=? AND p.source_version_id=? AND p.id=?
-             AND pdf.state='ready'
              AND NOT EXISTS(SELECT 1 FROM source_trash t WHERE t.source_id=s.id)
              AND NOT EXISTS(SELECT 1 FROM pdf_import_trash t WHERE t.import_id=pdf.id)
              AND NOT EXISTS(SELECT 1 FROM managed_file_removals r WHERE r.managed_file_id=f.id)""",

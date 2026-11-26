@@ -4,11 +4,13 @@ from dataclasses import replace
 
 import pytest
 from pdf_fixtures import native_text_pdf
+from test_import_cancellation import partial_pdf
 from test_import_expiry import publish_import
 from test_model_switch import complete, mark_installed, pending_jobs
+from test_replacement_safety import finish_extraction, upload
 from test_replacement_safety import original as original
-from test_replacement_safety import upload
 from test_search_expiry import reopen
+from test_search_safety import prepare
 
 from core.ingest.service import PdfIngestService
 from core.persistence.models import new_id
@@ -84,6 +86,53 @@ def test_lookup_checks_notebook_and_passage_offsets_without_guessing(store, orig
     with pytest.raises(SavedPassageUnavailable):
         lookup(store, notebook, replace(reference, passage_id=new_id()))
     assert lookup(store, notebook, replace(reference, text_range=(0, 8))).quote == saved.quote[:8]
+
+
+def test_failed_reindex_after_review_does_not_break_saved_citation(store, original):
+    notebook, client, old = original
+    pdf = partial_pdf()
+    item = store.load_pdf_import(upload(client, notebook, pdf, old.item.source_id))
+    extraction = finish_extraction(store, item.id)
+
+    def confirm(generation):
+        store.record_review_decision(extraction, "confirmed", generation)
+        with store.database.connect() as connection:
+            return connection.execute(
+                "SELECT job_id FROM search_handoffs WHERE extraction_version_id=? "
+                "AND review_generation=?",
+                (extraction, generation),
+            ).fetchone()[0]
+
+    job = confirm(1)
+    index, guard = prepare(store, job)
+    store.publish_readiness(job, item.source_id, item.source_version_id, [index], guard=guard)
+    store.finish_step_attempt(job, "prepare", guard.expected_attempt_number, None)
+    store.finish_job(job, "completed")
+    passage = store.load_extraction_report(extraction).passages[0]
+    reference = SavedPassageRef(item.source_id, item.source_version_id, passage.id)
+    saved = lookup(store, notebook, reference)
+
+    reopened_review = store.reopen_review(extraction)
+    rebuild_job = confirm(reopened_review.generation)
+    store.finish_job(rebuild_job, "failed", "controlled search rebuild failure")
+    assert store.load_pdf_import(item.id).state == "failed"
+    content, _ = PdfIngestService(store, "saved-citation-test").read_verified_import(item.id)
+    assert content == pdf
+    assert lookup(store, notebook, reference) == saved
+
+
+def test_cancelled_reprocessing_does_not_break_citation_to_older_pdf(store, original):
+    notebook, client, old = original
+    reference = original_reference(store, old)
+    saved = lookup(store, notebook, reference)
+    replace_pdf(store, client, notebook, old.item.source_id)
+
+    retry_job = store.retry_pdf_import_processing(old.item.id)
+    assert store.cancel_pdf_import_processing(old.item.id) == retry_job
+    assert store.load_pdf_import(old.item.id).failure_code == "processing_cancelled"
+    content, _ = PdfIngestService(store, "saved-citation-test").read_verified_import(old.item.id)
+    assert content == old.content
+    assert lookup(store, notebook, reference) == saved
 
 
 @pytest.mark.parametrize("trash", ["older_pdf", "whole_source"])
