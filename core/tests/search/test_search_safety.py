@@ -38,7 +38,7 @@ def native_hits(store, notebook, versions):
     return word, vector
 
 
-def prepare(store, job_id, *, profile_id="minilm-en"):
+def prepare(store, job_id, *, profile_id="minilm-en", settings=None):
     job = store.load_job_by_id(job_id)
     store.claim_job(job_id, "safety-tests")
     attempt = store.start_step_attempt(job_id, "prepare")
@@ -47,12 +47,21 @@ def prepare(store, job_id, *, profile_id="minilm-en"):
     report = store.load_extraction_report(job.extraction_version_id)
     chunks = make_chunks(eligible_passages(report), profile, lambda _: 1, lambda text: text)
     storage = SearchStorage(store)
-    index = storage.create_generation(
-        job_id, guard, profile, chunks, {"batch_size": 32, "separator": profile.separator}
-    )
+    if settings is None:
+        settings = {"batch_size": 32, "separator": profile.separator}
+    index = storage.create_generation(job_id, guard, profile, chunks, settings)
     graph = store.load_index(index)
+    chunk_ids = [c.id for c in graph.chunks]
+    with store.database.connect() as connection:
+        _, input_hash = storage.batch_inputs(connection, index, chunk_ids)
     storage.commit_batch(
-        job_id, guard, index, 0, [c.id for c in graph.chunks], [VECTOR for _ in graph.chunks]
+        job_id,
+        guard,
+        index,
+        0,
+        chunk_ids,
+        [VECTOR for _ in graph.chunks],
+        search_input_sha256=input_hash,
     )
     storage.finish_components(job_id, guard, index)
     store.commit_index_step(

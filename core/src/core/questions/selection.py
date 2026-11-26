@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from core.search.representation import selected as selected_search_representation
+
 SelectionFailure = Literal[
     "no_sources_selected",
     "no_ready_sources",
@@ -40,12 +42,13 @@ class ReadyQuestionPdf:
 
 
 # Match M1 search eligibility, with the additional requirement that the ready
-# version is the current usable PDF. Pending imports and pending model choices
-# have separate pointers and must not replace any of these identities.
+# version is the current PDF. The readiness publication records whether it can
+# be searched; retrying processing can change pdf.state without replacing that
+# publication. Pending imports and model choices must not change the selection.
 _READY_PDFS = """
     SELECT s.id AS source_id, ready.source_version_id, pdf.id AS import_id,
            i.extraction_version_id, r.generation AS review_generation,
-           g.manifest_id, i.id AS index_version_id
+           g.manifest_id, i.id AS index_version_id, g.settings_json
     FROM sources s
     JOIN source_pdf_state p ON p.source_id=s.id
     JOIN pdf_imports pdf ON pdf.id=p.current_import_id AND pdf.source_id=s.id
@@ -58,7 +61,7 @@ _READY_PDFS = """
     JOIN notebook_profiles n ON n.notebook_id=s.notebook_id AND n.active_manifest_id=g.manifest_id
     JOIN extraction_outcomes o ON o.extraction_version_id=i.extraction_version_id
     LEFT JOIN extraction_reviews r ON r.extraction_version_id=i.extraction_version_id
-    WHERE s.notebook_id=? AND pdf.state='ready'
+    WHERE s.notebook_id=?
       AND (o.outcome='complete' OR (o.outcome='partial' AND r.state='confirmed'))
       AND i.extraction_version_id=(SELECT e.id FROM extraction_versions e
           WHERE e.source_version_id=i.source_version_id
@@ -68,6 +71,17 @@ _READY_PDFS = """
       AND NOT EXISTS(SELECT 1 FROM job_status j WHERE j.job_id=ready.published_by_job_id
           AND (j.status IN ('failed','cancelled') OR j.superseded_by_job_id IS NOT NULL))
 """
+
+
+def _supports_saved_search_settings(settings_json: str) -> bool:
+    try:
+        settings = json.loads(settings_json)
+        if not isinstance(settings, dict):
+            return False
+        selected_search_representation(settings)
+    except ValueError:
+        return False
+    return True
 
 
 def resolve_question_selection(
@@ -112,6 +126,10 @@ def resolve_question_selection(
         current = matches[0]
         if current["source_version_id"] != pdf.source_version_id:
             raise QuestionSelectionError("selected_version_changed", pdf.source_id)
+        # A publication can survive a runtime upgrade that makes its stored
+        # representation unreadable. Use the same rule check as notebook search.
+        if any(not _supports_saved_search_settings(row["settings_json"]) for row in matches):
+            raise QuestionSelectionError("selected_source_unavailable", pdf.source_id)
         result.append(
             ReadyQuestionPdf(
                 source_id=pdf.source_id,
