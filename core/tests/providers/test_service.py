@@ -73,7 +73,12 @@ def success_handler(request: httpx.Request) -> httpx.Response:
         200,
         json={
             "id": "provider-result",
-            "output_text": "Grounded answer.",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "Grounded answer."}],
+                }
+            ],
             "usage": {
                 "total_input_tokens": 80,
                 "total_output_tokens": 20,
@@ -397,7 +402,7 @@ def test_cancel_before_retry_is_recorded_as_cancelled(
     assert usage[0].error_code == "cancelled"
 
 
-def test_cancelled_client_close_after_reply_finalizes_completed(
+def test_cancelled_client_close_after_reply_finalizes_completed_then_cancels(
     store: PersistenceStore,
 ) -> None:
     class CancelCloseTransport(httpx.AsyncBaseTransport):
@@ -408,22 +413,22 @@ def test_cancelled_client_close_after_reply_finalizes_completed(
             raise asyncio.CancelledError
 
     service = service_with_transport(store, CancelCloseTransport())
-    result = asyncio.run(
-        service.complete(
-            "generation",
-            instructions="Use evidence.",
-            input_text="Question",
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
         )
-    )
 
-    assert result.output_text == "Grounded answer."
     usage = service.usage()
     assert usage[0].outcome == "completed"
     assert usage[0].provider_request_id == "provider-result"
     assert usage[0].finished_at is not None
 
 
-def test_cancelled_client_close_after_no_reply_finalizes_unknown(
+def test_cancelled_client_close_after_no_reply_finalizes_unknown_then_cancels(
     store: PersistenceStore,
 ) -> None:
     class CancelRequestAndCloseTransport(httpx.AsyncBaseTransport):
@@ -434,7 +439,7 @@ def test_cancelled_client_close_after_no_reply_finalizes_unknown(
             raise asyncio.CancelledError
 
     service = service_with_transport(store, CancelRequestAndCloseTransport())
-    with pytest.raises(ProviderCancelled) as failure:
+    with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             service.complete(
                 "generation",
@@ -443,10 +448,73 @@ def test_cancelled_client_close_after_no_reply_finalizes_unknown(
             )
         )
 
-    assert failure.value.possibly_processed is True
     usage = service.usage()
     assert usage[0].outcome == "unknown"
     assert usage[0].error_code == "cancelled_outcome_unknown"
+    assert usage[0].finished_at is not None
+
+
+def test_cancelled_client_close_after_provider_failure_finalizes_failed(
+    store: PersistenceStore,
+) -> None:
+    class CancelCloseFailureTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    service = service_with_transport(store, CancelCloseFailureTransport())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
+        )
+
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "provider_rejected"
+    assert usage[0].finished_at is not None
+
+
+def test_actual_task_cancellation_during_close_records_completed(
+    store: PersistenceStore,
+) -> None:
+    class SlowCloseTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.closing = asyncio.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return success_handler(request)
+
+        async def aclose(self) -> None:
+            self.closing.set()
+            await asyncio.sleep(10)
+
+    transport = SlowCloseTransport()
+    service = service_with_transport(store, transport)
+
+    async def main() -> None:
+        task = asyncio.create_task(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
+        )
+        await asyncio.wait_for(transport.closing.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+    usage = service.usage()
+    assert usage[0].outcome == "completed"
+    assert usage[0].provider_request_id == "provider-result"
     assert usage[0].finished_at is not None
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -16,7 +17,11 @@ from core.persistence.models import (
 )
 from core.persistence.store import PersistenceStore
 from core.providers.credentials import CredentialStore
-from core.providers.errors import ProviderCancelled, ProviderFailure
+from core.providers.errors import (
+    ProviderCancelled,
+    ProviderCleanupCancelled,
+    ProviderFailure,
+)
 from core.providers.gemini import GeminiClient
 from core.providers.protocol import JSONSchema, ProviderCallResult
 
@@ -310,6 +315,44 @@ class ProviderService:
                 deadline_seconds=deadline_seconds,
                 request_id=request_id,
             )
+        except ProviderCleanupCancelled as stopped:
+            if stopped.result is not None:
+                self._finalize_usage(
+                    usage_id,
+                    outcome="completed",
+                    error_code=None,
+                    details=stopped.result,
+                )
+            elif stopped.failure is not None:
+                failure = stopped.failure
+                if isinstance(failure, ProviderCancelled):
+                    self._finalize_usage(
+                        usage_id,
+                        outcome="unknown" if failure.possibly_processed else "cancelled",
+                        error_code=failure.code,
+                    )
+                else:
+                    self._finalize_usage(
+                        usage_id,
+                        outcome="failed",
+                        error_code=failure.code,
+                        details=failure,
+                    )
+            elif stopped.paid_outcome_unknown:
+                self._finalize_usage(
+                    usage_id,
+                    outcome="unknown",
+                    error_code="paid_outcome_unknown",
+                )
+            else:
+                self._finalize_usage(
+                    usage_id,
+                    outcome="unknown",
+                    error_code=(
+                        "cancelled_outcome_unknown" if stopped.possibly_processed else "cancelled"
+                    ),
+                )
+            raise asyncio.CancelledError from None
         except ProviderCancelled as error:
             self._finalize_usage(
                 usage_id,
@@ -330,6 +373,13 @@ class ProviderService:
                 outcome="failed",
                 error_code=error.code,
                 details=error,
+            )
+            raise
+        except asyncio.CancelledError:
+            self._finalize_usage(
+                usage_id,
+                outcome="unknown",
+                error_code="call_cancelled",
             )
             raise
         except Exception:

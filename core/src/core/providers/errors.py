@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.providers.protocol import ProviderCallResult
+
 
 class ProviderFailure(Exception):
     """A sanitized, actionable provider or credential failure.
@@ -58,3 +60,21 @@ class ProviderCancelled(ProviderFailure):
                 "The provider call was stopped before it was sent.",
                 status=499,
             )
+
+
+class ProviderCleanupCancelled(Exception):
+    """Stop arrived while the HTTP client was closing after an outcome was known."""
+
+    def __init__(
+        self,
+        *,
+        result: ProviderCallResult | None = None,
+        failure: ProviderFailure | None = None,
+        paid_outcome_unknown: bool = False,
+        possibly_processed: bool = False,
+    ) -> None:
+        super().__init__("The provider call was stopped while its client closed.")
+        self.result = result
+        self.failure = failure
+        self.paid_outcome_unknown = paid_outcome_unknown
+        self.possibly_processed = possibly_processed

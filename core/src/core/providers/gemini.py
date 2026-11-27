@@ -12,7 +12,11 @@ from typing import Any
 import httpx
 
 from core.jobs.runner import PaidCallOutcomeUnknown
-from core.providers.errors import ProviderCancelled, ProviderFailure
+from core.providers.errors import (
+    ProviderCancelled,
+    ProviderCleanupCancelled,
+    ProviderFailure,
+)
 from core.providers.protocol import JSONSchema, ProviderCallResult
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -91,6 +95,21 @@ class _Reported:
             ),
             total_tokens=_optional_int(usage.get("total_tokens")),
         )
+
+
+class _DataCleanupCancelled(Exception):
+    def __init__(
+        self,
+        *,
+        data: dict[str, Any] | None = None,
+        failure: ProviderFailure | None = None,
+        paid_outcome_unknown: bool = False,
+        possibly_processed: bool = False,
+    ) -> None:
+        self.data = data
+        self.failure = failure
+        self.paid_outcome_unknown = paid_outcome_unknown
+        self.possibly_processed = possibly_processed
 
 
 def _failure(
@@ -202,13 +221,32 @@ class GeminiClient:
                 "mime_type": "application/json",
                 "schema": schema,
             }
-        data = await self._post_with_retries(
-            "/interactions",
-            body,
-            timeout_seconds=timeout_seconds,
-            attempts=attempts,
-            deadline_seconds=deadline_seconds,
-        )
+        try:
+            data = await self._post_with_retries(
+                "/interactions",
+                body,
+                timeout_seconds=timeout_seconds,
+                attempts=attempts,
+                deadline_seconds=deadline_seconds,
+            )
+        except _DataCleanupCancelled as stopped:
+            if stopped.data is not None:
+                try:
+                    result = self._result(stopped.data, local_request_id=request_id)
+                except ProviderFailure as error:
+                    raise ProviderCleanupCancelled(
+                        failure=error,
+                        possibly_processed=stopped.possibly_processed,
+                    ) from None
+                raise ProviderCleanupCancelled(
+                    result=result,
+                    possibly_processed=stopped.possibly_processed,
+                ) from None
+            raise ProviderCleanupCancelled(
+                failure=stopped.failure,
+                paid_outcome_unknown=stopped.paid_outcome_unknown,
+                possibly_processed=stopped.possibly_processed,
+            ) from None
         return self._result(data, local_request_id=request_id)
 
     async def count_tokens(
@@ -222,13 +260,16 @@ class GeminiClient:
         deadline_seconds: float | None = None,
     ) -> int:
         text = input_text if not instructions else f"{instructions}\n\n{input_text}"
-        data = await self._post_with_retries(
-            f"/models/{model}:countTokens",
-            {"contents": [{"parts": [{"text": text}]}]},
-            timeout_seconds=timeout_seconds,
-            attempts=attempts,
-            deadline_seconds=deadline_seconds,
-        )
+        try:
+            data = await self._post_with_retries(
+                f"/models/{model}:countTokens",
+                {"contents": [{"parts": [{"text": text}]}]},
+                timeout_seconds=timeout_seconds,
+                attempts=attempts,
+                deadline_seconds=deadline_seconds,
+            )
+        except _DataCleanupCancelled:
+            raise asyncio.CancelledError from None
         value = data.get("totalTokens", data.get("total_tokens"))
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise _failure("invalid_response", status=502)
@@ -255,14 +296,17 @@ class GeminiClient:
             params: dict[str, str | int] = {"pageSize": 1000}
             if page_token:
                 params["pageToken"] = page_token
-            data = await self._request_with_retries(
-                "GET",
-                "/models",
-                params=params,
-                timeout_seconds=timeout_seconds,
-                attempts=attempts,
-                deadline_seconds=remaining,
-            )
+            try:
+                data = await self._request_with_retries(
+                    "GET",
+                    "/models",
+                    params=params,
+                    timeout_seconds=timeout_seconds,
+                    attempts=attempts,
+                    deadline_seconds=remaining,
+                )
+            except _DataCleanupCancelled:
+                raise asyncio.CancelledError from None
             items = data.get("models")
             if not isinstance(items, list):
                 raise _failure("invalid_response", status=502)
@@ -318,6 +362,10 @@ class GeminiClient:
             base_url=self._base_url,
             transport=self._transport,
         )
+        outcome: dict[str, Any] | None = None
+        failure: ProviderFailure | None = None
+        primary: BaseException | None = None
+        in_flight = False
         try:
             for attempt in range(1, attempts + 1):
                 remaining = deadline - time.monotonic()
@@ -377,10 +425,49 @@ class GeminiClient:
                     raise _failure("invalid_response", status=502)
                 if "error" in data:
                     raise _payload_failure(response.status_code, data["error"])
-                return data
-            raise _failure("provider_unavailable", status=503)
+                outcome = data
+                break
+            else:
+                raise _failure("provider_unavailable", status=503)
+        except ProviderCancelled as error:
+            primary = error
+            raise
+        except PaidCallOutcomeUnknown as error:
+            primary = error
+            raise
+        except ProviderFailure as error:
+            failure = error
+            primary = error
+            raise
+        except asyncio.CancelledError as error:
+            primary = error
+            raise
+        except Exception as error:
+            primary = error
+            raise
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            await _close_client(client, deadline)
+            cleanup_cancelled = await _close_client(client, deadline)
+            if cleanup_cancelled:
+                if outcome is not None:
+                    raise _DataCleanupCancelled(data=outcome)
+                if failure is not None:
+                    raise _DataCleanupCancelled(failure=failure)
+                if isinstance(primary, ProviderCancelled):
+                    raise _DataCleanupCancelled(
+                        failure=primary,
+                        possibly_processed=primary.possibly_processed,
+                    )
+                if isinstance(primary, PaidCallOutcomeUnknown):
+                    raise _DataCleanupCancelled(paid_outcome_unknown=True)
+                if isinstance(primary, BaseException) and not isinstance(primary, Exception):
+                    raise primary
+                raise _DataCleanupCancelled(possibly_processed=in_flight)
+        if outcome is None:
+            raise _failure("provider_unavailable", status=503)
+        return outcome
 
     def _result(self, data: dict[str, Any], *, local_request_id: str) -> ProviderCallResult:
         reported = _Reported.from_payload(data)
@@ -414,11 +501,10 @@ class GeminiClient:
                 reported=reported,
             )
         steps = data.get("steps")
-        if isinstance(steps, list):
-            output_text = _current_model_text(steps)
-        else:
-            output_text = data.get("output_text")
-        if not isinstance(output_text, str) or not output_text:
+        if not isinstance(steps, list):
+            raise _failure("invalid_response", status=502, reported=reported)
+        output_text = _current_model_text(steps)
+        if not output_text:
             raise _failure("invalid_response", status=502, reported=reported)
         return ProviderCallResult(
             output_text=output_text,
@@ -442,19 +528,22 @@ async def _wait_before_retry(delay: float, deadline: float) -> None:
         raise ProviderCancelled(possibly_processed=False) from None
 
 
-async def _close_client(client: httpx.AsyncClient, deadline: float) -> None:
-    """Close without letting cleanup replace a known outcome or leak a pending call."""
+async def _close_client(client: httpx.AsyncClient, deadline: float) -> bool:
+    """Close within the deadline; report Stop separately from a slow close."""
 
     remaining = deadline - time.monotonic()
     timeout = max(0.01, min(CLIENT_CLOSE_TIMEOUT_SECONDS, remaining))
     try:
         async with asyncio.timeout(timeout):
             await client.aclose()
-    except (Exception, asyncio.CancelledError):
+    except asyncio.CancelledError:
+        return True
+    except Exception:
         # The provider result or its controlled failure already carries the
-        # outcome. A slow or cancelled close must not turn that into a pending
+        # outcome. A slow or failed close must not turn that into a pending
         # usage row or replace a known answer.
-        pass
+        return False
+    return False
 
 
 def _text_model_ids(items: list[object]) -> set[str]:

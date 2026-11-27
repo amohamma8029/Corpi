@@ -8,7 +8,11 @@ import httpx
 import pytest
 
 from core.jobs.runner import PaidCallOutcomeUnknown
-from core.providers.errors import ProviderCancelled, ProviderFailure
+from core.providers.errors import (
+    ProviderCancelled,
+    ProviderCleanupCancelled,
+    ProviderFailure,
+)
 from core.providers.gemini import GeminiClient, _retry_delay
 
 
@@ -40,7 +44,12 @@ def test_generate_uses_interactions_contract_and_parses_usage() -> None:
             200,
             json={
                 "id": "interaction-1",
-                "output_text": "Supported answer.",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "Supported answer."}],
+                    }
+                ],
                 "usage": {
                     "total_input_tokens": 120,
                     "total_output_tokens": 30,
@@ -186,7 +195,18 @@ def test_generate_retries_429_and_503_then_succeeds() -> None:
                 headers={"retry-after": "0"},
                 json={"error": {"message": "temporary"}},
             )
-        return httpx.Response(200, json={"id": "ok", "output_text": "done"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "ok",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "done"}],
+                    }
+                ],
+            },
+        )
 
     result = call(
         GeminiClient("secret-key", transport=httpx.MockTransport(handler)),
@@ -551,7 +571,12 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
     body = json.dumps(
         {
             "id": "trickle",
-            "output_text": "late" * 80,
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "late" * 80}],
+                }
+            ],
             "usage": {},
         }
     ).encode()
@@ -614,7 +639,18 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
 def test_slow_client_close_is_bounded_and_preserves_result() -> None:
     class SlowCloseTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"id": "slow-close", "output_text": "answer"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "slow-close",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "answer"}],
+                        }
+                    ],
+                },
+            )
 
         async def aclose(self) -> None:
             await asyncio.sleep(3)
@@ -634,19 +670,32 @@ def test_slow_client_close_is_bounded_and_preserves_result() -> None:
 def test_cancelled_client_close_preserves_known_result() -> None:
     class CancelCloseTransport(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"id": "known", "output_text": "answer"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "known",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "answer"}],
+                        }
+                    ],
+                },
+            )
 
         async def aclose(self) -> None:
             raise asyncio.CancelledError
 
-    result = call(
-        GeminiClient("secret-key", transport=CancelCloseTransport()),
-        timeout_seconds=5,
-        attempts=1,
-        deadline_seconds=2,
-    )
+    with pytest.raises(ProviderCleanupCancelled) as stopped:
+        call(
+            GeminiClient("secret-key", transport=CancelCloseTransport()),
+            timeout_seconds=5,
+            attempts=1,
+            deadline_seconds=2,
+        )
 
-    assert result.output_text == "answer"
+    assert stopped.value.result is not None
+    assert stopped.value.result.output_text == "answer"
 
 
 def test_cancelled_client_close_after_no_reply_is_possibly_processed() -> None:
@@ -657,7 +706,7 @@ def test_cancelled_client_close_after_no_reply_is_possibly_processed() -> None:
         async def aclose(self) -> None:
             raise asyncio.CancelledError
 
-    with pytest.raises(ProviderCancelled) as failure:
+    with pytest.raises(ProviderCleanupCancelled) as stopped:
         call(
             GeminiClient("secret-key", transport=CancelRequestAndCloseTransport()),
             timeout_seconds=5,
@@ -665,7 +714,30 @@ def test_cancelled_client_close_after_no_reply_is_possibly_processed() -> None:
             deadline_seconds=2,
         )
 
-    assert failure.value.possibly_processed is True
+    assert isinstance(stopped.value.failure, ProviderCancelled)
+    assert stopped.value.failure.possibly_processed is True
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"id": "top-level", "status": "completed", "output_text": "answer"},
+        {
+            "id": "malformed-steps",
+            "status": "completed",
+            "output_text": "answer",
+            "steps": "not-a-list",
+        },
+    ],
+)
+def test_top_level_output_text_without_valid_steps_is_rejected(response) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response)
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
 
 
 def test_model_discovery_deadline_covers_pagination() -> None:
@@ -801,7 +873,18 @@ def test_total_deadline_caps_the_http_timeout_budget() -> None:
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             timeout = request.extensions.get("timeout")
             self.timeout = timeout if isinstance(timeout, dict) else None
-            return httpx.Response(200, json={"id": "ok", "output_text": "ok"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ok",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "ok"}],
+                        }
+                    ],
+                },
+            )
 
     transport = TimeoutRecordingTransport()
     call(

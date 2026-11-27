@@ -2,7 +2,9 @@ from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from typing import Protocol
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from core.api.auth import AuthMiddleware
 from core.api.extraction import router as extraction_router
@@ -85,6 +87,28 @@ def create_app(
         redoc_url=None,
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(
+        _request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        # Pydantic's default error details include submitted input and context,
+        # which can echo a provider key from a rejected settings request.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {
+                        "loc": list(item["loc"]),
+                        "msg": item["msg"],
+                        "type": item["type"],
+                    }
+                    for item in error.errors()
+                ]
+            },
+        )
+
     app.state.store = store
     app.state.pdf_ingest = pdf_ingest
     app.state.runner = runner
