@@ -35,6 +35,7 @@ def success_handler(request: httpx.Request) -> httpx.Response:
         200,
         json={
             "id": "api-provider-result",
+            "status": "completed",
             "steps": [
                 {
                     "type": "model_output",

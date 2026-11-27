@@ -44,6 +44,7 @@ def test_generate_uses_interactions_contract_and_parses_usage() -> None:
             200,
             json={
                 "id": "interaction-1",
+                "status": "completed",
                 "steps": [
                     {
                         "type": "model_output",
@@ -177,6 +178,98 @@ def test_response_without_current_model_text_is_rejected() -> None:
     assert failure.value.code == "invalid_response"
 
 
+@pytest.mark.parametrize("status", [None, "", 1])
+def test_response_without_required_status_is_rejected(status) -> None:
+    payload: dict[str, Any] = {
+        "id": "missing-status",
+        "steps": [
+            {
+                "type": "model_output",
+                "content": [{"type": "text", "text": "answer"}],
+            }
+        ],
+    }
+    if status is not None:
+        payload["status"] = status
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [],
+        [{"type": "image"}],
+        "not-a-list",
+        [{"type": "text", "text": ""}],
+        [{"type": "text"}],
+        [{"type": "text", "text": 5}],
+        [{"type": "text", "text": "   "}],
+    ],
+)
+def test_response_does_not_reuse_earlier_text_when_final_output_is_empty(
+    content,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "earlier-only",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {"type": "model_output", "content": content},
+                ],
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
+def test_malformed_provider_id_is_dropped_without_losing_usage() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "   ",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "answer"}],
+                    }
+                ],
+                "usage": {
+                    "total_input_tokens": 4,
+                    "total_output_tokens": 2,
+                    "total_tokens": 6,
+                },
+            },
+        )
+
+    result = call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert result.output_text == "answer"
+    assert result.provider_request_id is None
+    assert (result.input_tokens, result.output_tokens, result.total_tokens) == (4, 2, 6)
+
+
 def test_generate_retries_429_and_503_then_succeeds() -> None:
     calls = 0
 
@@ -199,6 +292,7 @@ def test_generate_retries_429_and_503_then_succeeds() -> None:
             200,
             json={
                 "id": "ok",
+                "status": "completed",
                 "steps": [
                     {
                         "type": "model_output",
@@ -364,7 +458,12 @@ def test_incomplete_or_truncated_response_is_not_accepted() -> None:
     def max_tokens(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            json={"id": "partial", "finish_reason": "MAX_TOKENS", "output_text": "truncated"},
+            json={
+                "id": "partial",
+                "status": "completed",
+                "finish_reason": "MAX_TOKENS",
+                "output_text": "truncated",
+            },
         )
 
     with pytest.raises(ProviderFailure) as failure:
@@ -571,6 +670,7 @@ def test_total_deadline_bounds_a_trickling_http_response(monkeypatch) -> None:
     body = json.dumps(
         {
             "id": "trickle",
+            "status": "completed",
             "steps": [
                 {
                     "type": "model_output",
@@ -643,6 +743,7 @@ def test_slow_client_close_is_bounded_and_preserves_result() -> None:
                 200,
                 json={
                     "id": "slow-close",
+                    "status": "completed",
                     "steps": [
                         {
                             "type": "model_output",
@@ -674,6 +775,7 @@ def test_cancelled_client_close_preserves_known_result() -> None:
                 200,
                 json={
                     "id": "known",
+                    "status": "completed",
                     "steps": [
                         {
                             "type": "model_output",
@@ -800,7 +902,10 @@ def test_count_tokens_uses_the_same_instructions_and_content() -> None:
 
 def test_empty_model_output_is_invalid() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"id": "empty", "steps": []})
+        return httpx.Response(
+            200,
+            json={"id": "empty", "status": "completed", "steps": []},
+        )
 
     with pytest.raises(ProviderFailure) as failure:
         call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
@@ -877,6 +982,7 @@ def test_total_deadline_caps_the_http_timeout_budget() -> None:
                 200,
                 json={
                     "id": "ok",
+                    "status": "completed",
                     "steps": [
                         {
                             "type": "model_output",
