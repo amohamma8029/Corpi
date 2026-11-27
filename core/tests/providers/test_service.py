@@ -9,7 +9,7 @@ from core.jobs.runner import PaidCallOutcomeUnknown
 from core.persistence.models import ModelCallUsage, ProviderSettings, new_id, utc_timestamp
 from core.persistence.store import PersistenceStore
 from core.providers.credentials import InMemoryCredentialStore
-from core.providers.errors import ProviderCancelled, ProviderFailure
+from core.providers.errors import ProviderFailure
 from core.providers.gemini import GeminiClient
 from core.providers.protocol import ProviderCallResult
 from core.providers.service import (
@@ -73,6 +73,7 @@ def success_handler(request: httpx.Request) -> httpx.Response:
         200,
         json={
             "id": "provider-result",
+            "status": "completed",
             "steps": [
                 {
                     "type": "model_output",
@@ -356,7 +357,7 @@ def test_cancel_after_send_is_recorded_as_unknown_not_cancelled(
         raise asyncio.CancelledError
 
     service = configured_service(store, handler)
-    with pytest.raises(ProviderCancelled) as failure:
+    with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             service.complete(
                 "generation",
@@ -365,7 +366,6 @@ def test_cancel_after_send_is_recorded_as_unknown_not_cancelled(
             )
         )
 
-    assert failure.value.possibly_processed is True
     usage = service.usage()
     assert usage[0].outcome == "unknown"
     assert usage[0].error_code == "cancelled_outcome_unknown"
@@ -387,7 +387,7 @@ def test_cancel_before_retry_is_recorded_as_cancelled(
 
     monkeypatch.setattr(asyncio, "sleep", cancel)
     service = configured_service(store, handler)
-    with pytest.raises(ProviderCancelled) as failure:
+    with pytest.raises(asyncio.CancelledError):
         asyncio.run(
             service.complete(
                 "generation",
@@ -396,7 +396,6 @@ def test_cancel_before_retry_is_recorded_as_cancelled(
             )
         )
 
-    assert failure.value.possibly_processed is False
     usage = service.usage()
     assert usage[0].outcome == "cancelled"
     assert usage[0].error_code == "cancelled"
@@ -478,6 +477,95 @@ def test_cancelled_client_close_after_provider_failure_finalizes_failed(
     assert usage[0].outcome == "failed"
     assert usage[0].error_code == "provider_rejected"
     assert usage[0].finished_at is not None
+
+
+def test_cancelled_close_with_malformed_provider_id_keeps_reported_usage(
+    store: PersistenceStore,
+) -> None:
+    class MalformedIdCancelCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "   ",
+                    "status": "completed",
+                    "steps": [
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "answer"}],
+                        }
+                    ],
+                    "usage": {
+                        "total_input_tokens": 4,
+                        "total_output_tokens": 2,
+                        "total_tokens": 6,
+                    },
+                },
+            )
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    service = service_with_transport(store, MalformedIdCancelCloseTransport())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
+        )
+
+    usage = service.usage()
+    assert usage[0].outcome == "completed"
+    assert usage[0].provider_request_id is None
+    assert (usage[0].input_tokens, usage[0].output_tokens) == (4, 2)
+    assert usage[0].total_tokens == 6
+    assert usage[0].finished_at is not None
+
+
+def test_service_drops_a_malformed_provider_id_from_any_client(
+    store: PersistenceStore,
+) -> None:
+    class MalformedIdClient:
+        async def generate(self, **kwargs: Any) -> ProviderCallResult:
+            return ProviderCallResult(
+                output_text="answer",
+                local_request_id=kwargs["request_id"],
+                provider_request_id="   ",
+                input_tokens=4,
+                output_tokens=2,
+                total_tokens=6,
+            )
+
+    service = ProviderService(
+        store,
+        InMemoryCredentialStore(),
+        client_factory=lambda key: cast(GeminiClient, MalformedIdClient()),
+    )
+    service.save(
+        ProviderSettingsUpdate(
+            generation_model=DEFAULT_GENERATION_MODEL,
+            checker_model=DEFAULT_CHECKER_MODEL,
+            free_tier_acknowledged=True,
+        ),
+        api_key="test-key",
+    )
+
+    result = asyncio.run(
+        service.complete(
+            "generation",
+            instructions="Use evidence.",
+            input_text="Question",
+        )
+    )
+
+    assert result.output_text == "answer"
+    usage = service.usage()
+    assert usage[0].outcome == "completed"
+    assert usage[0].provider_request_id is None
+    assert (usage[0].input_tokens, usage[0].output_tokens) == (4, 2)
+    assert usage[0].total_tokens == 6
 
 
 def test_actual_task_cancellation_during_close_records_completed(
@@ -837,6 +925,77 @@ def test_connection_rejects_a_response_without_current_model_text(
     usage = service.usage()
     assert usage[0].outcome == "failed"
     assert usage[0].error_code == "invalid_response"
+
+
+def test_connection_rejects_a_response_without_required_status(
+    store: PersistenceStore,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "no-status",
+                "steps": [
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "OK"}],
+                    }
+                ],
+            },
+        )
+
+    service = configured_service(store, handler)
+    with pytest.raises(ProviderFailure) as failure:
+        asyncio.run(service.test_connection())
+
+    assert failure.value.code == "invalid_response"
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
+
+
+def test_connection_rejects_empty_final_model_text(
+    store: PersistenceStore,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "final-empty-text",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "Reply with exactly OK."}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": ""}],
+                    },
+                ],
+                "usage": {
+                    "total_input_tokens": 4,
+                    "total_output_tokens": 2,
+                    "total_tokens": 6,
+                },
+            },
+        )
+
+    service = configured_service(store, handler)
+    with pytest.raises(ProviderFailure) as failure:
+        asyncio.run(service.test_connection())
+
+    assert failure.value.code == "invalid_response"
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
+    assert usage[0].input_tokens == 4
+    assert usage[0].output_tokens == 2
+    assert usage[0].total_tokens == 6
 
 
 def test_count_tokens_uses_generation_model_and_requires_a_key(

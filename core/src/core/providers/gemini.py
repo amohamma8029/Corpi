@@ -63,8 +63,10 @@ def _optional_int(value: object) -> int | None:
 
 def _provider_request_id(data: dict[str, Any]) -> str | None:
     value = data.get("id")
-    if isinstance(value, str) and 0 < len(value) <= 512:
-        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and len(cleaned) <= 512 and cleaned.isprintable():
+            return cleaned
     return None
 
 
@@ -148,6 +150,7 @@ def _current_model_text(steps: list[object]) -> str:
 
     text_parts: list[str] = []
     collecting = False
+    first_model_output = True
     for step in reversed(steps):
         step_type = step.get("type") if isinstance(step, dict) else None
         if step_type == "user_input":
@@ -159,18 +162,23 @@ def _current_model_text(steps: list[object]) -> str:
                 break
             continue
         content = step.get("content") if isinstance(step, dict) else None
-        if not isinstance(content, list):
-            continue
+        text_count_before = len(text_parts)
         should_stop = False
-        for item in reversed(content):
-            item_type = item.get("type") if isinstance(item, dict) else None
-            if item_type == "text":
-                collecting = True
-                text = item.get("text") if isinstance(item, dict) else None
-                text_parts.append(text if isinstance(text, str) else "")
-            elif collecting:
-                should_stop = True
-                break
+        if isinstance(content, list):
+            for item in reversed(content):
+                item_type = item.get("type") if isinstance(item, dict) else None
+                if item_type == "text":
+                    text = item.get("text") if isinstance(item, dict) else None
+                    if isinstance(text, str) and text.strip():
+                        collecting = True
+                        text_parts.append(text)
+                elif collecting:
+                    should_stop = True
+                    break
+        if first_model_output:
+            first_model_output = False
+            if len(text_parts) == text_count_before:
+                return ""
         if should_stop:
             break
     return "".join(reversed(text_parts))
@@ -472,10 +480,13 @@ class GeminiClient:
     def _result(self, data: dict[str, Any], *, local_request_id: str) -> ProviderCallResult:
         reported = _Reported.from_payload(data)
         status = data.get("status")
-        if isinstance(status, str) and status.lower() not in {"completed", "succeeded", "success"}:
+        if not isinstance(status, str) or not status.strip():
+            raise _failure("invalid_response", status=502, reported=reported)
+        normalized_status = status.strip().lower()
+        if normalized_status != "completed":
             code = (
                 "incomplete_response"
-                if status.lower() in {"incomplete", "truncated", "max_tokens"}
+                if normalized_status in {"incomplete", "truncated", "max_tokens"}
                 else "provider_rejected"
             )
             raise _failure(

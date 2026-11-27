@@ -87,6 +87,15 @@ class ProviderSettingsUpdate:
     safety_margin_tokens: int = DEFAULT_SAFETY_MARGIN
 
 
+def _safe_provider_request_id(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > 512 or not cleaned.isprintable():
+        return None
+    return cleaned
+
+
 class ProviderService:
     """The only component that reads a provider credential."""
 
@@ -359,7 +368,7 @@ class ProviderService:
                 outcome="unknown" if error.possibly_processed else "cancelled",
                 error_code=error.code,
             )
-            raise
+            raise asyncio.CancelledError from None
         except PaidCallOutcomeUnknown:
             self._finalize_usage(
                 usage_id,
@@ -505,7 +514,9 @@ class ProviderService:
             usage_id,
             outcome=outcome,
             error_code=error_code,
-            provider_request_id=None if details is None else details.provider_request_id,
+            provider_request_id=(
+                None if details is None else _safe_provider_request_id(details.provider_request_id)
+            ),
             input_tokens=None if details is None else details.input_tokens,
             output_tokens=None if details is None else details.output_tokens,
             thought_tokens=None if details is None else details.thought_tokens,
