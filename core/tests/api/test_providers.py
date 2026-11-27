@@ -35,7 +35,12 @@ def success_handler(request: httpx.Request) -> httpx.Response:
         200,
         json={
             "id": "api-provider-result",
-            "output_text": "OK",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "OK"}],
+                }
+            ],
             "usage": {"total_input_tokens": 4, "total_output_tokens": 1, "total_tokens": 5},
         },
     )
@@ -107,6 +112,38 @@ def test_provider_settings_consent_and_secret_boundary(tmp_path) -> None:
         assert cleared.status_code == 200
         assert cleared.json()["credential_configured"] is False
         assert service.usage()[0].call_type == "settings_test"
+
+
+def test_provider_settings_validation_never_echoes_the_submitted_key(tmp_path) -> None:
+    client, _ = make_client(tmp_path, success_handler)
+    with client:
+        invalid_key = client.put(
+            "/provider/settings",
+            headers=HEADERS,
+            json={
+                "generation_model": "gemini-3.8-flash",
+                "checker_model": "gemini-3.5-flash-lite",
+                "free_tier_acknowledged": True,
+                "api_key": ["secret-submitted-key"],
+            },
+        )
+        assert invalid_key.status_code == 422
+        assert "secret-submitted-key" not in invalid_key.text
+        assert all(set(item) == {"loc", "msg", "type"} for item in invalid_key.json()["detail"])
+
+        invalid_setting = client.put(
+            "/provider/settings",
+            headers=HEADERS,
+            json={
+                "generation_model": "gemini-3.8-flash",
+                "checker_model": "gemini-3.5-flash-lite",
+                "free_tier_acknowledged": True,
+                "output_token_allowance": 0,
+                "api_key": "secret-submitted-key",
+            },
+        )
+        assert invalid_setting.status_code == 422
+        assert "secret-submitted-key" not in invalid_setting.text
 
 
 def test_provider_models_route_returns_the_provider_catalog(tmp_path) -> None:
