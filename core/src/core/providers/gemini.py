@@ -142,10 +142,11 @@ def _deadline_failure() -> ProviderFailure:
 def _current_model_text(steps: list[object]) -> str:
     """Read the trailing model-output text after the last user input.
 
-    Mirrors the Interactions SDK's output boundary: walk steps backward, stop at
-    the last user input, skip thoughts, and collect only trailing text blocks
-    from model-output steps. Earlier output and input text cannot become the
-    current answer.
+    Walk steps backward, stop at the last user input or any tool/result boundary,
+    skip thoughts, and collect only trailing text blocks from model-output steps.
+    Text fragments are kept verbatim, including whitespace-only fragments, so
+    spacing inside an answer is not lost. Earlier output and input text cannot
+    become the current answer.
     """
 
     text_parts: list[str] = []
@@ -158,9 +159,7 @@ def _current_model_text(steps: list[object]) -> str:
         if step_type == "thought":
             continue
         if step_type != "model_output":
-            if collecting:
-                break
-            continue
+            break
         content = step.get("content") if isinstance(step, dict) else None
         text_count_before = len(text_parts)
         should_stop = False
@@ -169,7 +168,7 @@ def _current_model_text(steps: list[object]) -> str:
                 item_type = item.get("type") if isinstance(item, dict) else None
                 if item_type == "text":
                     text = item.get("text") if isinstance(item, dict) else None
-                    if isinstance(text, str) and text.strip():
+                    if isinstance(text, str) and text != "":
                         collecting = True
                         text_parts.append(text)
                 elif collecting:
@@ -515,7 +514,7 @@ class GeminiClient:
         if not isinstance(steps, list):
             raise _failure("invalid_response", status=502, reported=reported)
         output_text = _current_model_text(steps)
-        if not output_text:
+        if not output_text.strip():
             raise _failure("invalid_response", status=502, reported=reported)
         return ProviderCallResult(
             output_text=output_text,

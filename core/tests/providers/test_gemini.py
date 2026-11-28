@@ -210,7 +210,6 @@ def test_response_without_required_status_is_rejected(status) -> None:
         [{"type": "text", "text": ""}],
         [{"type": "text"}],
         [{"type": "text", "text": 5}],
-        [{"type": "text", "text": "   "}],
     ],
 )
 def test_response_does_not_reuse_earlier_text_when_final_output_is_empty(
@@ -240,6 +239,119 @@ def test_response_does_not_reuse_earlier_text_when_final_output_is_empty(
         call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
 
     assert failure.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    ("fragments", "expected"),
+    [
+        (["Keep", " ", "separate"], "Keep separate"),
+        (['{"answer":"no', " ", 'evidence"}'], '{"answer":"no evidence"}'),
+    ],
+)
+def test_whitespace_fragments_are_preserved(fragments, expected) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "whitespace-fragments",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": fragment} for fragment in fragments],
+                    },
+                ],
+            },
+        )
+
+    result = call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert result.output_text == expected
+
+
+def test_whitespace_only_assembled_answer_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "blank-answer",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "   "}],
+                    },
+                ],
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
+def test_response_with_no_answer_after_tool_exchange_is_rejected() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "tool-without-answer",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {"type": "function_call", "content": []},
+                    {"type": "function_result", "content": []},
+                ],
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
+def test_final_model_output_after_tool_exchange_is_accepted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "tool-then-answer",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {"type": "function_call", "content": []},
+                    {"type": "function_result", "content": []},
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "final answer"}],
+                    },
+                ],
+            },
+        )
+
+    result = call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert result.output_text == "final answer"
 
 
 def test_malformed_provider_id_is_dropped_without_losing_usage() -> None:
