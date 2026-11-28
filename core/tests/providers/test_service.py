@@ -998,6 +998,40 @@ def test_connection_rejects_empty_final_model_text(
     assert usage[0].total_tokens == 6
 
 
+def test_connection_rejects_tool_exchange_without_final_output(
+    store: PersistenceStore,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "tool-without-answer",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "Reply with exactly OK."}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {"type": "function_call", "content": []},
+                    {"type": "function_result", "content": []},
+                ],
+            },
+        )
+
+    service = configured_service(store, handler)
+    with pytest.raises(ProviderFailure) as failure:
+        asyncio.run(service.test_connection())
+
+    assert failure.value.code == "invalid_response"
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
+
+
 def test_count_tokens_uses_generation_model_and_requires_a_key(
     store: PersistenceStore,
 ) -> None:
