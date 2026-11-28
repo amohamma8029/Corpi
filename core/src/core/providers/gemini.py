@@ -168,7 +168,9 @@ def _current_model_text(steps: list[object]) -> str:
                 item_type = item.get("type") if isinstance(item, dict) else None
                 if item_type == "text":
                     text = item.get("text") if isinstance(item, dict) else None
-                    if isinstance(text, str) and text != "":
+                    if not isinstance(text, str):
+                        return ""
+                    if text != "":
                         collecting = True
                         text_parts.append(text)
                 elif collecting:
