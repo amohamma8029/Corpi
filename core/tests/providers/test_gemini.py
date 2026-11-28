@@ -299,6 +299,47 @@ def test_whitespace_only_assembled_answer_is_rejected() -> None:
     assert failure.value.code == "invalid_response"
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"type": "text"},
+        {"type": "text", "text": None},
+        {"type": "text", "text": 5},
+    ],
+)
+def test_malformed_text_fragment_with_whitespace_is_rejected(malformed) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "malformed-with-whitespace",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "private question"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [
+                            {"type": "text", "text": " "},
+                            malformed,
+                        ],
+                    },
+                ],
+            },
+        )
+
+    with pytest.raises(ProviderFailure) as failure:
+        call(GeminiClient("secret-key", transport=httpx.MockTransport(handler)))
+
+    assert failure.value.code == "invalid_response"
+
+
 def test_response_with_no_answer_after_tool_exchange_is_rejected() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

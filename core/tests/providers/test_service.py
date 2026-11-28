@@ -1032,6 +1032,94 @@ def test_connection_rejects_tool_exchange_without_final_output(
     assert usage[0].error_code == "invalid_response"
 
 
+def test_connection_rejects_malformed_text_with_whitespace(
+    store: PersistenceStore,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "malformed-with-whitespace",
+                "status": "completed",
+                "steps": [
+                    {
+                        "type": "user_input",
+                        "content": [{"type": "text", "text": "Reply with exactly OK."}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [{"type": "text", "text": "earlier answer"}],
+                    },
+                    {
+                        "type": "model_output",
+                        "content": [
+                            {"type": "text", "text": " "},
+                            {"type": "text"},
+                        ],
+                    },
+                ],
+            },
+        )
+
+    service = configured_service(store, handler)
+    with pytest.raises(ProviderFailure) as failure:
+        asyncio.run(service.test_connection())
+
+    assert failure.value.code == "invalid_response"
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
+
+
+def test_cancelled_close_with_malformed_text_records_failed(
+    store: PersistenceStore,
+) -> None:
+    class MalformedTextCancelCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "malformed-with-whitespace",
+                    "status": "completed",
+                    "steps": [
+                        {
+                            "type": "user_input",
+                            "content": [{"type": "text", "text": "Reply with exactly OK."}],
+                        },
+                        {
+                            "type": "model_output",
+                            "content": [{"type": "text", "text": "earlier answer"}],
+                        },
+                        {
+                            "type": "model_output",
+                            "content": [
+                                {"type": "text", "text": " "},
+                                {"type": "text", "text": None},
+                            ],
+                        },
+                    ],
+                },
+            )
+
+        async def aclose(self) -> None:
+            raise asyncio.CancelledError
+
+    service = service_with_transport(store, MalformedTextCancelCloseTransport())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.complete(
+                "generation",
+                instructions="Use evidence.",
+                input_text="Question",
+            )
+        )
+
+    usage = service.usage()
+    assert usage[0].outcome == "failed"
+    assert usage[0].error_code == "invalid_response"
+    assert usage[0].finished_at is not None
+
+
 def test_count_tokens_uses_generation_model_and_requires_a_key(
     store: PersistenceStore,
 ) -> None:
